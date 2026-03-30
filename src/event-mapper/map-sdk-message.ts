@@ -3,6 +3,7 @@ import type { ProviderEvent } from "../runtime.js";
 interface SessionLikeMessage {
   session_id?: string;
   type?: string;
+  tool_use_result?: unknown;
 }
 
 interface ClaudeContentBlock {
@@ -47,6 +48,16 @@ function normalizeToolResultContent(content: unknown): string {
     return "";
   }
   return JSON.stringify(content);
+}
+
+function normalizeToolUseResult(result: unknown): string {
+  if (typeof result === "string") {
+    return result;
+  }
+  if (result === undefined || result === null) {
+    return "";
+  }
+  return JSON.stringify(result);
 }
 
 export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
@@ -97,6 +108,17 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
 
   if (type === "user") {
     const events: ProviderEvent[] = [];
+    const directToolUseResult = msg.tool_use_result;
+    if (directToolUseResult !== undefined) {
+      events.push({
+        type: "tool_result",
+        payload: {
+          content: normalizeToolUseResult(directToolUseResult),
+          sessionId
+        }
+      });
+    }
+
     const message = asRecord(msg.message) as MessageContainer;
     for (const block of Array.isArray(message.content) ? message.content : []) {
       if (block.type === "tool_result") {
@@ -158,23 +180,16 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
     ];
   }
 
-  if (type === "assistant_partial") {
-    const partial = asRecord(msg.partial_message);
-    const content = partial.content;
-    if (Array.isArray(content)) {
-      const text = content
-        .map((entry) => {
-          const block = asRecord(entry);
-          return typeof block.text === "string" ? block.text : "";
-        })
-        .join("");
-
-      if (text.length > 0) {
+  if (type === "stream_event") {
+    const event = asRecord(msg.event);
+    if (event.type === "content_block_delta") {
+      const delta = asRecord(event.delta);
+      if (delta.type === "text_delta" && typeof delta.text === "string") {
         return [
           {
             type: "message_delta",
             payload: {
-              delta: text,
+              delta: delta.text,
               partial: true,
               sessionId
             }

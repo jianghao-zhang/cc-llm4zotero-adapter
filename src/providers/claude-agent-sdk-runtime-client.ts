@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { ClaudeCodeRuntimeClient, RuntimeTurnRequest, RuntimeTurnStream } from "../runtime.js";
 import { mapSdkMessageToProviderEvents } from "../event-mapper/map-sdk-message.js";
+import type { PermissionMode, SettingSource } from "@anthropic-ai/claude-agent-sdk";
 
 type QueryFunction = (args: {
   prompt: string;
@@ -9,8 +10,8 @@ type QueryFunction = (args: {
 
 export interface ClaudeAgentSdkRuntimeClientOptions {
   cwd?: string;
-  settingSources?: Array<"user" | "project" | "local">;
-  permissionMode?: "default" | "acceptEdits" | "bypassPermissions" | "plan";
+  settingSources?: SettingSource[];
+  permissionMode?: PermissionMode;
   includePartialMessages?: boolean;
   maxTurns?: number;
   continue?: boolean;

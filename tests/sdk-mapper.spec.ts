@@ -48,4 +48,29 @@ describe("mapSdkMessageToProviderEvents", () => {
       }
     ]);
   });
+
+  it("maps stream_event text deltas", () => {
+    const events = mapSdkMessageToProviderEvents({
+      type: "stream_event",
+      session_id: "sess-3",
+      event: {
+        type: "content_block_delta",
+        delta: {
+          type: "text_delta",
+          text: "chunk"
+        }
+      }
+    });
+
+    expect(events).toEqual([
+      {
+        type: "message_delta",
+        payload: {
+          delta: "chunk",
+          partial: true,
+          sessionId: "sess-3"
+        }
+      }
+    ]);
+  });
 });

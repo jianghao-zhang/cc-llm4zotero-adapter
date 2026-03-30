@@ -26,6 +26,9 @@ Adapter that connects `llm-for-zotero` frontend-compatible agent flow to Claude 
 - Implemented trace stores:
   - `InMemoryTraceStore`
   - `JsonFileTraceStore`
+- Implemented Claude Agent SDK runtime client:
+  - `ClaudeAgentSdkRuntimeClient`
+  - SDK message -> frontend-compatible event mapping
 - Added unit tests for event flow + session/trace behavior.
 
 ## Quick Start
@@ -49,7 +52,7 @@ runTurn(request, { onStart, onEvent, signal }) -> outcome
 Events emitted to `onEvent` are frontend-compatible `AgentEvent` values.
 
 ## Next Step (Runtime Binding)
-The current runtime interface is intentionally minimal:
+The adapter runtime interface remains intentionally minimal:
 
 ```ts
 interface ClaudeCodeRuntimeClient {
@@ -57,7 +60,13 @@ interface ClaudeCodeRuntimeClient {
 }
 ```
 
-To bind real Claude Code SDK/CLI, implement `startTurn` and stream provider events into this adapter.
+`ClaudeAgentSdkRuntimeClient` already binds real `@anthropic-ai/claude-agent-sdk` streaming output into adapter events.
+
+Remaining integration focus is wiring this adapter into `llm-for-zotero` backend entrypoints.
+
+## Official References
+- Agent SDK TS reference: [TypeScript SDK](https://platform.claude.com/docs/en/agent-sdk/typescript)
+- Agent SDK overview: [Overview](https://platform.claude.com/docs/en/agent-sdk/overview)
 
 ## Repository Layout
 - `src/bridge`: runtime bridge entrypoints

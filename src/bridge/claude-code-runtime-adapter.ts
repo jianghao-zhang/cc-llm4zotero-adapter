@@ -23,25 +23,27 @@ export class ClaudeCodeRuntimeAdapter {
 
   async runTurn(request: RunTurnRequest, hooks: RunTurnHooks = {}): Promise<RunTurnOutcome> {
     const signal = hooks.signal ?? request.signal;
-    const providerSessionId = await this.sessionMapper.get(request.conversationKey);
+    const initialSessionId = await this.sessionMapper.get(request.conversationKey);
+    let resolvedSessionId = initialSessionId;
 
     const stream = await this.runtimeClient.startTurn({
       conversationKey: request.conversationKey,
       userMessage: request.userMessage,
-      providerSessionId,
+      providerSessionId: initialSessionId,
       allowedTools: request.allowedTools,
       metadata: request.metadata,
       signal
     });
 
     if (stream.providerSessionId) {
+      resolvedSessionId = stream.providerSessionId;
       await this.sessionMapper.set(request.conversationKey, stream.providerSessionId);
     }
 
     hooks.onStart?.({
       runId: stream.runId,
       conversationKey: request.conversationKey,
-      providerSessionId: stream.providerSessionId ?? providerSessionId
+      providerSessionId: stream.providerSessionId ?? initialSessionId
     });
 
     let finalText = "";
@@ -49,6 +51,11 @@ export class ClaudeCodeRuntimeAdapter {
     try {
       for await (const providerEvent of stream.events) {
         const event = mapProviderEvent(providerEvent);
+        const eventSessionId = this.extractSessionId(event.payload);
+        if (eventSessionId && eventSessionId !== resolvedSessionId) {
+          resolvedSessionId = eventSessionId;
+          await this.sessionMapper.set(request.conversationKey, eventSessionId);
+        }
         await this.emitEvent(stream.runId, request.conversationKey, event, hooks);
 
         if (event.type === "message_delta") {
@@ -69,7 +76,7 @@ export class ClaudeCodeRuntimeAdapter {
       return {
         runId: stream.runId,
         conversationKey: request.conversationKey,
-        providerSessionId: stream.providerSessionId ?? providerSessionId,
+        providerSessionId: resolvedSessionId,
         status: signal?.aborted ? "cancelled" : "completed",
         finalText
       };
@@ -88,7 +95,7 @@ export class ClaudeCodeRuntimeAdapter {
       return {
         runId: stream.runId,
         conversationKey: request.conversationKey,
-        providerSessionId: stream.providerSessionId ?? providerSessionId,
+        providerSessionId: resolvedSessionId,
         status: signal?.aborted ? "cancelled" : "failed",
         finalText,
         error: err.message
@@ -106,5 +113,18 @@ export class ClaudeCodeRuntimeAdapter {
     if (this.traceStore) {
       await this.traceStore.append({ runId, conversationKey, event });
     }
+  }
+
+  private extractSessionId(payload: unknown): string | undefined {
+    if (payload && typeof payload === "object") {
+      const record = payload as Record<string, unknown>;
+      if (typeof record.sessionId === "string") {
+        return record.sessionId;
+      }
+      if (typeof record.session_id === "string") {
+        return record.session_id;
+      }
+    }
+    return undefined;
   }
 }

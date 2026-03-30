@@ -12,7 +12,8 @@
     "build": "tsc -p tsconfig.json",
     "clean": "rm -rf dist coverage",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "demo:llm4zotero": "tsx examples/llm4zotero-runturn-demo.ts"
   },
   "keywords": [
     "zotero",
@@ -23,6 +24,7 @@
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^25.5.0",
+    "tsx": "^4.20.5",
     "typescript": "^5.9.2",
     "vitest": "^3.2.4"
   },

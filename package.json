@@ -1,0 +1,29 @@
+{
+  "name": "cc-llm4zotero-adapter",
+  "version": "0.1.0",
+  "description": "Adapter that connects llm-for-zotero agent frontend semantics to Claude Code runtime",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist coverage",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "keywords": [
+    "zotero",
+    "claude-code",
+    "adapter",
+    "agent"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}

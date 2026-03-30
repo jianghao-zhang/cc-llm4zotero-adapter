@@ -13,7 +13,8 @@
     "clean": "rm -rf dist coverage",
     "test": "vitest run",
     "test:watch": "vitest",
-    "demo:llm4zotero": "tsx examples/llm4zotero-runturn-demo.ts"
+    "demo:llm4zotero": "tsx examples/llm4zotero-runturn-demo.ts",
+    "serve:bridge": "tsx bin/start-bridge-server.ts --host 127.0.0.1 --port 8787"
   },
   "keywords": [
     "zotero",

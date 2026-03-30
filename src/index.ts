@@ -3,6 +3,8 @@ export * from "./runtime.js";
 export * from "./event-mapper/map-provider-event.js";
 export * from "./event-mapper/map-sdk-message.js";
 export * from "./session-link/session-mapper.js";
+export * from "./session-link/session-resolver.js";
 export * from "./trace-store/trace-store.js";
 export * from "./bridge/claude-code-runtime-adapter.js";
 export * from "./providers/claude-agent-sdk-runtime-client.js";
+export * from "./providers/claude-agent-sdk-session-discovery.js";

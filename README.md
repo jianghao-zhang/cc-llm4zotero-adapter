@@ -38,6 +38,21 @@ npm run build
 npm test
 ```
 
+Start bridge server:
+
+```bash
+npx tsx bin/start-bridge-server.ts --host 127.0.0.1 --port 18787
+```
+
+Model/profile behavior:
+- By default, frontend `metadata.model` is ignored.
+- Runtime model selection follows your local Claude Code profile (for example `cc-switch` active profile).
+- If you explicitly want frontend model passthrough, start with:
+
+```bash
+ADAPTER_FORWARD_FRONTEND_MODEL=true npx tsx bin/start-bridge-server.ts --host 127.0.0.1 --port 18787
+```
+
 ## Adapter Contract
 ```ts
 runTurn(request, { onStart, onEvent, signal }) -> outcome

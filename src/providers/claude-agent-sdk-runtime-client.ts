@@ -15,11 +15,48 @@ export interface ClaudeAgentSdkRuntimeClientOptions {
   includePartialMessages?: boolean;
   maxTurns?: number;
   continue?: boolean;
+  forwardFrontendModel?: boolean;
+  blockedMetadataKeys?: string[];
   queryImpl?: QueryFunction;
 }
 
-function parseMetadata(metadata: RuntimeTurnRequest["metadata"]): Record<string, unknown> {
-  return metadata ? { ...metadata } : {};
+const DEFAULT_BLOCKED_METADATA_KEYS = new Set<string>([
+  "allowedTools",
+  "abortController",
+  "continue",
+  "cwd",
+  "includePartialMessages",
+  "maxTurns",
+  "permissionMode",
+  "resume",
+  "settingSources",
+]);
+
+function parseMetadata(
+  metadata: RuntimeTurnRequest["metadata"],
+  options: Pick<ClaudeAgentSdkRuntimeClientOptions, "forwardFrontendModel" | "blockedMetadataKeys">
+): Record<string, unknown> {
+  if (!metadata) {
+    return {};
+  }
+
+  const blockedKeys = new Set<string>([
+    ...DEFAULT_BLOCKED_METADATA_KEYS,
+    ...(options.blockedMetadataKeys ?? []),
+  ]);
+
+  if (!options.forwardFrontendModel) {
+    blockedKeys.add("model");
+  }
+
+  const result: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(metadata)) {
+    if (!blockedKeys.has(key)) {
+      result[key] = value;
+    }
+  }
+
+  return result;
 }
 
 export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
@@ -31,9 +68,10 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
 
   async startTurn(request: RuntimeTurnRequest): Promise<RuntimeTurnStream> {
     const query = this.options.queryImpl ?? (await this.loadQuery());
-    const metadata = parseMetadata(request.metadata);
+    const metadata = parseMetadata(request.metadata, this.options);
 
     const queryOptions: Record<string, unknown> = {
+      ...metadata,
       cwd: this.options.cwd,
       allowedTools: request.allowedTools,
       settingSources: this.options.settingSources ?? ["user", "project"],
@@ -43,7 +81,6 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       continue: this.options.continue,
       resume: request.providerSessionId,
       abortController: request.signal ? this.createAbortController(request.signal) : undefined,
-      ...metadata
     };
 
     const cleanedOptions = Object.fromEntries(

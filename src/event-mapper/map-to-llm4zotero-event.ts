@@ -82,9 +82,15 @@ export function mapToLlm4ZoteroEvent(event: AgentEvent): Llm4ZoteroAgentEvent | 
       };
     }
     case "fallback": {
+      const reason = asString(payload.reason) || "fallback";
+      // Claude SDK streams include many informational event variants.
+      // Keep them in backend trace, but suppress noisy unmapped markers in UI.
+      if (reason === "unmapped_provider_event") {
+        return null;
+      }
       return {
         type: "fallback",
-        reason: asString(payload.reason) || "fallback"
+        reason
       };
     }
     case "final": {

@@ -15,6 +15,14 @@ function getArg(name: string): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
+function parseBoolean(value: string | undefined, defaultValue: boolean): boolean {
+  if (value === undefined) return defaultValue;
+  const v = value.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(v)) return true;
+  if (["0", "false", "no", "off"].includes(v)) return false;
+  return defaultValue;
+}
+
 async function main() {
   const host = getArg("host") || process.env.ADAPTER_HOST || "127.0.0.1";
   const portRaw = getArg("port") || process.env.ADAPTER_PORT || "8787";
@@ -27,10 +35,15 @@ async function main() {
     getArg("state-dir") ||
     process.env.ADAPTER_STATE_DIR ||
     `${process.cwd()}/.adapter-state`;
+  const forwardFrontendModel = parseBoolean(
+    getArg("forward-frontend-model") ?? process.env.ADAPTER_FORWARD_FRONTEND_MODEL,
+    false,
+  );
 
   const runtimeClient = new ClaudeAgentSdkRuntimeClient({
     settingSources: ["user", "project"],
     includePartialMessages: true,
+    forwardFrontendModel,
   });
 
   const core = new ClaudeCodeRuntimeAdapter({

@@ -31,6 +31,38 @@ export interface Llm4ZoteroRunTurnRequest {
   metadata?: Record<string, unknown>;
 }
 
+export type Llm4ZoteroToolMutability = "read" | "write";
+export type Llm4ZoteroToolRiskLevel = "low" | "medium" | "high";
+export type Llm4ZoteroToolSource = "claude-runtime" | "zotero-bridge" | "mcp";
+
+export interface Llm4ZoteroToolDescriptor {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  mutability: Llm4ZoteroToolMutability;
+  riskLevel: Llm4ZoteroToolRiskLevel;
+  requiresConfirmation: boolean;
+  source: Llm4ZoteroToolSource;
+}
+
+export interface Llm4ZoteroRunActionRequest {
+  conversationKey: string | number;
+  toolName: string;
+  args?: unknown;
+  approved?: boolean;
+  activeItemId?: number;
+  libraryID?: number;
+  contextEnvelope?: Record<string, unknown>;
+  metadata?: Record<string, unknown>;
+}
+
+export interface Llm4ZoteroRunActionParams {
+  request: Llm4ZoteroRunActionRequest;
+  onEvent?: (event: Llm4ZoteroAgentEvent) => void | Promise<void>;
+  onStart?: (runId: string) => void | Promise<void>;
+  signal?: AbortSignal;
+}
+
 export interface Llm4ZoteroRunTurnParams {
   request: Llm4ZoteroRunTurnRequest;
   onEvent?: (event: Llm4ZoteroAgentEvent) => void | Promise<void>;

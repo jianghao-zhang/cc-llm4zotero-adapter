@@ -5,6 +5,7 @@ import type {
 } from "../bridge/llm4zotero-agent-backend-adapter.js";
 import type {
   Llm4ZoteroAgentEvent,
+  Llm4ZoteroRunActionRequest,
   Llm4ZoteroRunTurnRequest
 } from "../bridge/llm4zotero-contract.js";
 
@@ -75,6 +76,34 @@ function toRequestPayload(body: unknown): Llm4ZoteroRunTurnRequest {
   };
 }
 
+function toActionPayload(body: unknown): Llm4ZoteroRunActionRequest {
+  const record = body !== null && typeof body === "object" ? (body as Record<string, unknown>) : {};
+  const conversationKey = record.conversationKey;
+  const toolName = record.toolName;
+  if (!(typeof conversationKey === "string" || typeof conversationKey === "number")) {
+    throw new Error("conversationKey must be string or number");
+  }
+  if (typeof toolName !== "string" || !toolName.trim()) {
+    throw new Error("toolName must be a non-empty string");
+  }
+  return {
+    conversationKey,
+    toolName,
+    args: record.args,
+    approved: typeof record.approved === "boolean" ? record.approved : false,
+    activeItemId: typeof record.activeItemId === "number" ? record.activeItemId : undefined,
+    libraryID: typeof record.libraryID === "number" ? record.libraryID : undefined,
+    contextEnvelope:
+      record.contextEnvelope && typeof record.contextEnvelope === "object"
+        ? (record.contextEnvelope as Record<string, unknown>)
+        : undefined,
+    metadata:
+      record.metadata && typeof record.metadata === "object"
+        ? (record.metadata as Record<string, unknown>)
+        : undefined,
+  };
+}
+
 function writeLine(res: ServerResponse, line: BridgeStreamLine): void {
   res.write(JSON.stringify(line));
   res.write("\n");
@@ -90,6 +119,11 @@ export async function startHttpBridgeServer(
     try {
       if (req.method === "GET" && req.url === "/healthz") {
         sendJson(res, 200, { ok: true, ts: Date.now() });
+        return;
+      }
+
+      if (req.method === "GET" && req.url === "/tools") {
+        sendJson(res, 200, { tools: options.adapter.listTools() });
         return;
       }
 
@@ -119,6 +153,39 @@ export async function startHttpBridgeServer(
           onEvent: (event) => {
             writeLine(res, { type: "event", event });
           }
+        });
+
+        writeLine(res, { type: "outcome", outcome });
+        res.end();
+        return;
+      }
+
+      if (req.method === "POST" && req.url === "/run-action") {
+        let payload: Llm4ZoteroRunActionRequest;
+        try {
+          payload = toActionPayload(await readJson(req));
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          sendJson(res, 400, { error: message });
+          return;
+        }
+
+        res.statusCode = 200;
+        res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
+        res.setHeader("Cache-Control", "no-cache, no-transform");
+        res.setHeader("Connection", "keep-alive");
+
+        const startRunId = randomUUID();
+        writeLine(res, { type: "start", runId: startRunId });
+
+        const outcome = await options.adapter.runAction({
+          request: payload,
+          onStart: (runId) => {
+            writeLine(res, { type: "start", runId });
+          },
+          onEvent: (event) => {
+            writeLine(res, { type: "event", event });
+          },
         });
 
         writeLine(res, { type: "outcome", outcome });

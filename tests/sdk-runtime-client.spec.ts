@@ -50,6 +50,50 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
     expect(types).toEqual(["status", "message_delta", "final"]);
   });
 
+  it("ignores frontend model metadata by default", async () => {
+    let seenOptions: Record<string, unknown> = {};
+
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      queryImpl(args) {
+        seenOptions = args.options;
+        return makeStream([
+          { type: "result", session_id: "session-new", result: "ok", is_error: false }
+        ]);
+      }
+    });
+
+    await runtime.startTurn({
+      conversationKey: "conv-1",
+      userMessage: "hello",
+      metadata: { model: "gemini-3.1-pro-preview", activeItemId: 123 }
+    });
+
+    expect(seenOptions.model).toBeUndefined();
+    expect(seenOptions.activeItemId).toBe(123);
+  });
+
+  it("can forward frontend model metadata when explicitly enabled", async () => {
+    let seenOptions: Record<string, unknown> = {};
+
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      forwardFrontendModel: true,
+      queryImpl(args) {
+        seenOptions = args.options;
+        return makeStream([
+          { type: "result", session_id: "session-new", result: "ok", is_error: false }
+        ]);
+      }
+    });
+
+    await runtime.startTurn({
+      conversationKey: "conv-1",
+      userMessage: "hello",
+      metadata: { model: "gemini-3.1-pro-preview" }
+    });
+
+    expect(seenOptions.model).toBe("gemini-3.1-pro-preview");
+  });
+
   it("adapter updates session mapper from streamed sessionId", async () => {
     const runtime = new ClaudeAgentSdkRuntimeClient({
       queryImpl() {

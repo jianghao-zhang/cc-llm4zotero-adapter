@@ -10,6 +10,7 @@ export * from "./trace-store/trace-replay.js";
 export * from "./bridge/claude-code-runtime-adapter.js";
 export * from "./bridge/llm4zotero-contract.js";
 export * from "./bridge/llm4zotero-agent-backend-adapter.js";
+export * from "./bridge/tool-catalog.js";
 export * from "./providers/claude-agent-sdk-runtime-client.js";
 export * from "./providers/claude-agent-sdk-session-discovery.js";
 export * from "./server/http-bridge.js";

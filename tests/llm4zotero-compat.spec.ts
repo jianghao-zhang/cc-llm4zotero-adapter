@@ -99,4 +99,37 @@ describe("Llm4ZoteroAgentBackendAdapter", () => {
     expect(outcome.kind).toBe("fallback");
     expect(outcome.usedFallback).toBe(true);
   });
+
+  it("suppresses unmapped_provider_event noise from UI stream", async () => {
+    const runtimeClient: ClaudeCodeRuntimeClient = {
+      async startTurn() {
+        return {
+          runId: "run-z-3",
+          events: providerEvents([
+            { type: "unknown", payload: { sourceType: "stream_event" } },
+            { type: "message_delta", payload: { delta: "hello" } },
+            { type: "final", payload: { output: "hello" } }
+          ])
+        };
+      }
+    };
+
+    const base = new ClaudeCodeRuntimeAdapter({
+      runtimeClient,
+      sessionMapper: new InMemorySessionMapper()
+    });
+
+    const compat = new Llm4ZoteroAgentBackendAdapter(base);
+    const seen: string[] = [];
+
+    const outcome = await compat.runTurn({
+      request: { conversationKey: "conv-noise", userText: "x" },
+      onEvent(event) {
+        seen.push(event.type);
+      }
+    });
+
+    expect(outcome.kind).toBe("completed");
+    expect(seen).toEqual(["message_delta", "final"]);
+  });
 });

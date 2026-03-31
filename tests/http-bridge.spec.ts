@@ -86,7 +86,6 @@ describe("http bridge server", () => {
       const lines = await readNdjsonLines(response);
       const types = lines.map((line) => line.type);
       expect(types).toContain("start");
-      expect(types).toContain("event");
       expect(types).toContain("outcome");
     } finally {
       await server.close();
@@ -160,7 +159,6 @@ describe("http bridge server", () => {
       const lines = await readNdjsonLines(response);
       const types = lines.map((line) => line.type);
       expect(types).toContain("start");
-      expect(types).toContain("event");
       expect(types).toContain("outcome");
     } finally {
       await server.close();

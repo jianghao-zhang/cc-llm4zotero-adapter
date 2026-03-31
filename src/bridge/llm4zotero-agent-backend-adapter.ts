@@ -90,8 +90,8 @@ export class Llm4ZoteroAgentBackendAdapter {
         type: "confirmation_required",
         requestId: `confirm-${Date.now()}`,
         action: {
-          toolName: requested.toolName,
-          title: `Approve ${requested.toolName}`,
+          toolName: `/${requested.toolName}`,
+          title: `Approve /${requested.toolName}`,
           mode: "approval",
           confirmLabel: "Run",
           cancelLabel: "Cancel",
@@ -116,22 +116,19 @@ export class Llm4ZoteroAgentBackendAdapter {
       };
     }
 
-    const instruction = [
-      `Execute exactly one tool call: ${requested.toolName}.`,
-      "Do not choose a different tool.",
-      `Use these arguments JSON:\n${JSON.stringify(requested.args ?? {}, null, 2)}`,
-      "After the tool returns, provide a concise result summary.",
-    ].join("\n\n");
+    const argumentText = this.readCommandArguments(requested.args);
+    const slashPrompt = argumentText
+      ? `/${requested.toolName} ${argumentText}`
+      : `/${requested.toolName}`;
 
     return this.runTurn({
       request: {
         conversationKey: requested.conversationKey,
-        userText: instruction,
-        allowedTools: [requested.toolName],
+        userText: slashPrompt,
         metadata: {
           ...(requested.metadata || {}),
           runType: "action",
-          toolName: requested.toolName,
+          toolName: `/${requested.toolName}`,
           actionArgs: requested.args,
           activeItemId: requested.activeItemId,
           libraryID: requested.libraryID,
@@ -142,5 +139,18 @@ export class Llm4ZoteroAgentBackendAdapter {
       onEvent: params.onEvent,
       signal: params.signal,
     });
+  }
+
+  private readCommandArguments(args: unknown): string {
+    if (typeof args === "string") {
+      return args.trim();
+    }
+    if (args && typeof args === "object") {
+      const record = args as Record<string, unknown>;
+      if (typeof record.arguments === "string") {
+        return record.arguments.trim();
+      }
+    }
+    return "";
   }
 }

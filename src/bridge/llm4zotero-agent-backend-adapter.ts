@@ -7,6 +7,20 @@ import type {
 import { mapToLlm4ZoteroEvent } from "../event-mapper/map-to-llm4zotero-event.js";
 import { findToolByName, getToolCatalog } from "./tool-catalog.js";
 
+const CATASTROPHIC_ARG_PATTERNS: RegExp[] = [
+  /\brm\s+-rf\s+\/(?!\S)/i,
+  /\bsudo\s+rm\s+-rf\b/i,
+  /\bmkfs(\.\w+)?\b/i,
+  /\bdd\s+if=.*\sof=\/dev\//i,
+  /:\(\)\s*\{\s*:\|:&\s*\};:/i,
+];
+
+function hasCatastrophicCommandPattern(argumentText: string): boolean {
+  const text = argumentText.trim();
+  if (!text) return false;
+  return CATASTROPHIC_ARG_PATTERNS.some((pattern) => pattern.test(text));
+}
+
 export class Llm4ZoteroAgentBackendAdapter {
   constructor(private readonly adapter: ClaudeCodeRuntimeAdapter) {}
 
@@ -117,6 +131,19 @@ export class Llm4ZoteroAgentBackendAdapter {
     }
 
     const argumentText = this.readCommandArguments(requested.args);
+    if (hasCatastrophicCommandPattern(argumentText)) {
+      await params.onEvent?.({
+        type: "status",
+        text: "Blocked a potentially destructive command pattern.",
+      });
+      return {
+        kind: "fallback",
+        runId: `action-${Date.now()}`,
+        reason: "dangerous_command_blocked",
+        usedFallback: true,
+      };
+    }
+
     const slashPrompt = argumentText
       ? `/${requested.toolName} ${argumentText}`
       : `/${requested.toolName}`;

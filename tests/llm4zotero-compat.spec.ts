@@ -132,4 +132,43 @@ describe("Llm4ZoteroAgentBackendAdapter", () => {
     expect(outcome.kind).toBe("completed");
     expect(seen).toEqual(["message_delta", "final"]);
   });
+
+  it("blocks catastrophic action arguments before runtime execution", async () => {
+    let turnCalls = 0;
+    const runtimeClient: ClaudeCodeRuntimeClient = {
+      async startTurn() {
+        turnCalls += 1;
+        return {
+          runId: "run-z-blocked",
+          events: providerEvents([{ type: "final", payload: { output: "should not run" } }]),
+        };
+      },
+    };
+
+    const base = new ClaudeCodeRuntimeAdapter({
+      runtimeClient,
+      sessionMapper: new InMemorySessionMapper(),
+    });
+    const compat = new Llm4ZoteroAgentBackendAdapter(base);
+    const candidateTool = compat.listTools()[0];
+    expect(candidateTool).toBeDefined();
+
+    const seen: string[] = [];
+    const outcome = await compat.runAction({
+      request: {
+        conversationKey: "conv-danger",
+        toolName: candidateTool!.name,
+        args: { arguments: "rm -rf /" },
+        approved: true,
+      },
+      onEvent(event) {
+        seen.push(event.type);
+      },
+    });
+
+    expect(outcome.kind).toBe("fallback");
+    expect(outcome.reason).toBe("dangerous_command_blocked");
+    expect(turnCalls).toBe(0);
+    expect(seen).toContain("status");
+  });
 });

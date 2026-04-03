@@ -46,6 +46,7 @@ type RuntimeRequestShape = {
   userText?: unknown;
   selectedTexts?: unknown;
   selectedPaperContexts?: unknown;
+  paperContexts?: unknown;
   fullTextPaperContexts?: unknown;
   pinnedPaperContexts?: unknown;
   attachments?: unknown;
@@ -178,6 +179,64 @@ function collectPaperTitles(entries: unknown, limit: number): string[] {
   return titles;
 }
 
+type RuntimePaperPathEntry = {
+  title: string;
+  contextItemId?: number;
+  contextFilePath?: string;
+  mineruFullMdPath?: string;
+  mineruCacheDir?: string;
+};
+
+function asPath(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim();
+  if (!normalized || !normalized.startsWith("/")) return undefined;
+  return normalized;
+}
+
+function collectPaperPathEntries(entries: unknown, limit: number): RuntimePaperPathEntry[] {
+  if (!Array.isArray(entries) || limit <= 0) return [];
+  const collected: RuntimePaperPathEntry[] = [];
+  for (const raw of entries) {
+    if (collected.length >= limit) break;
+    const record = asRecord(raw);
+    if (!record) continue;
+    const title = trimInline(record.title, 140) || "paper";
+    const contextItemId =
+      typeof record.contextItemId === "number" && Number.isFinite(record.contextItemId)
+        ? Math.floor(record.contextItemId)
+        : undefined;
+    const contextFilePath = asPath(record.contextFilePath);
+    const mineruFullMdPath = asPath(record.mineruFullMdPath);
+    const mineruCacheDir = asPath(record.mineruCacheDir);
+    if (!contextFilePath && !mineruFullMdPath && !mineruCacheDir && !contextItemId) {
+      continue;
+    }
+    collected.push({
+      title,
+      contextItemId,
+      contextFilePath,
+      mineruFullMdPath,
+      mineruCacheDir,
+    });
+  }
+  return collected;
+}
+
+function formatPaperPathLines(entries: RuntimePaperPathEntry[]): string[] {
+  return entries.map((entry) => {
+    const pathHints = [
+      entry.mineruFullMdPath ? `MinerU md: ${entry.mineruFullMdPath}` : "",
+      entry.contextFilePath ? `attachment: ${entry.contextFilePath}` : "",
+      entry.mineruCacheDir ? `MinerU dir: ${entry.mineruCacheDir}` : "",
+      typeof entry.contextItemId === "number"
+        ? `contextItemId=${entry.contextItemId}`
+        : "",
+    ].filter(Boolean);
+    return `- ${entry.title}${pathHints.length ? ` [${pathHints.join(" | ")}]` : ""}`;
+  });
+}
+
 function buildPromptText(
   userMessage: string,
   runtimeRequest: RuntimeRequestShape | undefined,
@@ -209,11 +268,33 @@ function buildPromptText(
     );
   }
 
+  const selectedPaperPathEntries = collectPaperPathEntries(
+    runtimeRequest.selectedPaperContexts ?? runtimeRequest.paperContexts,
+    8,
+  );
+  if (selectedPaperPathEntries.length) {
+    lines.push(
+      "Selected paper contexts with local readable paths (prefer MinerU md, then attachment path):",
+      ...formatPaperPathLines(selectedPaperPathEntries),
+    );
+  }
+
   const fullTextPapers = collectPaperTitles(runtimeRequest.fullTextPaperContexts, 4);
   if (fullTextPapers.length) {
     lines.push(
       "Papers marked for full-text reading:",
       ...fullTextPapers.map((title) => `- ${title}`),
+    );
+  }
+
+  const fullTextPaperPathEntries = collectPaperPathEntries(
+    runtimeRequest.fullTextPaperContexts,
+    6,
+  );
+  if (fullTextPaperPathEntries.length) {
+    lines.push(
+      "Full-text paper contexts with local readable paths:",
+      ...formatPaperPathLines(fullTextPaperPathEntries),
     );
   }
 

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import type { ClaudeCodeRuntimeClient, RuntimeTurnRequest, RuntimeTurnStream } from "../runtime.js";
 import { mapSdkMessageToProviderEvents } from "../event-mapper/map-sdk-message.js";
 import type { PermissionMode, SDKUserMessage, SettingSource } from "@anthropic-ai/claude-agent-sdk";
@@ -60,6 +61,14 @@ const IMAGE_MIME_BY_KIND: Record<string, "image/jpeg" | "image/png" | "image/gif
   webp: "image/webp",
 };
 
+const IMAGE_MIME_FROM_TYPE: Record<string, "image/jpeg" | "image/png" | "image/gif" | "image/webp"> = {
+  "image/jpeg": "image/jpeg",
+  "image/jpg": "image/jpeg",
+  "image/png": "image/png",
+  "image/gif": "image/gif",
+  "image/webp": "image/webp",
+};
+
 function trimInline(value: unknown, max = 280): string {
   if (typeof value !== "string") return "";
   const normalized = value.replace(/\s+/g, " ").trim();
@@ -96,6 +105,46 @@ function parseImageDataUrl(
   const data = match[2].replace(/\s+/g, "");
   if (!data) return null;
   return { mediaType, data };
+}
+
+function resolveImageMediaType(attachment: RuntimeAttachment): "image/jpeg" | "image/png" | "image/gif" | "image/webp" | null {
+  const mimeType = typeof attachment.mimeType === "string" ? attachment.mimeType.trim().toLowerCase() : "";
+  if (mimeType && IMAGE_MIME_FROM_TYPE[mimeType]) {
+    return IMAGE_MIME_FROM_TYPE[mimeType];
+  }
+  const name = typeof attachment.name === "string" ? attachment.name.trim().toLowerCase() : "";
+  if (name.endsWith(".png")) return "image/png";
+  if (name.endsWith(".gif")) return "image/gif";
+  if (name.endsWith(".webp")) return "image/webp";
+  if (name.endsWith(".jpg") || name.endsWith(".jpeg")) return "image/jpeg";
+  return null;
+}
+
+async function loadAttachmentImagePayloads(
+  runtimeRequest: RuntimeRequestShape | undefined,
+  limit: number,
+): Promise<Array<{ mediaType: "image/jpeg" | "image/png" | "image/gif" | "image/webp"; data: string }>> {
+  if (!runtimeRequest || !Array.isArray(runtimeRequest.attachments) || limit <= 0) return [];
+  const payloads: Array<{ mediaType: "image/jpeg" | "image/png" | "image/gif" | "image/webp"; data: string }> = [];
+  for (const raw of runtimeRequest.attachments as RuntimeAttachment[]) {
+    if (payloads.length >= limit) break;
+    if (!raw || typeof raw !== "object") continue;
+    const storedPath = typeof raw.storedPath === "string" ? raw.storedPath.trim() : "";
+    if (!storedPath || !storedPath.startsWith("/")) continue;
+    const category = typeof raw.category === "string" ? raw.category.trim().toLowerCase() : "";
+    const mediaType = resolveImageMediaType(raw);
+    const isImage = category === "image" || Boolean(mediaType);
+    if (!isImage || !mediaType) continue;
+    try {
+      const buffer = await readFile(storedPath);
+      const data = buffer.toString("base64");
+      if (!data) continue;
+      payloads.push({ mediaType, data });
+    } catch {
+      // best effort: keep prompt text path fallback, but skip block if unreadable
+    }
+  }
+  return payloads;
 }
 
 function collectAttachmentPaths(runtimeRequest: RuntimeRequestShape | undefined): string[] {
@@ -200,19 +249,24 @@ function buildPromptText(
   return lines.filter(Boolean).join("\n\n");
 }
 
-function buildPromptInput(
+async function buildPromptInput(
   request: RuntimeTurnRequest,
   metadata: Record<string, unknown>,
-): string | AsyncIterable<SDKUserMessage> {
+): Promise<string | AsyncIterable<SDKUserMessage>> {
   const runtimeRequest = toRuntimeRequest(request, metadata);
   const promptText = buildPromptText(request.userMessage, runtimeRequest);
 
-  const imagePayloads = Array.isArray(runtimeRequest?.screenshots)
+  const screenshotPayloads = Array.isArray(runtimeRequest?.screenshots)
     ? runtimeRequest!.screenshots
         .map((entry) => parseImageDataUrl(entry))
         .filter((entry): entry is NonNullable<typeof entry> => Boolean(entry))
         .slice(0, 8)
     : [];
+  const attachmentImagePayloads = await loadAttachmentImagePayloads(
+    runtimeRequest,
+    Math.max(0, 8 - screenshotPayloads.length),
+  );
+  const imagePayloads = [...screenshotPayloads, ...attachmentImagePayloads].slice(0, 8);
   if (!imagePayloads.length) {
     return promptText;
   }
@@ -297,7 +351,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       Object.entries(queryOptions).filter(([, value]) => value !== undefined)
     );
 
-    const prompt = buildPromptInput(request, metadata);
+    const prompt = await buildPromptInput(request, metadata);
     const sdkStream = query({
       prompt,
       options: cleanedOptions

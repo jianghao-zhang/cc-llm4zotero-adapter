@@ -7,7 +7,7 @@ import {
   startHttpBridgeServer,
 } from "../src/index.js";
 import type { SettingSource } from "@anthropic-ai/claude-agent-sdk";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 
 function getArg(name: string): string | undefined {
   const flag = `--${name}`;
@@ -57,10 +57,23 @@ async function main() {
     throw new Error(`Invalid port: ${portRaw}`);
   }
 
+  const homeDir = process.env.HOME && process.env.HOME.trim()
+    ? process.env.HOME.trim()
+    : undefined;
+  const defaultRuntimeCwd = homeDir || process.cwd();
+  const defaultStateDir = (() => {
+    if (homeDir && existsSync(`${homeDir}/Zotero`)) {
+      return `${homeDir}/Zotero/agent-state`;
+    }
+    if (homeDir) {
+      return `${homeDir}/agent-state`;
+    }
+    return `${process.cwd()}/.adapter-state`;
+  })();
   const stateDir =
     getArg("state-dir") ||
     process.env.ADAPTER_STATE_DIR ||
-    `${process.cwd()}/.adapter-state`;
+    defaultStateDir;
   const forwardFrontendModel = parseBoolean(
     getArg("forward-frontend-model") ?? process.env.ADAPTER_FORWARD_FRONTEND_MODEL,
     false,
@@ -68,7 +81,7 @@ async function main() {
   const runtimeCwd =
     getArg("runtime-cwd") ||
     process.env.ADAPTER_RUNTIME_CWD ||
-    process.cwd();
+    defaultRuntimeCwd;
   const settingSources = parseSettingSources(
     getArg("setting-sources") || process.env.ADAPTER_SETTING_SOURCES,
   );
@@ -94,8 +107,12 @@ async function main() {
 
   const core = new ClaudeCodeRuntimeAdapter({
     runtimeClient,
-    sessionMapper: new JsonFileSessionMapper(`${stateDir}/sessions.json`),
-    traceStore: new JsonFileTraceStore(`${stateDir}/trace.json`),
+    sessionMapper: new JsonFileSessionMapper(
+      `${stateDir}/session-links/sessions.json`,
+    ),
+    traceStore: new JsonFileTraceStore(
+      `${stateDir}/turn-traces/trace.json`,
+    ),
   });
 
   const compat = new Llm4ZoteroAgentBackendAdapter(core);
@@ -104,6 +121,7 @@ async function main() {
   console.log(`[cc-llm4zotero-adapter] listening on http://${server.host}:${server.port}`);
   console.log(`[cc-llm4zotero-adapter] healthz: http://${server.host}:${server.port}/healthz`);
   console.log(`[cc-llm4zotero-adapter] runtime cwd: ${runtimeCwd}`);
+  console.log(`[cc-llm4zotero-adapter] state dir: ${stateDir}`);
   console.log(`[cc-llm4zotero-adapter] settingSources: ${settingSources.join(",")}`);
   if (appendSystemPrompt) {
     console.log("[cc-llm4zotero-adapter] appendSystemPrompt: enabled");

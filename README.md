@@ -44,6 +44,18 @@ Start bridge server:
 npx tsx bin/start-bridge-server.ts --host 127.0.0.1 --port 18787
 ```
 
+Zotero-focused default startup (recommended):
+
+```bash
+npm run serve:bridge:zotero
+```
+
+This uses:
+- `runtime-cwd = $HOME` (so Claude Code can read both `~/Zotero` and your repos)
+- `state-dir = $HOME/Zotero/agent-state`
+  - session links: `session-links/sessions.json`
+  - traces: `turn-traces/trace.json`
+
 Isolation-first recommendation (keep Zotero runs separate from your daily Claude Code usage):
 
 ```bash
@@ -60,7 +72,9 @@ CLI/env options:
 - `--setting-sources` or `ADAPTER_SETTING_SOURCES`: comma-separated settings sources (`user,project,local`).
 - `--append-system-prompt` or `ADAPTER_APPEND_SYSTEM_PROMPT`: inline overlay prompt text.
 - `--append-system-prompt-file` or `ADAPTER_APPEND_SYSTEM_PROMPT_FILE`: file-based overlay prompt text.
-- Default is `project,local` (does not load global `user` settings unless explicitly requested).
+- Default `runtime-cwd` is `$HOME` when available.
+- Default `state-dir` is `$HOME/Zotero/agent-state` when `~/Zotero` exists (otherwise `$HOME/agent-state`).
+- Default `settingSources` is `project,local` (does not load global `user` settings unless explicitly requested).
 
 Model/profile behavior:
 - By default, frontend `metadata.model` is ignored.

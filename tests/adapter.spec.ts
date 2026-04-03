@@ -94,4 +94,52 @@ describe("ClaudeCodeRuntimeAdapter", () => {
 
     expect(seenTypes).toEqual(["fallback"]);
   });
+
+  it("retries with fresh session when thinking signature is invalid", async () => {
+    let callCount = 0;
+    const runtimeClient: ClaudeCodeRuntimeClient = {
+      async startTurn(request) {
+        callCount += 1;
+        if (callCount === 1) {
+          throw new Error("API Error: 400 Invalid signature in thinking block");
+        }
+        return {
+          runId: "run-ok",
+          providerSessionId: "fresh-session-id",
+          events: providerEvents([
+            { type: "message_delta", payload: { delta: "ok" } },
+            { type: "final", payload: { output: "ok" } }
+          ])
+        };
+      }
+    };
+
+    const sessionMapper = new InMemorySessionMapper();
+    await sessionMapper.set("conv-retry", "stale-session");
+    const adapter = new ClaudeCodeRuntimeAdapter({
+      runtimeClient,
+      sessionMapper
+    });
+
+    const seenStatuses: string[] = [];
+    const outcome = await adapter.runTurn(
+      {
+        conversationKey: "conv-retry",
+        userMessage: "retry me"
+      },
+      {
+        onEvent(event) {
+          if (event.type === "status" && typeof event.payload.text === "string") {
+            seenStatuses.push(event.payload.text);
+          }
+        }
+      }
+    );
+
+    expect(callCount).toBe(2);
+    expect(outcome.status).toBe("completed");
+    expect(outcome.finalText).toBe("ok");
+    expect(await sessionMapper.get("conv-retry")).toBe("fresh-session-id");
+    expect(seenStatuses.some((line) => line.includes("Session signature mismatch"))).toBe(true);
+  });
 });

@@ -24,18 +24,59 @@ export class ClaudeCodeRuntimeAdapter {
   async runTurn(request: RunTurnRequest, hooks: RunTurnHooks = {}): Promise<RunTurnOutcome> {
     const signal = hooks.signal ?? request.signal;
     const initialSessionId = await this.sessionMapper.get(request.conversationKey);
-    let resolvedSessionId = initialSessionId;
+    let firstOutcome: RunTurnOutcome;
+    try {
+      firstOutcome = await this.runTurnOnce(request, hooks, signal, initialSessionId);
+    } catch (error) {
+      const err = error instanceof Error ? error : new Error(String(error));
+      if (initialSessionId && this.isInvalidThinkingSignatureError(err.message)) {
+        await this.sessionMapper.delete(request.conversationKey);
+        await hooks.onEvent?.({
+          type: "status",
+          ts: Date.now(),
+          payload: {
+            text: "Session signature mismatch detected. Retrying with a fresh Claude session."
+          }
+        });
+        return this.runTurnOnce(request, hooks, signal, undefined);
+      }
+      throw err;
+    }
+    if (
+      initialSessionId &&
+      firstOutcome.status === "failed" &&
+      this.isInvalidThinkingSignatureError(firstOutcome.error)
+    ) {
+      await this.sessionMapper.delete(request.conversationKey);
+      await hooks.onEvent?.({
+        type: "status",
+        ts: Date.now(),
+        payload: {
+          text: "Session signature mismatch detected. Retrying with a fresh Claude session."
+        }
+      });
+      firstOutcome = await this.runTurnOnce(request, hooks, signal, undefined);
+    }
+    return firstOutcome;
+  }
 
+  private async runTurnOnce(
+    request: RunTurnRequest,
+    hooks: RunTurnHooks,
+    signal: AbortSignal | undefined,
+    providerSessionId: string | undefined
+  ): Promise<RunTurnOutcome> {
     const stream = await this.runtimeClient.startTurn({
       conversationKey: request.conversationKey,
       userMessage: request.userMessage,
-      providerSessionId: initialSessionId,
+      providerSessionId,
       allowedTools: request.allowedTools,
       runtimeRequest: request.runtimeRequest,
       metadata: request.metadata,
       signal
     });
 
+    let resolvedSessionId = providerSessionId;
     if (stream.providerSessionId) {
       resolvedSessionId = stream.providerSessionId;
       await this.sessionMapper.set(request.conversationKey, stream.providerSessionId);
@@ -44,7 +85,7 @@ export class ClaudeCodeRuntimeAdapter {
     hooks.onStart?.({
       runId: stream.runId,
       conversationKey: request.conversationKey,
-      providerSessionId: stream.providerSessionId ?? initialSessionId
+      providerSessionId: stream.providerSessionId ?? providerSessionId
     });
 
     let finalText = "";
@@ -127,5 +168,14 @@ export class ClaudeCodeRuntimeAdapter {
       }
     }
     return undefined;
+  }
+
+  private isInvalidThinkingSignatureError(message: string | undefined): boolean {
+    if (!message) return false;
+    const normalized = message.toLowerCase();
+    return (
+      normalized.includes("invalid signature in thinking block") ||
+      normalized.includes("thinking block") && normalized.includes("invalid signature")
+    );
   }
 }

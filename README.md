@@ -91,7 +91,6 @@ CLI/env options:
 - Default `runtime-cwd` is `$HOME/Zotero/agent-runtime` when `~/Zotero` exists.
 - Default additional readable directories are `$HOME/Zotero`, `$HOME/Downloads`, `$HOME/Documents`.
 - Runtime cwd is validated:
-  - using HOME directly is forbidden
   - runtime cwd must be inside `~/Zotero` when that directory exists
 - Default `state-dir` is `$HOME/Zotero/agent-state` when `~/Zotero` exists (otherwise `$HOME/agent-state`).
 - Default `settingSources` is `project,local` (does not load global `user` settings unless explicitly requested).

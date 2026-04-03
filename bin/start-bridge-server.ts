@@ -127,12 +127,6 @@ async function main() {
   const stateDirResolved = resolve(stateDir);
 
   if (homeDir) {
-    const resolvedHome = resolve(homeDir);
-    if (runtimeCwd === resolvedHome) {
-      throw new Error(
-        `Invalid runtime cwd: ${runtimeCwd}. Using HOME directly is forbidden. Use a Zotero subdirectory such as ${resolve(resolvedHome, "Zotero/agent-runtime")}.`,
-      );
-    }
     if (zoteroRoot && existsSync(zoteroRoot)) {
       const rel = relative(zoteroRoot, runtimeCwd);
       const insideZotero = rel === "" || (!rel.startsWith("..") && !rel.startsWith("/"));

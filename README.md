@@ -51,12 +51,15 @@ npx tsx bin/start-bridge-server.ts \
   --host 127.0.0.1 \
   --port 18787 \
   --runtime-cwd "$HOME/claude-profiles/zotero-harness" \
-  --setting-sources project,local
+  --setting-sources project,local \
+  --append-system-prompt-file "$HOME/claude-profiles/zotero-harness/prompts/literature-overlay.md"
 ```
 
 CLI/env options:
 - `--runtime-cwd` or `ADAPTER_RUNTIME_CWD`: workspace root Claude Agent SDK should run in.
 - `--setting-sources` or `ADAPTER_SETTING_SOURCES`: comma-separated settings sources (`user,project,local`).
+- `--append-system-prompt` or `ADAPTER_APPEND_SYSTEM_PROMPT`: inline overlay prompt text.
+- `--append-system-prompt-file` or `ADAPTER_APPEND_SYSTEM_PROMPT_FILE`: file-based overlay prompt text.
 - Default is `project,local` (does not load global `user` settings unless explicitly requested).
 
 Model/profile behavior:

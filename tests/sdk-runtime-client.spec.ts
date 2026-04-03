@@ -94,6 +94,27 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
     expect(seenOptions.model).toBe("gemini-3.1-pro-preview");
   });
 
+  it("forwards appendSystemPrompt option to sdk query options", async () => {
+    let seenOptions: Record<string, unknown> = {};
+
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      appendSystemPrompt: "Use evidence-first reading style.",
+      queryImpl(args) {
+        seenOptions = args.options;
+        return makeStream([
+          { type: "result", session_id: "session-new", result: "ok", is_error: false }
+        ]);
+      }
+    });
+
+    await runtime.startTurn({
+      conversationKey: "conv-1",
+      userMessage: "hello"
+    });
+
+    expect(seenOptions.appendSystemPrompt).toBe("Use evidence-first reading style.");
+  });
+
   it("adapter updates session mapper from streamed sessionId", async () => {
     const runtime = new ClaudeAgentSdkRuntimeClient({
       queryImpl() {

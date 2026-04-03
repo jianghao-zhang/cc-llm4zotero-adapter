@@ -7,6 +7,7 @@ import {
   startHttpBridgeServer,
 } from "../src/index.js";
 import type { SettingSource } from "@anthropic-ai/claude-agent-sdk";
+import { readFileSync } from "node:fs";
 
 function getArg(name: string): string | undefined {
   const flag = `--${name}`;
@@ -38,6 +39,16 @@ function parseSettingSources(value: string | undefined): SettingSource[] {
   return accepted.length > 0 ? accepted : ["project", "local"];
 }
 
+function readTextFile(path: string | undefined): string {
+  if (!path) return "";
+  try {
+    return readFileSync(path, "utf8").trim();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Failed to read file: ${path} (${message})`);
+  }
+}
+
 async function main() {
   const host = getArg("host") || process.env.ADAPTER_HOST || "127.0.0.1";
   const portRaw = getArg("port") || process.env.ADAPTER_PORT || "8787";
@@ -61,11 +72,23 @@ async function main() {
   const settingSources = parseSettingSources(
     getArg("setting-sources") || process.env.ADAPTER_SETTING_SOURCES,
   );
+  const appendPromptInline =
+    getArg("append-system-prompt") ||
+    process.env.ADAPTER_APPEND_SYSTEM_PROMPT ||
+    "";
+  const appendPromptFile = readTextFile(
+    getArg("append-system-prompt-file") ||
+      process.env.ADAPTER_APPEND_SYSTEM_PROMPT_FILE,
+  );
+  const appendSystemPrompt = [appendPromptInline.trim(), appendPromptFile.trim()]
+    .filter(Boolean)
+    .join("\n\n");
 
   const runtimeClient = new ClaudeAgentSdkRuntimeClient({
     cwd: runtimeCwd,
     settingSources,
     includePartialMessages: true,
+    appendSystemPrompt: appendSystemPrompt || undefined,
     forwardFrontendModel,
   });
 
@@ -82,6 +105,9 @@ async function main() {
   console.log(`[cc-llm4zotero-adapter] healthz: http://${server.host}:${server.port}/healthz`);
   console.log(`[cc-llm4zotero-adapter] runtime cwd: ${runtimeCwd}`);
   console.log(`[cc-llm4zotero-adapter] settingSources: ${settingSources.join(",")}`);
+  if (appendSystemPrompt) {
+    console.log("[cc-llm4zotero-adapter] appendSystemPrompt: enabled");
+  }
   console.log("[cc-llm4zotero-adapter] Press Ctrl+C to stop");
 
   const shutdown = async () => {

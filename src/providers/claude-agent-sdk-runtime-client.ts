@@ -15,6 +15,7 @@ export interface ClaudeAgentSdkRuntimeClientOptions {
   includePartialMessages?: boolean;
   maxTurns?: number;
   continue?: boolean;
+  appendSystemPrompt?: string;
   forwardFrontendModel?: boolean;
   blockedMetadataKeys?: string[];
   queryImpl?: QueryFunction;
@@ -79,6 +80,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       includePartialMessages: this.options.includePartialMessages,
       maxTurns: this.options.maxTurns,
       continue: this.options.continue,
+      appendSystemPrompt: this.options.appendSystemPrompt,
       resume: request.providerSessionId,
       abortController: request.signal ? this.createAbortController(request.signal) : undefined,
     };

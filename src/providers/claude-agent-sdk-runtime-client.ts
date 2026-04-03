@@ -423,6 +423,22 @@ function parseMetadata(
   return result;
 }
 
+function parseSettingSourcesOverride(
+  metadata: Record<string, unknown>,
+): SettingSource[] | undefined {
+  const raw = metadata.claudeSettingSources;
+  if (!Array.isArray(raw)) return undefined;
+  const allowed = new Set<SettingSource>(["user", "project", "local"]);
+  const next: SettingSource[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== "string") continue;
+    const normalized = entry.trim().toLowerCase() as SettingSource;
+    if (!allowed.has(normalized)) continue;
+    if (!next.includes(normalized)) next.push(normalized);
+  }
+  return next.length > 0 ? next : undefined;
+}
+
 function mergeAllowedTools(
   requestAllowedTools: string[] | undefined,
   defaultAllowedTools: string[] | undefined,
@@ -449,6 +465,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
   async startTurn(request: RuntimeTurnRequest): Promise<RuntimeTurnStream> {
     const query = this.options.queryImpl ?? (await this.loadQuery());
     const metadata = parseMetadata(request.metadata, this.options);
+    const settingSourcesOverride = parseSettingSourcesOverride(metadata);
     const effectiveCwd = this.resolveScopedCwd(request.metadata);
 
     const queryOptions: Record<string, unknown> = {
@@ -456,7 +473,8 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       cwd: effectiveCwd,
       additionalDirectories: this.options.additionalDirectories,
       allowedTools: mergeAllowedTools(request.allowedTools, this.options.defaultAllowedTools),
-      settingSources: this.options.settingSources ?? ["user", "project"],
+      settingSources:
+        settingSourcesOverride ?? this.options.settingSources ?? ["user", "project"],
       permissionMode: this.options.permissionMode,
       includePartialMessages: this.options.includePartialMessages,
       maxTurns: this.options.maxTurns,

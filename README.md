@@ -69,10 +69,12 @@ npx tsx bin/start-bridge-server.ts \
 
 CLI/env options:
 - `--runtime-cwd` or `ADAPTER_RUNTIME_CWD`: workspace root Claude Agent SDK should run in.
+- `--additional-directories` or `ADAPTER_ADDITIONAL_DIRECTORIES`: extra readable directories (comma-separated absolute paths, `~` supported).
 - `--setting-sources` or `ADAPTER_SETTING_SOURCES`: comma-separated settings sources (`user,project,local`).
 - `--append-system-prompt` or `ADAPTER_APPEND_SYSTEM_PROMPT`: inline overlay prompt text.
 - `--append-system-prompt-file` or `ADAPTER_APPEND_SYSTEM_PROMPT_FILE`: file-based overlay prompt text.
 - Default `runtime-cwd` is `$HOME/Zotero/agent-runtime` when `~/Zotero` exists.
+- Default additional readable directories are `$HOME/Zotero`, `$HOME/Downloads`, `$HOME/Documents`.
 - Runtime cwd is validated:
   - using HOME directly is forbidden
   - runtime cwd must be inside `~/Zotero` when that directory exists

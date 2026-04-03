@@ -13,6 +13,7 @@ type QueryFunction = (args: {
 
 export interface ClaudeAgentSdkRuntimeClientOptions {
   cwd?: string;
+  additionalDirectories?: string[];
   settingSources?: SettingSource[];
   permissionMode?: PermissionMode;
   includePartialMessages?: boolean;
@@ -436,6 +437,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     const queryOptions: Record<string, unknown> = {
       ...metadata,
       cwd: effectiveCwd,
+      additionalDirectories: this.options.additionalDirectories,
       allowedTools: request.allowedTools,
       settingSources: this.options.settingSources ?? ["user", "project"],
       permissionMode: this.options.permissionMode,

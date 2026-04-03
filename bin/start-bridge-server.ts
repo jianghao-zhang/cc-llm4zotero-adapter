@@ -40,6 +40,30 @@ function parseSettingSources(value: string | undefined): SettingSource[] {
   return accepted.length > 0 ? accepted : ["project", "local"];
 }
 
+function normalizePathWithHome(value: string, homeDir: string | undefined): string | undefined {
+  const raw = value.trim();
+  if (!raw) return undefined;
+  if (raw === "~") {
+    return homeDir ? resolve(homeDir) : undefined;
+  }
+  if (raw.startsWith("~/")) {
+    return homeDir ? resolve(homeDir, raw.slice(2)) : undefined;
+  }
+  return resolve(raw);
+}
+
+function parseDirectoryList(
+  value: string | undefined,
+  homeDir: string | undefined,
+): string[] {
+  if (!value || !value.trim()) return [];
+  const normalized = value
+    .split(",")
+    .map((entry) => normalizePathWithHome(entry, homeDir))
+    .filter((entry): entry is string => Boolean(entry));
+  return Array.from(new Set(normalized));
+}
+
 function readTextFile(path: string | undefined): string {
   if (!path) return "";
   try {
@@ -124,9 +148,27 @@ async function main() {
   const appendSystemPrompt = [appendPromptInline.trim(), appendPromptFile.trim()]
     .filter(Boolean)
     .join("\n\n");
+  const defaultAdditionalDirs = [
+    normalizePathWithHome("~/Zotero", homeDir),
+    normalizePathWithHome("~/Downloads", homeDir),
+    normalizePathWithHome("~/Documents", homeDir),
+  ].filter((entry): entry is string => Boolean(entry));
+  const configuredAdditionalDirs = parseDirectoryList(
+    getArg("additional-directories") || process.env.ADAPTER_ADDITIONAL_DIRECTORIES,
+    homeDir,
+  );
+  const additionalDirectories = Array.from(
+    new Set(
+      [...defaultAdditionalDirs, ...configuredAdditionalDirs].filter((entry) => entry !== runtimeCwd),
+    ),
+  );
+  for (const dir of additionalDirectories) {
+    mkdirSync(dir, { recursive: true });
+  }
 
   const runtimeClient = new ClaudeAgentSdkRuntimeClient({
     cwd: runtimeCwd,
+    additionalDirectories,
     settingSources,
     includePartialMessages: true,
     appendSystemPrompt: appendSystemPrompt || undefined,
@@ -149,6 +191,11 @@ async function main() {
   console.log(`[cc-llm4zotero-adapter] listening on http://${server.host}:${server.port}`);
   console.log(`[cc-llm4zotero-adapter] healthz: http://${server.host}:${server.port}/healthz`);
   console.log(`[cc-llm4zotero-adapter] runtime cwd: ${runtimeCwd}`);
+  console.log(
+    `[cc-llm4zotero-adapter] additional directories: ${
+      additionalDirectories.length > 0 ? additionalDirectories.join(", ") : "(none)"
+    }`,
+  );
   console.log(`[cc-llm4zotero-adapter] state dir: ${stateDirResolved}`);
   console.log(`[cc-llm4zotero-adapter] settingSources: ${settingSources.join(",")}`);
   if (appendSystemPrompt) {

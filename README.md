@@ -54,6 +54,10 @@ npm run bridge:restart
 npm run bridge:stop
 ```
 
+Operational hard rule:
+- Do not ask the user to manually switch bridge settings in Zotero Run JavaScript during normal troubleshooting.
+- Treat bridge routing as a backend service responsibility (daemon health + config), not a user manual pref task.
+
 Zotero-focused default startup (recommended):
 
 ```bash

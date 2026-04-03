@@ -100,7 +100,7 @@ describe("Llm4ZoteroAgentBackendAdapter", () => {
     expect(outcome.usedFallback).toBe(true);
   });
 
-  it("suppresses unmapped_provider_event noise from UI stream", async () => {
+  it("forwards provider_event for unknown runtime events", async () => {
     const runtimeClient: ClaudeCodeRuntimeClient = {
       async startTurn() {
         return {
@@ -130,7 +130,7 @@ describe("Llm4ZoteroAgentBackendAdapter", () => {
     });
 
     expect(outcome.kind).toBe("completed");
-    expect(seen).toEqual(["message_delta", "final"]);
+    expect(seen).toEqual(["provider_event", "message_delta", "final"]);
   });
 
   it("blocks catastrophic action arguments before runtime execution", async () => {

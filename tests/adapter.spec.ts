@@ -63,7 +63,7 @@ describe("ClaudeCodeRuntimeAdapter", () => {
     expect(traces[0]?.runId).toBe("run-1");
   });
 
-  it("emits fallback on unmapped event", async () => {
+  it("emits provider_event on unmapped event", async () => {
     const runtimeClient: ClaudeCodeRuntimeClient = {
       async startTurn() {
         return {
@@ -92,7 +92,7 @@ describe("ClaudeCodeRuntimeAdapter", () => {
       }
     );
 
-    expect(seenTypes).toEqual(["fallback"]);
+    expect(seenTypes).toEqual(["provider_event"]);
   });
 
   it("retries with fresh session when thinking signature is invalid", async () => {

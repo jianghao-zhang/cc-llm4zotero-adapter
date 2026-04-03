@@ -17,6 +17,19 @@ export function mapToLlm4ZoteroEvent(event: AgentEvent): Llm4ZoteroAgentEvent | 
   const payload = asRecord(event.payload);
 
   switch (event.type) {
+    case "provider_event": {
+      const rawPayload =
+        payload.payload && typeof payload.payload === "object"
+          ? (payload.payload as Record<string, unknown>)
+          : payload;
+      return {
+        type: "provider_event",
+        providerType: asString(payload.providerType) || "unknown",
+        sessionId: asString(payload.sessionId) || asString(rawPayload.sessionId) || asString(rawPayload.session_id) || undefined,
+        payload: rawPayload,
+        ts: asNumber(payload.ts, event.ts),
+      };
+    }
     case "status": {
       const text =
         asString(payload.text) ||
@@ -83,11 +96,6 @@ export function mapToLlm4ZoteroEvent(event: AgentEvent): Llm4ZoteroAgentEvent | 
     }
     case "fallback": {
       const reason = asString(payload.reason) || "fallback";
-      // Claude SDK streams include many informational event variants.
-      // Keep them in backend trace, but suppress noisy unmapped markers in UI.
-      if (reason === "unmapped_provider_event") {
-        return null;
-      }
       return {
         type: "fallback",
         reason

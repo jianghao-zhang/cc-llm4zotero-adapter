@@ -1,4 +1,11 @@
 export type Llm4ZoteroAgentEvent =
+  | {
+      type: "provider_event";
+      providerType: string;
+      sessionId?: string;
+      payload: Record<string, unknown>;
+      ts: number;
+    }
   | { type: "status"; text: string }
   | { type: "reasoning"; round: number; summary?: string; details?: string }
   | { type: "tool_call"; callId: string; name: string; args: unknown }

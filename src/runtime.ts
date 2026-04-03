@@ -1,6 +1,7 @@
 import type { JsonObject } from "./types.js";
 
 export type ProviderEventType =
+  | "provider_event"
   | "status"
   | "tool_call"
   | "tool_result"

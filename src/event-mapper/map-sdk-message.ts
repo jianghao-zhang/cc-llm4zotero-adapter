@@ -64,9 +64,18 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
   const msg = asRecord(raw);
   const type = typeof msg.type === "string" ? msg.type : "unknown";
   const sessionId = getSessionId(msg);
+  const providerEvent: ProviderEvent = {
+    type: "provider_event",
+    payload: {
+      providerType: type,
+      sessionId,
+      ts: Date.now(),
+      payload: msg,
+    },
+  };
 
   if (type === "assistant") {
-    const events: ProviderEvent[] = [];
+    const events: ProviderEvent[] = [providerEvent];
     const message = asRecord(msg.message) as MessageContainer;
     for (const block of Array.isArray(message.content) ? message.content : []) {
       if (block.type === "text" && typeof block.text === "string") {
@@ -107,7 +116,7 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
   }
 
   if (type === "user") {
-    const events: ProviderEvent[] = [];
+    const events: ProviderEvent[] = [providerEvent];
     const directToolUseResult = msg.tool_use_result;
     if (directToolUseResult !== undefined) {
       events.push({
@@ -133,13 +142,15 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
       }
     }
 
-    if (events.length > 0) {
+    if (events.length > 1) {
       return events;
     }
+    return [providerEvent];
   }
 
   if (type === "result") {
     return [
+      providerEvent,
       {
         type: "final",
         payload: {
@@ -156,6 +167,7 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
 
   if (type === "system") {
     return [
+      providerEvent,
       {
         type: "status",
         payload: {
@@ -169,6 +181,7 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
 
   if (type === "tool_progress") {
     return [
+      providerEvent,
       {
         type: "status",
         payload: {
@@ -186,6 +199,7 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
       const delta = asRecord(event.delta);
       if (delta.type === "text_delta" && typeof delta.text === "string") {
         return [
+          providerEvent,
           {
             type: "message_delta",
             payload: {
@@ -199,14 +213,5 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
     }
   }
 
-  return [
-    {
-      type: "unknown",
-      payload: {
-        sourceType: type,
-        sessionId,
-        raw: msg
-      }
-    }
-  ];
+  return [providerEvent];
 }

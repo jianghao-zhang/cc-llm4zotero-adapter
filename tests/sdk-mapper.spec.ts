@@ -14,12 +14,16 @@ describe("mapSdkMessageToProviderEvents", () => {
       }
     });
 
-    expect(events).toHaveLength(2);
+    expect(events).toHaveLength(3);
     expect(events[0]).toMatchObject({
+      type: "provider_event",
+      payload: { providerType: "assistant", sessionId: "sess-1" }
+    });
+    expect(events[1]).toMatchObject({
       type: "message_delta",
       payload: { delta: "hello", sessionId: "sess-1" }
     });
-    expect(events[1]).toMatchObject({
+    expect(events[2]).toMatchObject({
       type: "tool_call",
       payload: { id: "toolu_1", name: "Read", sessionId: "sess-1" }
     });
@@ -35,6 +39,13 @@ describe("mapSdkMessageToProviderEvents", () => {
     });
 
     expect(events).toEqual([
+      {
+        type: "provider_event",
+        payload: expect.objectContaining({
+          providerType: "result",
+          sessionId: "sess-2",
+        })
+      },
       {
         type: "final",
         payload: {
@@ -63,6 +74,13 @@ describe("mapSdkMessageToProviderEvents", () => {
     });
 
     expect(events).toEqual([
+      {
+        type: "provider_event",
+        payload: expect.objectContaining({
+          providerType: "stream_event",
+          sessionId: "sess-3",
+        }),
+      },
       {
         type: "message_delta",
         payload: {

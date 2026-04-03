@@ -2,6 +2,7 @@ import type { ProviderEvent } from "../runtime.js";
 import type { AgentEvent } from "../types.js";
 
 const SUPPORTED_TYPES = new Set([
+  "provider_event",
   "status",
   "tool_call",
   "tool_result",
@@ -23,12 +24,14 @@ export function mapProviderEvent(event: ProviderEvent, ts = Date.now()): AgentEv
   }
 
   return {
-    type: "fallback",
+    type: "provider_event",
     ts,
     payload: {
-      reason: "unmapped_provider_event",
-      sourceType: event.type,
-      sourcePayload: event.payload
+      providerType: event.type,
+      payload:
+        event.payload && typeof event.payload === "object"
+          ? (event.payload as Record<string, unknown>)
+          : { value: event.payload },
     }
   };
 }

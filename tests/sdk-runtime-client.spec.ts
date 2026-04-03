@@ -47,7 +47,14 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
       types.push(event.type);
     }
 
-    expect(types).toEqual(["status", "message_delta", "final"]);
+    expect(types).toEqual([
+      "provider_event",
+      "status",
+      "provider_event",
+      "message_delta",
+      "provider_event",
+      "final"
+    ]);
   });
 
   it("ignores frontend model metadata by default", async () => {

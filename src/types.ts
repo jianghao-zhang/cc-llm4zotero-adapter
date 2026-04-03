@@ -1,4 +1,5 @@
 export type AgentEventType =
+  | "provider_event"
   | "status"
   | "tool_call"
   | "tool_result"

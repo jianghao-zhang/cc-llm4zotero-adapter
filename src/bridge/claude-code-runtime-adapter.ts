@@ -23,18 +23,7 @@ export class ClaudeCodeRuntimeAdapter {
 
   async runTurn(request: RunTurnRequest, hooks: RunTurnHooks = {}): Promise<RunTurnOutcome> {
     const signal = hooks.signal ?? request.signal;
-    const storedSessionId = await this.sessionMapper.get(request.conversationKey);
-    const hasVisualPayload = this.hasVisualPayload(request.runtimeRequest);
-    const initialSessionId = hasVisualPayload ? undefined : storedSessionId;
-    if (hasVisualPayload && storedSessionId) {
-      await hooks.onEvent?.({
-        type: "status",
-        ts: Date.now(),
-        payload: {
-          text: "Visual input detected. Starting a fresh Claude session for this turn."
-        }
-      });
-    }
+    const initialSessionId = await this.sessionMapper.get(request.conversationKey);
     let firstOutcome: RunTurnOutcome;
     try {
       firstOutcome = await this.runTurnOnce(request, hooks, signal, initialSessionId);
@@ -200,20 +189,4 @@ export class ClaudeCodeRuntimeAdapter {
     return false;
   }
 
-  private hasVisualPayload(runtimeRequest: RunTurnRequest["runtimeRequest"]): boolean {
-    if (!runtimeRequest || typeof runtimeRequest !== "object") return false;
-    const screenshots = (runtimeRequest as Record<string, unknown>).screenshots;
-    if (Array.isArray(screenshots) && screenshots.some((entry) => typeof entry === "string" && entry.trim())) {
-      return true;
-    }
-    const attachments = (runtimeRequest as Record<string, unknown>).attachments;
-    if (!Array.isArray(attachments)) return false;
-    return attachments.some((entry) => {
-      if (!entry || typeof entry !== "object") return false;
-      const record = entry as Record<string, unknown>;
-      const category = typeof record.category === "string" ? record.category.trim().toLowerCase() : "";
-      const mimeType = typeof record.mimeType === "string" ? record.mimeType.trim().toLowerCase() : "";
-      return category === "image" || mimeType.startsWith("image/");
-    });
-  }
 }

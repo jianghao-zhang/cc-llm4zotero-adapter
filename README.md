@@ -44,6 +44,16 @@ Start bridge server:
 npx tsx bin/start-bridge-server.ts --host 127.0.0.1 --port 18787
 ```
 
+Recommended fixed workflow (process management):
+
+```bash
+npm run bridge:start
+npm run bridge:status
+npm run bridge:logs
+npm run bridge:restart
+npm run bridge:stop
+```
+
 Zotero-focused default startup (recommended):
 
 ```bash

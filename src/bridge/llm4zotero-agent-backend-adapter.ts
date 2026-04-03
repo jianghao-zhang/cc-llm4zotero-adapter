@@ -37,6 +37,7 @@ export class Llm4ZoteroAgentBackendAdapter {
         conversationKey: String(params.request.conversationKey),
         userMessage: params.request.userText,
         allowedTools: params.request.allowedTools,
+        runtimeRequest: params.request.runtimeRequest,
         metadata: params.request.metadata,
         signal: params.signal
       },

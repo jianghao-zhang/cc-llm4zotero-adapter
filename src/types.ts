@@ -22,6 +22,7 @@ export interface RunTurnRequest {
   conversationKey: string;
   userMessage: string;
   allowedTools?: string[];
+  runtimeRequest?: JsonObject;
   metadata?: JsonObject;
   signal?: AbortSignal;
 }

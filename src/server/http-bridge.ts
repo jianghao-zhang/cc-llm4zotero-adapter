@@ -69,6 +69,10 @@ function toRequestPayload(body: unknown): Llm4ZoteroRunTurnRequest {
     allowedTools: Array.isArray(record.allowedTools)
       ? record.allowedTools.filter((x): x is string => typeof x === "string")
       : undefined,
+    runtimeRequest:
+      record.runtimeRequest && typeof record.runtimeRequest === "object"
+        ? (record.runtimeRequest as Record<string, unknown>)
+        : undefined,
     metadata:
       record.metadata && typeof record.metadata === "object"
         ? (record.metadata as Record<string, unknown>)

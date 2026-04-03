@@ -31,6 +31,7 @@ export class ClaudeCodeRuntimeAdapter {
       userMessage: request.userMessage,
       providerSessionId: initialSessionId,
       allowedTools: request.allowedTools,
+      runtimeRequest: request.runtimeRequest,
       metadata: request.metadata,
       signal
     });

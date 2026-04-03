@@ -1,10 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type { ClaudeCodeRuntimeClient, RuntimeTurnRequest, RuntimeTurnStream } from "../runtime.js";
 import { mapSdkMessageToProviderEvents } from "../event-mapper/map-sdk-message.js";
-import type { PermissionMode, SettingSource } from "@anthropic-ai/claude-agent-sdk";
+import type { PermissionMode, SDKUserMessage, SettingSource } from "@anthropic-ai/claude-agent-sdk";
 
 type QueryFunction = (args: {
-  prompt: string;
+  prompt: string | AsyncIterable<SDKUserMessage>;
   options: Record<string, unknown>;
 }) => AsyncIterable<unknown>;
 
@@ -31,7 +31,215 @@ const DEFAULT_BLOCKED_METADATA_KEYS = new Set<string>([
   "permissionMode",
   "resume",
   "settingSources",
+  "runtimeRequest",
 ]);
+
+type RuntimeAttachment = {
+  name?: unknown;
+  category?: unknown;
+  mimeType?: unknown;
+  storedPath?: unknown;
+};
+
+type RuntimeRequestShape = {
+  userText?: unknown;
+  selectedTexts?: unknown;
+  selectedPaperContexts?: unknown;
+  fullTextPaperContexts?: unknown;
+  pinnedPaperContexts?: unknown;
+  attachments?: unknown;
+  screenshots?: unknown;
+  activeNoteContext?: unknown;
+};
+
+const IMAGE_MIME_BY_KIND: Record<string, "image/jpeg" | "image/png" | "image/gif" | "image/webp"> = {
+  jpeg: "image/jpeg",
+  jpg: "image/jpeg",
+  png: "image/png",
+  gif: "image/gif",
+  webp: "image/webp",
+};
+
+function trimInline(value: unknown, max = 280): string {
+  if (typeof value !== "string") return "";
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (!normalized) return "";
+  if (normalized.length <= max) return normalized;
+  return `${normalized.slice(0, Math.max(0, max - 1)).trimEnd()}…`;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  return value as Record<string, unknown>;
+}
+
+function toRuntimeRequest(
+  request: RuntimeTurnRequest,
+  metadata: Record<string, unknown>,
+): RuntimeRequestShape | undefined {
+  const direct = asRecord(request.runtimeRequest);
+  if (direct) return direct as RuntimeRequestShape;
+  const fromMetadata = asRecord(metadata.runtimeRequest);
+  if (fromMetadata) return fromMetadata as RuntimeRequestShape;
+  return undefined;
+}
+
+function parseImageDataUrl(
+  value: unknown,
+): { mediaType: "image/jpeg" | "image/png" | "image/gif" | "image/webp"; data: string } | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  const match = /^data:image\/([a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)$/i.exec(normalized);
+  if (!match) return null;
+  const mediaType = IMAGE_MIME_BY_KIND[match[1].toLowerCase()];
+  if (!mediaType) return null;
+  const data = match[2].replace(/\s+/g, "");
+  if (!data) return null;
+  return { mediaType, data };
+}
+
+function collectAttachmentPaths(runtimeRequest: RuntimeRequestShape | undefined): string[] {
+  if (!runtimeRequest || !Array.isArray(runtimeRequest.attachments)) return [];
+  const paths: string[] = [];
+  for (const entry of runtimeRequest.attachments as RuntimeAttachment[]) {
+    if (!entry || typeof entry !== "object") continue;
+    const storedPath = typeof entry.storedPath === "string" ? entry.storedPath.trim() : "";
+    if (!storedPath || !storedPath.startsWith("/")) continue;
+    const name = trimInline(entry.name, 120);
+    const mimeType = trimInline(entry.mimeType, 80);
+    const category = trimInline(entry.category, 24);
+    const meta = [category, mimeType].filter(Boolean).join(", ");
+    const suffix = meta ? ` (${meta})` : "";
+    paths.push(`- ${name || "attachment"}: ${storedPath}${suffix}`);
+  }
+  return paths;
+}
+
+function collectPaperTitles(entries: unknown, limit: number): string[] {
+  if (!Array.isArray(entries)) return [];
+  const titles: string[] = [];
+  for (const entry of entries) {
+    const record = asRecord(entry);
+    if (!record) continue;
+    const title = trimInline(record.title, 140);
+    if (!title) continue;
+    titles.push(title);
+    if (titles.length >= limit) break;
+  }
+  return titles;
+}
+
+function buildPromptText(
+  userMessage: string,
+  runtimeRequest: RuntimeRequestShape | undefined,
+): string {
+  const lines: string[] = [userMessage.trim()];
+
+  if (!runtimeRequest) {
+    return lines.join("\n\n");
+  }
+
+  const selectedTexts = Array.isArray(runtimeRequest.selectedTexts)
+    ? runtimeRequest.selectedTexts
+        .slice(0, 3)
+        .map((entry) => trimInline(entry, 320))
+        .filter(Boolean)
+    : [];
+  if (selectedTexts.length) {
+    lines.push(
+      "Selected snippets:",
+      ...selectedTexts.map((text, index) => `${index + 1}. ${text}`),
+    );
+  }
+
+  const selectedPapers = collectPaperTitles(runtimeRequest.selectedPaperContexts, 6);
+  if (selectedPapers.length) {
+    lines.push(
+      "Selected papers:",
+      ...selectedPapers.map((title) => `- ${title}`),
+    );
+  }
+
+  const fullTextPapers = collectPaperTitles(runtimeRequest.fullTextPaperContexts, 4);
+  if (fullTextPapers.length) {
+    lines.push(
+      "Papers marked for full-text reading:",
+      ...fullTextPapers.map((title) => `- ${title}`),
+    );
+  }
+
+  const pinnedPapers = collectPaperTitles(runtimeRequest.pinnedPaperContexts, 4);
+  if (pinnedPapers.length) {
+    lines.push(
+      "Pinned papers:",
+      ...pinnedPapers.map((title) => `- ${title}`),
+    );
+  }
+
+  const attachmentPaths = collectAttachmentPaths(runtimeRequest);
+  if (attachmentPaths.length) {
+    lines.push(
+      "Local attachment files (absolute paths). Read these files directly when needed:",
+      ...attachmentPaths,
+    );
+  }
+
+  const activeNote = asRecord(runtimeRequest.activeNoteContext);
+  if (activeNote) {
+    const noteTitle = trimInline(activeNote.title, 140);
+    const preview = trimInline(activeNote.noteText, 420);
+    if (noteTitle || preview) {
+      lines.push(
+        "Active note context:",
+        noteTitle ? `- Title: ${noteTitle}` : "- Title: (untitled)",
+        preview ? `- Preview: ${preview}` : "",
+      );
+    }
+  }
+
+  return lines.filter(Boolean).join("\n\n");
+}
+
+function buildPromptInput(
+  request: RuntimeTurnRequest,
+  metadata: Record<string, unknown>,
+): string | AsyncIterable<SDKUserMessage> {
+  const runtimeRequest = toRuntimeRequest(request, metadata);
+  const promptText = buildPromptText(request.userMessage, runtimeRequest);
+
+  const imagePayloads = Array.isArray(runtimeRequest?.screenshots)
+    ? runtimeRequest!.screenshots
+        .map((entry) => parseImageDataUrl(entry))
+        .filter((entry): entry is NonNullable<typeof entry> => Boolean(entry))
+        .slice(0, 8)
+    : [];
+  if (!imagePayloads.length) {
+    return promptText;
+  }
+
+  const userEvent: SDKUserMessage = {
+    type: "user",
+    parent_tool_use_id: null,
+    message: {
+      role: "user",
+      content: [
+        { type: "text", text: promptText },
+        ...imagePayloads.map((entry) => ({
+          type: "image" as const,
+          source: {
+            type: "base64" as const,
+            media_type: entry.mediaType,
+            data: entry.data,
+          },
+        })),
+      ],
+    },
+  };
+
+  return (async function* () {
+    yield userEvent;
+  })();
+}
 
 function parseMetadata(
   metadata: RuntimeTurnRequest["metadata"],
@@ -89,8 +297,9 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       Object.entries(queryOptions).filter(([, value]) => value !== undefined)
     );
 
+    const prompt = buildPromptInput(request, metadata);
     const sdkStream = query({
-      prompt: request.userMessage,
+      prompt,
       options: cleanedOptions
     });
 

@@ -28,6 +28,7 @@ export interface Llm4ZoteroRunTurnRequest {
   conversationKey: string | number;
   userText: string;
   allowedTools?: string[];
+  runtimeRequest?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
 }
 

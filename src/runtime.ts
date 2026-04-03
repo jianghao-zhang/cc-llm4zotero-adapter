@@ -22,6 +22,7 @@ export interface RuntimeTurnRequest {
   userMessage: string;
   providerSessionId?: string;
   allowedTools?: string[];
+  runtimeRequest?: JsonObject;
   metadata?: JsonObject;
   signal?: AbortSignal;
 }

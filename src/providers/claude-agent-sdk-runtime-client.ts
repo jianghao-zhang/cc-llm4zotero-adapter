@@ -14,6 +14,7 @@ type QueryFunction = (args: {
 export interface ClaudeAgentSdkRuntimeClientOptions {
   cwd?: string;
   additionalDirectories?: string[];
+  defaultAllowedTools?: string[];
   settingSources?: SettingSource[];
   permissionMode?: PermissionMode;
   includePartialMessages?: boolean;
@@ -422,6 +423,22 @@ function parseMetadata(
   return result;
 }
 
+function mergeAllowedTools(
+  requestAllowedTools: string[] | undefined,
+  defaultAllowedTools: string[] | undefined,
+): string[] | undefined {
+  const merged = new Set<string>();
+  for (const tool of defaultAllowedTools ?? []) {
+    const normalized = tool.trim();
+    if (normalized) merged.add(normalized);
+  }
+  for (const tool of requestAllowedTools ?? []) {
+    const normalized = tool.trim();
+    if (normalized) merged.add(normalized);
+  }
+  return merged.size > 0 ? Array.from(merged) : undefined;
+}
+
 export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
   private readonly options: ClaudeAgentSdkRuntimeClientOptions;
 
@@ -438,7 +455,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       ...metadata,
       cwd: effectiveCwd,
       additionalDirectories: this.options.additionalDirectories,
-      allowedTools: request.allowedTools,
+      allowedTools: mergeAllowedTools(request.allowedTools, this.options.defaultAllowedTools),
       settingSources: this.options.settingSources ?? ["user", "project"],
       permissionMode: this.options.permissionMode,
       includePartialMessages: this.options.includePartialMessages,

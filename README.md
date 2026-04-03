@@ -70,6 +70,7 @@ npx tsx bin/start-bridge-server.ts \
 CLI/env options:
 - `--runtime-cwd` or `ADAPTER_RUNTIME_CWD`: workspace root Claude Agent SDK should run in.
 - `--additional-directories` or `ADAPTER_ADDITIONAL_DIRECTORIES`: extra readable directories (comma-separated absolute paths, `~` supported).
+- `--default-allowed-tools` or `ADAPTER_DEFAULT_ALLOWED_TOOLS`: tools always auto-allowed by bridge (comma-separated). Default: `WebFetch,WebSearch`.
 - `--setting-sources` or `ADAPTER_SETTING_SOURCES`: comma-separated settings sources (`user,project,local`).
 - `--append-system-prompt` or `ADAPTER_APPEND_SYSTEM_PROMPT`: inline overlay prompt text.
 - `--append-system-prompt-file` or `ADAPTER_APPEND_SYSTEM_PROMPT_FILE`: file-based overlay prompt text.

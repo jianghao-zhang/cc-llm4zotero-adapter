@@ -64,6 +64,18 @@ function parseDirectoryList(
   return Array.from(new Set(normalized));
 }
 
+function parseStringList(value: string | undefined): string[] {
+  if (!value || !value.trim()) return [];
+  return Array.from(
+    new Set(
+      value
+        .split(",")
+        .map((entry) => entry.trim())
+        .filter(Boolean),
+    ),
+  );
+}
+
 function readTextFile(path: string | undefined): string {
   if (!path) return "";
   try {
@@ -162,6 +174,11 @@ async function main() {
       [...defaultAdditionalDirs, ...configuredAdditionalDirs].filter((entry) => entry !== runtimeCwd),
     ),
   );
+  const defaultAllowedTools = parseStringList(
+    getArg("default-allowed-tools") ||
+      process.env.ADAPTER_DEFAULT_ALLOWED_TOOLS ||
+      "WebFetch,WebSearch",
+  );
   for (const dir of additionalDirectories) {
     mkdirSync(dir, { recursive: true });
   }
@@ -169,6 +186,7 @@ async function main() {
   const runtimeClient = new ClaudeAgentSdkRuntimeClient({
     cwd: runtimeCwd,
     additionalDirectories,
+    defaultAllowedTools,
     settingSources,
     includePartialMessages: true,
     appendSystemPrompt: appendSystemPrompt || undefined,
@@ -194,6 +212,11 @@ async function main() {
   console.log(
     `[cc-llm4zotero-adapter] additional directories: ${
       additionalDirectories.length > 0 ? additionalDirectories.join(", ") : "(none)"
+    }`,
+  );
+  console.log(
+    `[cc-llm4zotero-adapter] default allowed tools: ${
+      defaultAllowedTools.length > 0 ? defaultAllowedTools.join(", ") : "(none)"
     }`,
   );
   console.log(`[cc-llm4zotero-adapter] state dir: ${stateDirResolved}`);

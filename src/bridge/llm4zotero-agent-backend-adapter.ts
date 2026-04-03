@@ -1,6 +1,7 @@
 import type { ClaudeCodeRuntimeAdapter } from "./claude-code-runtime-adapter.js";
 import type {
   Llm4ZoteroRunActionParams,
+  Llm4ZoteroRunTurnRequest,
   Llm4ZoteroRunTurnOutcome,
   Llm4ZoteroRunTurnParams
 } from "./llm4zotero-contract.js";
@@ -21,6 +22,82 @@ function hasCatastrophicCommandPattern(argumentText: string): boolean {
   return CATASTROPHIC_ARG_PATTERNS.some((pattern) => pattern.test(text));
 }
 
+type ScopeType = "paper" | "open" | "folder" | "tag" | "tagset" | "custom";
+
+type ScopeInfo = {
+  scopeType: ScopeType;
+  scopeId: string;
+  scopeLabel?: string;
+};
+
+const VALID_SCOPE_TYPES = new Set<ScopeType>([
+  "paper",
+  "open",
+  "folder",
+  "tag",
+  "tagset",
+  "custom",
+]);
+
+function normalizeScopeType(value: unknown): ScopeType | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().toLowerCase();
+  if (VALID_SCOPE_TYPES.has(normalized as ScopeType)) {
+    return normalized as ScopeType;
+  }
+  return undefined;
+}
+
+function normalizeScopeId(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim();
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+function toSafePathSegment(value: string): string {
+  return value
+    .trim()
+    .replace(/[\/\\]/g, "_")
+    .replace(/\s+/g, "_")
+    .replace(/[^\w.\-:@]/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 120) || "unknown";
+}
+
+function toScopeInfo(
+  request: Pick<Llm4ZoteroRunTurnRequest, "scopeType" | "scopeId" | "scopeLabel" | "metadata">,
+): ScopeInfo | undefined {
+  const metadata = request.metadata && typeof request.metadata === "object"
+    ? request.metadata
+    : undefined;
+  const scopeType = normalizeScopeType(request.scopeType ?? metadata?.scopeType);
+  const scopeId = normalizeScopeId(request.scopeId ?? metadata?.scopeId);
+  if (!scopeType || !scopeId) return undefined;
+  const scopeLabelRaw = request.scopeLabel ?? metadata?.scopeLabel;
+  const scopeLabel =
+    typeof scopeLabelRaw === "string" && scopeLabelRaw.trim().length > 0
+      ? scopeLabelRaw.trim()
+      : undefined;
+  return { scopeType, scopeId, scopeLabel };
+}
+
+function buildScopedConversationKey(conversationKey: string, scope?: ScopeInfo): string {
+  if (!scope) return conversationKey;
+  return `${conversationKey}::${scope.scopeType}:${scope.scopeId}`;
+}
+
+function buildRuntimeCwdRelative(
+  scope: ScopeInfo | undefined,
+  originalConversationKey: string,
+): string | undefined {
+  if (!scope) return undefined;
+  const scopeType = toSafePathSegment(scope.scopeType);
+  const scopeId = toSafePathSegment(scope.scopeId);
+  const conversationDir = toSafePathSegment(originalConversationKey);
+  return `scopes/${scopeType}/${scopeId}/conversations/${conversationDir}`;
+}
+
 export class Llm4ZoteroAgentBackendAdapter {
   constructor(private readonly adapter: ClaudeCodeRuntimeAdapter) {}
 
@@ -32,13 +109,31 @@ export class Llm4ZoteroAgentBackendAdapter {
     let lastFallbackReason = "";
     let finalText = "";
 
+    const originalConversationKey = String(params.request.conversationKey);
+    const scope = toScopeInfo(params.request);
+    const scopedConversationKey = buildScopedConversationKey(
+      originalConversationKey,
+      scope,
+    );
+    const runtimeCwdRelative = buildRuntimeCwdRelative(scope, originalConversationKey);
+    const mergedMetadata: Record<string, unknown> = {
+      ...(params.request.metadata || {}),
+      originalConversationKey,
+      scopeType: scope?.scopeType,
+      scopeId: scope?.scopeId,
+      scopeLabel: scope?.scopeLabel,
+    };
+    if (runtimeCwdRelative) {
+      mergedMetadata.runtimeCwdRelative = runtimeCwdRelative;
+    }
+
     const outcome = await this.adapter.runTurn(
       {
-        conversationKey: String(params.request.conversationKey),
+        conversationKey: scopedConversationKey,
         userMessage: params.request.userText,
         allowedTools: params.request.allowedTools,
         runtimeRequest: params.request.runtimeRequest,
-        metadata: params.request.metadata,
+        metadata: mergedMetadata,
         signal: params.signal
       },
       {
@@ -153,6 +248,9 @@ export class Llm4ZoteroAgentBackendAdapter {
       request: {
         conversationKey: requested.conversationKey,
         userText: slashPrompt,
+        scopeType: requested.scopeType,
+        scopeId: requested.scopeId,
+        scopeLabel: requested.scopeLabel,
         metadata: {
           ...(requested.metadata || {}),
           runType: "action",
@@ -161,6 +259,9 @@ export class Llm4ZoteroAgentBackendAdapter {
           activeItemId: requested.activeItemId,
           libraryID: requested.libraryID,
           contextEnvelope: requested.contextEnvelope,
+          scopeType: requested.scopeType,
+          scopeId: requested.scopeId,
+          scopeLabel: requested.scopeLabel,
         },
       },
       onStart: params.onStart,

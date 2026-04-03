@@ -28,6 +28,9 @@ export interface Llm4ZoteroRunTurnRequest {
   conversationKey: string | number;
   userText: string;
   allowedTools?: string[];
+  scopeType?: "paper" | "open" | "folder" | "tag" | "tagset" | "custom";
+  scopeId?: string;
+  scopeLabel?: string;
   runtimeRequest?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
 }
@@ -51,6 +54,9 @@ export interface Llm4ZoteroRunActionRequest {
   toolName: string;
   args?: unknown;
   approved?: boolean;
+  scopeType?: "paper" | "open" | "folder" | "tag" | "tagset" | "custom";
+  scopeId?: string;
+  scopeLabel?: string;
   activeItemId?: number;
   libraryID?: number;
   contextEnvelope?: Record<string, unknown>;

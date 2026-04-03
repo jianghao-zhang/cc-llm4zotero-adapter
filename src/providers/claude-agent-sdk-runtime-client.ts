@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { mkdirSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { isAbsolute, relative, resolve } from "node:path";
 import type { ClaudeCodeRuntimeClient, RuntimeTurnRequest, RuntimeTurnStream } from "../runtime.js";
 import { mapSdkMessageToProviderEvents } from "../event-mapper/map-sdk-message.js";
 import type { PermissionMode, SDKUserMessage, SettingSource } from "@anthropic-ai/claude-agent-sdk";
@@ -33,6 +35,7 @@ const DEFAULT_BLOCKED_METADATA_KEYS = new Set<string>([
   "resume",
   "settingSources",
   "runtimeRequest",
+  "runtimeCwdRelative",
 ]);
 
 type RuntimeAttachment = {
@@ -428,10 +431,11 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
   async startTurn(request: RuntimeTurnRequest): Promise<RuntimeTurnStream> {
     const query = this.options.queryImpl ?? (await this.loadQuery());
     const metadata = parseMetadata(request.metadata, this.options);
+    const effectiveCwd = this.resolveScopedCwd(request.metadata);
 
     const queryOptions: Record<string, unknown> = {
       ...metadata,
-      cwd: this.options.cwd,
+      cwd: effectiveCwd,
       allowedTools: request.allowedTools,
       settingSources: this.options.settingSources ?? ["user", "project"],
       permissionMode: this.options.permissionMode,
@@ -467,6 +471,32 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       providerSessionId: request.providerSessionId,
       events
     };
+  }
+
+  private resolveScopedCwd(metadata: RuntimeTurnRequest["metadata"]): string | undefined {
+    const baseCwd = this.options.cwd ? resolve(this.options.cwd) : undefined;
+    if (!baseCwd) return undefined;
+    const runtimeCwdRelative =
+      metadata && typeof metadata.runtimeCwdRelative === "string"
+        ? metadata.runtimeCwdRelative.trim()
+        : "";
+    if (!runtimeCwdRelative) {
+      mkdirSync(baseCwd, { recursive: true });
+      return baseCwd;
+    }
+    if (isAbsolute(runtimeCwdRelative)) {
+      mkdirSync(baseCwd, { recursive: true });
+      return baseCwd;
+    }
+    const candidate = resolve(baseCwd, runtimeCwdRelative);
+    const rel = relative(baseCwd, candidate);
+    const insideBase = rel === "" || (!rel.startsWith("..") && !rel.startsWith("/"));
+    if (!insideBase) {
+      mkdirSync(baseCwd, { recursive: true });
+      return baseCwd;
+    }
+    mkdirSync(candidate, { recursive: true });
+    return candidate;
   }
 
   private async loadQuery(): Promise<QueryFunction> {

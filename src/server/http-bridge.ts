@@ -32,6 +32,24 @@ type BridgeStreamLine =
     }
   | { type: "error"; error: string };
 
+function parseScopeType(
+  value: unknown,
+): "paper" | "open" | "folder" | "tag" | "tagset" | "custom" | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().toLowerCase();
+  switch (normalized) {
+    case "paper":
+    case "open":
+    case "folder":
+    case "tag":
+    case "tagset":
+    case "custom":
+      return normalized;
+    default:
+      return undefined;
+  }
+}
+
 function sendJson(res: ServerResponse, statusCode: number, body: unknown): void {
   res.statusCode = statusCode;
   res.setHeader("Content-Type", "application/json; charset=utf-8");
@@ -69,6 +87,15 @@ function toRequestPayload(body: unknown): Llm4ZoteroRunTurnRequest {
     allowedTools: Array.isArray(record.allowedTools)
       ? record.allowedTools.filter((x): x is string => typeof x === "string")
       : undefined,
+    scopeType: parseScopeType(record.scopeType),
+    scopeId:
+      typeof record.scopeId === "string" && record.scopeId.trim().length > 0
+        ? record.scopeId.trim()
+        : undefined,
+    scopeLabel:
+      typeof record.scopeLabel === "string" && record.scopeLabel.trim().length > 0
+        ? record.scopeLabel.trim()
+        : undefined,
     runtimeRequest:
       record.runtimeRequest && typeof record.runtimeRequest === "object"
         ? (record.runtimeRequest as Record<string, unknown>)
@@ -95,6 +122,15 @@ function toActionPayload(body: unknown): Llm4ZoteroRunActionRequest {
     toolName,
     args: record.args,
     approved: typeof record.approved === "boolean" ? record.approved : false,
+    scopeType: parseScopeType(record.scopeType),
+    scopeId:
+      typeof record.scopeId === "string" && record.scopeId.trim().length > 0
+        ? record.scopeId.trim()
+        : undefined,
+    scopeLabel:
+      typeof record.scopeLabel === "string" && record.scopeLabel.trim().length > 0
+        ? record.scopeLabel.trim()
+        : undefined,
     activeItemId: typeof record.activeItemId === "number" ? record.activeItemId : undefined,
     libraryID: typeof record.libraryID === "number" ? record.libraryID : undefined,
     contextEnvelope:

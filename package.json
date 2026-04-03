@@ -15,7 +15,7 @@
     "test:watch": "vitest",
     "demo:llm4zotero": "tsx examples/llm4zotero-runturn-demo.ts",
     "serve:bridge": "tsx bin/start-bridge-server.ts --host 127.0.0.1 --port 8787",
-    "serve:bridge:zotero": "ADAPTER_RUNTIME_CWD=\"$HOME\" ADAPTER_STATE_DIR=\"$HOME/Zotero/agent-state\" tsx bin/start-bridge-server.ts --host 127.0.0.1 --port 18787"
+    "serve:bridge:zotero": "ADAPTER_RUNTIME_CWD=\"$HOME/Zotero/agent-runtime\" ADAPTER_STATE_DIR=\"$HOME/Zotero/agent-state\" tsx bin/start-bridge-server.ts --host 127.0.0.1 --port 18787"
   },
   "keywords": [
     "zotero",

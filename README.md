@@ -51,7 +51,7 @@ npm run serve:bridge:zotero
 ```
 
 This uses:
-- `runtime-cwd = $HOME` (so Claude Code can read both `~/Zotero` and your repos)
+- `runtime-cwd = $HOME/Zotero/agent-runtime` (forced into Zotero workspace)
 - `state-dir = $HOME/Zotero/agent-state`
   - session links: `session-links/sessions.json`
   - traces: `turn-traces/trace.json`
@@ -72,7 +72,10 @@ CLI/env options:
 - `--setting-sources` or `ADAPTER_SETTING_SOURCES`: comma-separated settings sources (`user,project,local`).
 - `--append-system-prompt` or `ADAPTER_APPEND_SYSTEM_PROMPT`: inline overlay prompt text.
 - `--append-system-prompt-file` or `ADAPTER_APPEND_SYSTEM_PROMPT_FILE`: file-based overlay prompt text.
-- Default `runtime-cwd` is `$HOME` when available.
+- Default `runtime-cwd` is `$HOME/Zotero/agent-runtime` when `~/Zotero` exists.
+- Runtime cwd is validated:
+  - using HOME directly is forbidden
+  - runtime cwd must be inside `~/Zotero` when that directory exists
 - Default `state-dir` is `$HOME/Zotero/agent-state` when `~/Zotero` exists (otherwise `$HOME/agent-state`).
 - Default `settingSources` is `project,local` (does not load global `user` settings unless explicitly requested).
 

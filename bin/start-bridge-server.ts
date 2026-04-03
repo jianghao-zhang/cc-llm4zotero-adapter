@@ -7,7 +7,8 @@ import {
   startHttpBridgeServer,
 } from "../src/index.js";
 import type { SettingSource } from "@anthropic-ai/claude-agent-sdk";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { resolve, relative } from "node:path";
 
 function getArg(name: string): string | undefined {
   const flag = `--${name}`;
@@ -60,15 +61,19 @@ async function main() {
   const homeDir = process.env.HOME && process.env.HOME.trim()
     ? process.env.HOME.trim()
     : undefined;
-  const defaultRuntimeCwd = homeDir || process.cwd();
+  const zoteroRoot = homeDir ? resolve(homeDir, "Zotero") : undefined;
+  const defaultRuntimeCwd =
+    zoteroRoot && existsSync(zoteroRoot)
+      ? resolve(zoteroRoot, "agent-runtime")
+      : process.cwd();
   const defaultStateDir = (() => {
-    if (homeDir && existsSync(`${homeDir}/Zotero`)) {
-      return `${homeDir}/Zotero/agent-state`;
+    if (zoteroRoot && existsSync(zoteroRoot)) {
+      return resolve(zoteroRoot, "agent-state");
     }
     if (homeDir) {
-      return `${homeDir}/agent-state`;
+      return resolve(homeDir, "agent-state");
     }
-    return `${process.cwd()}/.adapter-state`;
+    return resolve(process.cwd(), ".adapter-state");
   })();
   const stateDir =
     getArg("state-dir") ||
@@ -78,10 +83,33 @@ async function main() {
     getArg("forward-frontend-model") ?? process.env.ADAPTER_FORWARD_FRONTEND_MODEL,
     false,
   );
-  const runtimeCwd =
+  const runtimeCwdRaw =
     getArg("runtime-cwd") ||
     process.env.ADAPTER_RUNTIME_CWD ||
     defaultRuntimeCwd;
+  const runtimeCwd = resolve(runtimeCwdRaw);
+  const stateDirResolved = resolve(stateDir);
+
+  if (homeDir) {
+    const resolvedHome = resolve(homeDir);
+    if (runtimeCwd === resolvedHome) {
+      throw new Error(
+        `Invalid runtime cwd: ${runtimeCwd}. Using HOME directly is forbidden. Use a Zotero subdirectory such as ${resolve(resolvedHome, "Zotero/agent-runtime")}.`,
+      );
+    }
+    if (zoteroRoot && existsSync(zoteroRoot)) {
+      const rel = relative(zoteroRoot, runtimeCwd);
+      const insideZotero = rel === "" || (!rel.startsWith("..") && !rel.startsWith("/"));
+      if (!insideZotero) {
+        throw new Error(
+          `Invalid runtime cwd: ${runtimeCwd}. runtime-cwd must be inside ${zoteroRoot}.`,
+        );
+      }
+    }
+  }
+
+  mkdirSync(runtimeCwd, { recursive: true });
+  mkdirSync(stateDirResolved, { recursive: true });
   const settingSources = parseSettingSources(
     getArg("setting-sources") || process.env.ADAPTER_SETTING_SOURCES,
   );
@@ -108,10 +136,10 @@ async function main() {
   const core = new ClaudeCodeRuntimeAdapter({
     runtimeClient,
     sessionMapper: new JsonFileSessionMapper(
-      `${stateDir}/session-links/sessions.json`,
+      `${stateDirResolved}/session-links/sessions.json`,
     ),
     traceStore: new JsonFileTraceStore(
-      `${stateDir}/turn-traces/trace.json`,
+      `${stateDirResolved}/turn-traces/trace.json`,
     ),
   });
 
@@ -121,7 +149,7 @@ async function main() {
   console.log(`[cc-llm4zotero-adapter] listening on http://${server.host}:${server.port}`);
   console.log(`[cc-llm4zotero-adapter] healthz: http://${server.host}:${server.port}/healthz`);
   console.log(`[cc-llm4zotero-adapter] runtime cwd: ${runtimeCwd}`);
-  console.log(`[cc-llm4zotero-adapter] state dir: ${stateDir}`);
+  console.log(`[cc-llm4zotero-adapter] state dir: ${stateDirResolved}`);
   console.log(`[cc-llm4zotero-adapter] settingSources: ${settingSources.join(",")}`);
   if (appendSystemPrompt) {
     console.log("[cc-llm4zotero-adapter] appendSystemPrompt: enabled");

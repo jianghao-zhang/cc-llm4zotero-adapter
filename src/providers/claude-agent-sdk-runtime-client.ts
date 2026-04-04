@@ -59,7 +59,6 @@ const DEFAULT_BLOCKED_METADATA_KEYS = new Set<string>([
   "cwd",
   "includePartialMessages",
   "maxTurns",
-  "permissionMode",
   "resume",
   "settingSources",
   "runtimeRequest",
@@ -465,6 +464,30 @@ function parseSettingSourcesOverride(
   return next.length > 0 ? next : undefined;
 }
 
+function parsePermissionModeOverride(
+  metadata: Record<string, unknown>,
+): PermissionMode | undefined {
+  const raw = metadata.permissionMode;
+  if (typeof raw !== "string") return undefined;
+  const normalized = raw.trim().toLowerCase();
+  if (!normalized) return undefined;
+  if (normalized === "yolo") return "bypassPermissions";
+  if (normalized === "safe") return "default";
+  if (
+    normalized === "default" ||
+    normalized === "acceptedits" ||
+    normalized === "bypasspermissions" ||
+    normalized === "plan" ||
+    normalized === "dontask"
+  ) {
+    if (normalized === "acceptedits") return "acceptEdits";
+    if (normalized === "bypasspermissions") return "bypassPermissions";
+    if (normalized === "dontask") return "dontAsk";
+    return normalized as PermissionMode;
+  }
+  return undefined;
+}
+
 function mergeAllowedTools(
   requestAllowedTools: string[] | undefined,
   defaultAllowedTools: string[] | undefined,
@@ -522,6 +545,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
         ? requestedEffortRaw
         : undefined;
     const settingSourcesOverride = parseSettingSourcesOverride(metadata);
+    const permissionModeOverride = parsePermissionModeOverride(metadata);
     const effectiveCwd = this.resolveScopedCwd(request.metadata);
 
     const queryOptions: Record<string, unknown> = {
@@ -533,7 +557,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       allowedTools: mergeAllowedTools(request.allowedTools, this.options.defaultAllowedTools),
       settingSources:
         settingSourcesOverride ?? this.options.settingSources ?? ["user", "project"],
-      permissionMode: this.options.permissionMode,
+      permissionMode: permissionModeOverride ?? this.options.permissionMode,
       includePartialMessages: this.options.includePartialMessages,
       maxTurns: this.options.maxTurns,
       continue: this.options.continue,
@@ -565,6 +589,8 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
           payload: {
             requestedModel: requestedModel ?? null,
             resolvedEffort: requestedEffort ?? null,
+            resolvedPermissionMode:
+              permissionModeOverride ?? client.options.permissionMode ?? null,
             settingSources: effectiveSettingSources,
             cwd: effectiveCwd,
           },

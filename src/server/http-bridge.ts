@@ -50,6 +50,23 @@ function parseScopeType(
   }
 }
 
+function parseConversationKey(
+  value: unknown,
+): string | number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return Math.floor(value);
+  }
+  if (typeof value === "string" && value.trim().length > 0) {
+    const trimmed = value.trim();
+    if (/^-?\d+$/.test(trimmed)) {
+      const parsed = Number.parseInt(trimmed, 10);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+    return trimmed;
+  }
+  return undefined;
+}
+
 function parseSettingSources(
   value: string | null | undefined,
 ): Array<"user" | "project" | "local"> | undefined {
@@ -161,6 +178,28 @@ function toActionPayload(body: unknown): Llm4ZoteroRunActionRequest {
   };
 }
 
+function toResolveConfirmationPayload(body: unknown): {
+  requestId: string;
+  approved: boolean;
+  actionId?: string;
+  data?: unknown;
+} {
+  const record = body !== null && typeof body === "object" ? (body as Record<string, unknown>) : {};
+  const requestId = typeof record.requestId === "string" ? record.requestId.trim() : "";
+  if (!requestId) {
+    throw new Error("requestId must be a non-empty string");
+  }
+  return {
+    requestId,
+    approved: Boolean(record.approved),
+    actionId:
+      typeof record.actionId === "string" && record.actionId.trim().length > 0
+        ? record.actionId.trim()
+        : undefined,
+    data: record.data,
+  };
+}
+
 function writeLine(res: ServerResponse, line: BridgeStreamLine): void {
   res.write(JSON.stringify(line));
   res.write("\n");
@@ -219,6 +258,35 @@ export async function startHttpBridgeServer(
           model: model || undefined,
         });
         sendJson(res, 200, { efforts });
+        return;
+      }
+
+      if (req.method === "GET" && reqUrl.pathname === "/session-info") {
+        const conversationKey = parseConversationKey(
+          reqUrl.searchParams.get("conversationKey"),
+        );
+        if (conversationKey === undefined) {
+          sendJson(res, 400, { error: "conversationKey query param is required" });
+          return;
+        }
+        const scopeType = parseScopeType(reqUrl.searchParams.get("scopeType"));
+        const scopeIdRaw = reqUrl.searchParams.get("scopeId");
+        const scopeLabelRaw = reqUrl.searchParams.get("scopeLabel");
+        const scopeId =
+          typeof scopeIdRaw === "string" && scopeIdRaw.trim().length > 0
+            ? scopeIdRaw.trim()
+            : undefined;
+        const scopeLabel =
+          typeof scopeLabelRaw === "string" && scopeLabelRaw.trim().length > 0
+            ? scopeLabelRaw.trim()
+            : undefined;
+        const sessionInfo = await options.adapter.getSessionInfo({
+          conversationKey,
+          scopeType: scopeType || undefined,
+          scopeId,
+          scopeLabel,
+        });
+        sendJson(res, 200, { session: sessionInfo });
         return;
       }
 
@@ -285,6 +353,32 @@ export async function startHttpBridgeServer(
 
         writeLine(res, { type: "outcome", outcome });
         res.end();
+        return;
+      }
+
+      if (req.method === "POST" && req.url === "/resolve-confirmation") {
+        let payload: {
+          requestId: string;
+          approved: boolean;
+          actionId?: string;
+          data?: unknown;
+        };
+        try {
+          payload = toResolveConfirmationPayload(await readJson(req));
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          sendJson(res, 400, { error: message });
+          return;
+        }
+        const accepted = options.adapter.resolveExternalConfirmation(payload.requestId, {
+          approved: payload.approved,
+          actionId: payload.actionId,
+          data: payload.data,
+        });
+        sendJson(res, accepted ? 200 : 404, {
+          ok: accepted,
+          requestId: payload.requestId,
+        });
         return;
       }
 

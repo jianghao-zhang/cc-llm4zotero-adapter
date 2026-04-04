@@ -1,4 +1,5 @@
 import type { ClaudeCodeRuntimeAdapter } from "./claude-code-runtime-adapter.js";
+import { resolve } from "node:path";
 import type {
   Llm4ZoteroRunActionParams,
   Llm4ZoteroRunTurnRequest,
@@ -98,13 +99,41 @@ function buildRuntimeCwdRelative(
   return `scopes/${scopeType}/${scopeId}/conversations/${conversationDir}`;
 }
 
+function resolveSessionCwd(
+  runtimeCwd: string | undefined,
+  runtimeCwdRelative: string | undefined,
+): string | undefined {
+  if (!runtimeCwd) return undefined;
+  if (!runtimeCwdRelative) return resolve(runtimeCwd);
+  return resolve(runtimeCwd, runtimeCwdRelative);
+}
+
 export class Llm4ZoteroAgentBackendAdapter {
   private readonly adapter: ClaudeCodeRuntimeAdapter;
   private readonly runtimeCwd?: string;
+  private readonly pendingExternalConfirmations = new Map<
+    string,
+    (resolution: { approved: boolean; actionId?: string; data?: unknown }) => void
+  >();
 
   constructor(options: { adapter: ClaudeCodeRuntimeAdapter; runtimeCwd?: string }) {
     this.adapter = options.adapter;
     this.runtimeCwd = options.runtimeCwd;
+  }
+
+  resolveExternalConfirmation(
+    requestId: string,
+    resolution: { approved: boolean; actionId?: string; data?: unknown },
+  ): boolean {
+    const resolve = this.pendingExternalConfirmations.get(requestId);
+    if (!resolve) return false;
+    this.pendingExternalConfirmations.delete(requestId);
+    resolve({
+      approved: Boolean(resolution.approved),
+      actionId: resolution.actionId,
+      data: resolution.data,
+    });
+    return true;
   }
 
   listTools(options?: {
@@ -187,6 +216,44 @@ export class Llm4ZoteroAgentBackendAdapter {
     return Array.from(unique);
   }
 
+  async getSessionInfo(params: {
+    conversationKey: string | number;
+    scopeType?: ScopeType;
+    scopeId?: string;
+    scopeLabel?: string;
+    metadata?: Record<string, unknown>;
+  }): Promise<{
+    originalConversationKey: string;
+    scopedConversationKey: string;
+    scopeType?: ScopeType;
+    scopeId?: string;
+    scopeLabel?: string;
+    runtimeCwdRelative?: string;
+    cwd?: string;
+  }> {
+    const originalConversationKey = String(params.conversationKey);
+    const scope = toScopeInfo({
+      scopeType: params.scopeType,
+      scopeId: params.scopeId,
+      scopeLabel: params.scopeLabel,
+      metadata: params.metadata,
+    });
+    const scopedConversationKey = buildScopedConversationKey(
+      originalConversationKey,
+      scope,
+    );
+    const runtimeCwdRelative = buildRuntimeCwdRelative(scope, originalConversationKey);
+    return {
+      originalConversationKey,
+      scopedConversationKey,
+      scopeType: scope?.scopeType,
+      scopeId: scope?.scopeId,
+      scopeLabel: scope?.scopeLabel,
+      runtimeCwdRelative,
+      cwd: resolveSessionCwd(this.runtimeCwd, runtimeCwdRelative),
+    };
+  }
+
   async runTurn(params: Llm4ZoteroRunTurnParams): Promise<Llm4ZoteroRunTurnOutcome> {
     let lastFallbackReason = "";
     let finalText = "";
@@ -207,6 +274,51 @@ export class Llm4ZoteroAgentBackendAdapter {
     };
     if (runtimeCwdRelative) {
       mergedMetadata.runtimeCwdRelative = runtimeCwdRelative;
+    }
+
+    const shouldProbePermission =
+      mergedMetadata.debugPermissionProbe === true ||
+      mergedMetadata.debugPermissionProbe === "true";
+    if (shouldProbePermission) {
+      const requestId = `probe-confirm-${Date.now().toString(36)}-${Math.random()
+        .toString(36)
+        .slice(2, 8)}`;
+      await params.onEvent?.({
+        type: "confirmation_required",
+        requestId,
+        action: {
+          toolName: "permission_probe",
+          title: "Permission probe",
+          mode: "approval",
+          confirmLabel: "Approve once",
+          cancelLabel: "Deny",
+          description:
+            "Debug probe: confirms the confirmation event chain from adapter to plugin UI.",
+          fields: [],
+        },
+      });
+      const settled = await new Promise<{
+        approved: boolean;
+        actionId?: string;
+        data?: unknown;
+      }>((resolve) => {
+        this.pendingExternalConfirmations.set(requestId, resolve);
+      });
+      await params.onEvent?.({
+        type: "confirmation_resolved",
+        requestId,
+        approved: settled.approved,
+        actionId: settled.actionId,
+        data: settled.data,
+      });
+      if (!settled.approved) {
+        return {
+          kind: "fallback",
+          runId: `probe-${Date.now()}`,
+          reason: "permission_probe_denied",
+          usedFallback: true,
+        };
+      }
     }
 
     const outcome = await this.adapter.runTurn(

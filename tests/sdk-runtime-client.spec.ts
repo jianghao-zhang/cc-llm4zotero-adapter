@@ -49,6 +49,7 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
 
     expect(types).toEqual([
       "provider_event",
+      "provider_event",
       "status",
       "provider_event",
       "message_delta",

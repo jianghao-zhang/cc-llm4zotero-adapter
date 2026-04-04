@@ -74,6 +74,63 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
     },
   };
 
+  if (type === "confirmation_required") {
+    const requestId =
+      (typeof msg.requestId === "string" && msg.requestId.trim()) ||
+      (typeof msg.request_id === "string" && msg.request_id.trim()) ||
+      `confirm-${Date.now()}`;
+    const actionCandidate =
+      (msg.action && typeof msg.action === "object" ? msg.action : undefined) ??
+      (msg.pendingAction && typeof msg.pendingAction === "object"
+        ? msg.pendingAction
+        : undefined) ??
+      (msg.pending_action && typeof msg.pending_action === "object"
+        ? msg.pending_action
+        : undefined);
+    const action =
+      (actionCandidate as Record<string, unknown> | undefined) ?? {
+        toolName: "action",
+        title: "Approval required",
+        mode: "approval",
+        confirmLabel: "Approve",
+        cancelLabel: "Deny",
+        description:
+          typeof msg.message === "string" ? msg.message : "The runtime requests confirmation.",
+        fields: [],
+      };
+    return [
+      providerEvent,
+      {
+        type: "confirmation_required",
+        payload: {
+          requestId,
+          action,
+          sessionId,
+        },
+      },
+    ];
+  }
+
+  if (type === "confirmation_resolved") {
+    const requestId =
+      (typeof msg.requestId === "string" && msg.requestId.trim()) ||
+      (typeof msg.request_id === "string" && msg.request_id.trim()) ||
+      "";
+    return [
+      providerEvent,
+      {
+        type: "confirmation_resolved",
+        payload: {
+          requestId,
+          approved: Boolean(msg.approved),
+          actionId: typeof msg.actionId === "string" ? msg.actionId : undefined,
+          data: msg.data,
+          sessionId,
+        },
+      },
+    ];
+  }
+
   if (type === "assistant") {
     const events: ProviderEvent[] = [providerEvent];
     const message = asRecord(msg.message) as MessageContainer;

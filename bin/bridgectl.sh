@@ -31,11 +31,8 @@ start_bridge() {
 
   mkdir -p "$(dirname "$LOG_FILE")"
   rm -f "$PID_FILE"
-  (
-    cd "$ROOT_DIR"
-    nohup npx tsx bin/start-bridge-server.ts --host "$HOST" --port "$PORT" >>"$LOG_FILE" 2>&1 &
-    echo $! >"$PID_FILE"
-  )
+  nohup bash -lc "cd \"$ROOT_DIR\" && exec npx tsx bin/start-bridge-server.ts --host \"$HOST\" --port \"$PORT\"" >>"$LOG_FILE" 2>&1 &
+  echo $! >"$PID_FILE"
 
   sleep 1
   if curl -sS "http://${HOST}:${PORT}/healthz" >/dev/null 2>&1; then
@@ -91,4 +88,3 @@ case "${1:-}" in
     exit 1
     ;;
 esac
-

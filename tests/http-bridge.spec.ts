@@ -38,7 +38,7 @@ describe("http bridge server", () => {
       runtimeClient,
       sessionMapper: new InMemorySessionMapper()
     });
-    const compat = new Llm4ZoteroAgentBackendAdapter(base);
+    const compat = new Llm4ZoteroAgentBackendAdapter({ adapter: base });
     const server = await startHttpBridgeServer({ adapter: compat });
 
     try {
@@ -69,7 +69,7 @@ describe("http bridge server", () => {
       runtimeClient,
       sessionMapper: new InMemorySessionMapper()
     });
-    const compat = new Llm4ZoteroAgentBackendAdapter(base);
+    const compat = new Llm4ZoteroAgentBackendAdapter({ adapter: base });
     const server = await startHttpBridgeServer({ adapter: compat });
 
     try {
@@ -106,7 +106,7 @@ describe("http bridge server", () => {
       runtimeClient,
       sessionMapper: new InMemorySessionMapper()
     });
-    const compat = new Llm4ZoteroAgentBackendAdapter(base);
+    const compat = new Llm4ZoteroAgentBackendAdapter({ adapter: base });
     const server = await startHttpBridgeServer({ adapter: compat });
 
     try {
@@ -140,7 +140,7 @@ describe("http bridge server", () => {
       runtimeClient,
       sessionMapper: new InMemorySessionMapper()
     });
-    const compat = new Llm4ZoteroAgentBackendAdapter(base);
+    const compat = new Llm4ZoteroAgentBackendAdapter({ adapter: base });
     const server = await startHttpBridgeServer({ adapter: compat });
 
     try {

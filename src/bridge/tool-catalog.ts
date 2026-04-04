@@ -1,5 +1,5 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { basename, extname, join } from "node:path";
+import { basename, extname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import type { Llm4ZoteroToolDescriptor } from "./llm4zotero-contract.js";
 
@@ -83,18 +83,55 @@ function walkDirsForCommands(root: string, maxDepth = 6): string[] {
   return out;
 }
 
-function getCommandDirs(): string[] {
+type ToolCatalogOptions = {
+  runtimeCwd?: string;
+  settingSources?: Array<"user" | "project" | "local">;
+};
+
+function normalizeSettingSources(
+  settingSources: Array<"user" | "project" | "local"> | undefined,
+): Array<"user" | "project" | "local"> {
+  if (!Array.isArray(settingSources) || settingSources.length === 0) {
+    return ["user", "project", "local"];
+  }
+  const accepted: Array<"user" | "project" | "local"> = [];
+  for (const source of settingSources) {
+    if (
+      (source === "user" || source === "project" || source === "local") &&
+      !accepted.includes(source)
+    ) {
+      accepted.push(source);
+    }
+  }
+  return accepted.length > 0 ? accepted : ["user", "project", "local"];
+}
+
+function getCommandDirs(options?: ToolCatalogOptions): string[] {
+  const settingSources = normalizeSettingSources(options?.settingSources);
+  const roots: string[] = [];
   const home = homedir();
-  const roots = [
-    join(home, ".claude", "commands"),
-    ...walkDirsForCommands(join(home, ".claude", "plugins", "marketplaces")),
-  ];
+  const runtimeCwd = resolve(options?.runtimeCwd || process.cwd());
+
+  if (settingSources.includes("user")) {
+    roots.push(
+      join(home, ".claude", "commands"),
+      ...walkDirsForCommands(join(home, ".claude", "plugins", "marketplaces")),
+    );
+  }
+
+  if (settingSources.includes("project") || settingSources.includes("local")) {
+    roots.push(
+      join(runtimeCwd, ".claude", "commands"),
+      ...walkDirsForCommands(join(runtimeCwd, ".claude", "plugins", "marketplaces")),
+    );
+  }
+
   return [...new Set(roots)].filter((dir) => existsSync(dir));
 }
 
-function listCommandFiles(): string[] {
+function listCommandFiles(options?: ToolCatalogOptions): string[] {
   const files: string[] = [];
-  for (const dir of getCommandDirs()) {
+  for (const dir of getCommandDirs(options)) {
     let entries: import("node:fs").Dirent[];
     try {
       entries = readdirSync(dir, { withFileTypes: true });
@@ -145,10 +182,10 @@ function parseCommandDescriptor(filePath: string): Llm4ZoteroToolDescriptor | nu
   };
 }
 
-export function getToolCatalog(): Llm4ZoteroToolDescriptor[] {
+export function getToolCatalog(options?: ToolCatalogOptions): Llm4ZoteroToolDescriptor[] {
   const seen = new Set<string>();
   const tools: Llm4ZoteroToolDescriptor[] = [];
-  for (const file of listCommandFiles()) {
+  for (const file of listCommandFiles(options)) {
     const descriptor = parseCommandDescriptor(file);
     if (!descriptor) continue;
     if (seen.has(descriptor.name)) continue;

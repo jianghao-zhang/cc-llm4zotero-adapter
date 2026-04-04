@@ -11,6 +11,20 @@ type QueryFunction = (args: {
   options: Record<string, unknown>;
 }) => AsyncIterable<unknown>;
 
+type ClaudeModelInfo = {
+  value?: string;
+  supportedEffortLevels?: string[];
+  supportsEffort?: boolean;
+};
+
+function normalizeModelName(value: unknown): string {
+  if (typeof value !== "string") return "";
+  return value
+    .replace(/\u001b\[[0-9;]*m/g, "")
+    .replace(/\[[0-9;]*m\]?/g, "")
+    .trim();
+}
+
 export interface ClaudeAgentSdkRuntimeClientOptions {
   cwd?: string;
   additionalDirectories?: string[];
@@ -25,6 +39,12 @@ export interface ClaudeAgentSdkRuntimeClientOptions {
   blockedMetadataKeys?: string[];
   queryImpl?: QueryFunction;
 }
+
+type ClaudeSettingsShape = {
+  model?: unknown;
+  availableModels?: unknown;
+  modelOverrides?: unknown;
+};
 
 const DEFAULT_BLOCKED_METADATA_KEYS = new Set<string>([
   "allowedTools",
@@ -398,7 +418,7 @@ async function buildPromptInput(
 
 function parseMetadata(
   metadata: RuntimeTurnRequest["metadata"],
-  options: Pick<ClaudeAgentSdkRuntimeClientOptions, "forwardFrontendModel" | "blockedMetadataKeys">
+  options: Pick<ClaudeAgentSdkRuntimeClientOptions, "blockedMetadataKeys">
 ): Record<string, unknown> {
   if (!metadata) {
     return {};
@@ -408,10 +428,6 @@ function parseMetadata(
     ...DEFAULT_BLOCKED_METADATA_KEYS,
     ...(options.blockedMetadataKeys ?? []),
   ]);
-
-  if (!options.forwardFrontendModel) {
-    blockedKeys.add("model");
-  }
 
   const result: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(metadata)) {
@@ -457,6 +473,11 @@ function mergeAllowedTools(
 
 export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
   private readonly options: ClaudeAgentSdkRuntimeClientOptions;
+  private modelInfoCache = new Map<
+    string,
+    { expiresAt: number; infos: ClaudeModelInfo[] }
+  >();
+  private readonly modelInfoTtlMs = 60_000;
 
   constructor(options: ClaudeAgentSdkRuntimeClientOptions = {}) {
     this.options = options;
@@ -465,11 +486,33 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
   async startTurn(request: RuntimeTurnRequest): Promise<RuntimeTurnStream> {
     const query = this.options.queryImpl ?? (await this.loadQuery());
     const metadata = parseMetadata(request.metadata, this.options);
+    const shouldForwardFrontendModel = this.options.forwardFrontendModel === true;
+    const requestedModelRaw =
+      typeof metadata.model === "string" ? metadata.model.trim() : "";
+    const requestedModel =
+      shouldForwardFrontendModel &&
+      requestedModelRaw &&
+      requestedModelRaw.toLowerCase() !== "default"
+        ? requestedModelRaw
+        : undefined;
+    const requestedEffortRaw =
+      typeof metadata.effort === "string"
+        ? metadata.effort.trim().toLowerCase()
+        : "";
+    const requestedEffort =
+      requestedEffortRaw === "low" ||
+      requestedEffortRaw === "medium" ||
+      requestedEffortRaw === "high" ||
+      requestedEffortRaw === "max"
+        ? requestedEffortRaw
+        : undefined;
     const settingSourcesOverride = parseSettingSourcesOverride(metadata);
     const effectiveCwd = this.resolveScopedCwd(request.metadata);
 
     const queryOptions: Record<string, unknown> = {
       ...metadata,
+      model: requestedModel,
+      effort: requestedEffort,
       cwd: effectiveCwd,
       additionalDirectories: this.options.additionalDirectories,
       allowedTools: mergeAllowedTools(request.allowedTools, this.options.defaultAllowedTools),
@@ -487,14 +530,31 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     const cleanedOptions = Object.fromEntries(
       Object.entries(queryOptions).filter(([, value]) => value !== undefined)
     );
+    const effectiveSettingSources =
+      settingSourcesOverride ?? this.options.settingSources ?? ["user", "project"];
 
     const prompt = await buildPromptInput(request, metadata);
     const sdkStream = query({
       prompt,
       options: cleanedOptions
     });
+    const client = this;
 
     const events = (async function* (): AsyncIterable<import("../runtime.js").ProviderEvent> {
+      yield {
+        type: "provider_event",
+        payload: {
+          providerType: "runtime_config",
+          sessionId: request.providerSessionId,
+          ts: Date.now(),
+          payload: {
+            requestedModel: requestedModel ?? null,
+            resolvedEffort: requestedEffort ?? null,
+            settingSources: effectiveSettingSources,
+            cwd: effectiveCwd,
+          },
+        },
+      };
       for await (const message of sdkStream) {
         const mapped = mapSdkMessageToProviderEvents(message);
         for (const event of mapped) {
@@ -508,6 +568,73 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       providerSessionId: request.providerSessionId,
       events
     };
+  }
+
+  async listModels(
+    options?: {
+      settingSources?: Array<"user" | "project" | "local">;
+    },
+  ): Promise<string[]> {
+    const sdkInfos = await this.readSupportedModelsFromSdk(options);
+    const requestedSources = options?.settingSources;
+    const settingSources = Array.isArray(requestedSources) && requestedSources.length > 0
+      ? requestedSources
+      : this.options.settingSources ?? ["user", "project"];
+    const unique = new Set<string>();
+    for (const info of sdkInfos) {
+      const value = normalizeModelName(info.value);
+      if (value) unique.add(value);
+    }
+    for (const source of settingSources) {
+      const settingsPath = this.resolveSettingsPathBySource(source);
+      if (!settingsPath) continue;
+      const settings = await this.readSettingsFile(settingsPath);
+      this.collectModelsFromSettings(settings, unique);
+    }
+    return Array.from(unique);
+  }
+
+  async listEfforts(
+    options?: {
+      model?: string;
+      settingSources?: Array<"user" | "project" | "local">;
+    },
+  ): Promise<string[]> {
+    const sdkInfos = await this.readSupportedModelsFromSdk({
+      settingSources: options?.settingSources,
+    });
+    const model = (options?.model || "").trim().toLowerCase();
+    const base = ["default", "low", "medium", "high"] as string[];
+    if (model) {
+      const matched = sdkInfos.find((info) => {
+        const value = typeof info.value === "string" ? info.value.trim().toLowerCase() : "";
+        return value === model;
+      });
+      if (matched?.supportsEffort && Array.isArray(matched.supportedEffortLevels)) {
+        const efforts = Array.from(
+          new Set(
+            matched.supportedEffortLevels
+              .map((entry) => entry.trim().toLowerCase())
+              .filter(
+                (entry) =>
+                  entry === "low" ||
+                  entry === "medium" ||
+                  entry === "high" ||
+                  entry === "max",
+              ),
+          ),
+        );
+        return efforts.length > 0 ? ["default", ...efforts] : base;
+      }
+    }
+    if (
+      /(?:^|[._-])max(?:$|[._-])/.test(model) ||
+      /opus[\s._-]*4[\s._-]*6/.test(model) ||
+      /claude-opus-4-6/.test(model)
+    ) {
+      return [...base, "max"];
+    }
+    return base;
   }
 
   private resolveScopedCwd(metadata: RuntimeTurnRequest["metadata"]): string | undefined {
@@ -536,6 +663,64 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     return candidate;
   }
 
+  private resolveSettingsPathBySource(
+    source: "user" | "project" | "local",
+  ): string | undefined {
+    const homeDir = process.env.HOME && process.env.HOME.trim()
+      ? resolve(process.env.HOME.trim())
+      : undefined;
+    const baseCwd = this.options.cwd ? resolve(this.options.cwd) : process.cwd();
+    if (source === "user") {
+      if (!homeDir) return undefined;
+      return resolve(homeDir, ".claude/settings.json");
+    }
+    if (source === "project") {
+      return resolve(baseCwd, ".claude/settings.json");
+    }
+    return resolve(baseCwd, ".claude/settings.local.json");
+  }
+
+  private async readSettingsFile(path: string): Promise<ClaudeSettingsShape> {
+    try {
+      const raw = await readFile(path, "utf8");
+      const parsed = JSON.parse(raw) as ClaudeSettingsShape;
+      return parsed && typeof parsed === "object" ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+
+  private collectModelsFromSettings(
+    settings: ClaudeSettingsShape,
+    unique: Set<string>,
+  ): void {
+    if (!settings || typeof settings !== "object") return;
+    const defaultModel = normalizeModelName(settings.model);
+    if (defaultModel) {
+      unique.add(defaultModel);
+    }
+    if (Array.isArray(settings.availableModels)) {
+      for (const entry of settings.availableModels) {
+        const normalized = normalizeModelName(entry);
+        if (normalized) unique.add(normalized);
+      }
+    }
+    if (
+      settings.modelOverrides &&
+      typeof settings.modelOverrides === "object" &&
+      !Array.isArray(settings.modelOverrides)
+    ) {
+      for (const [key, value] of Object.entries(
+        settings.modelOverrides as Record<string, unknown>,
+      )) {
+        const normalizedKey = normalizeModelName(key);
+        if (normalizedKey) unique.add(normalizedKey);
+        const normalizedValue = normalizeModelName(value);
+        if (normalizedValue) unique.add(normalizedValue);
+      }
+    }
+  }
+
   private async loadQuery(): Promise<QueryFunction> {
     const sdk = (await import("@anthropic-ai/claude-agent-sdk")) as {
       query: QueryFunction;
@@ -546,6 +731,55 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     }
 
     return sdk.query;
+  }
+
+  private async readSupportedModelsFromSdk(
+    options?: {
+      settingSources?: Array<"user" | "project" | "local">;
+    },
+  ): Promise<ClaudeModelInfo[]> {
+    const requestedSources = options?.settingSources;
+    const settingSources = Array.isArray(requestedSources) && requestedSources.length > 0
+      ? requestedSources
+      : this.options.settingSources ?? ["user", "project"];
+    const cacheKey = settingSources.join(",");
+    const cached = this.modelInfoCache.get(cacheKey);
+    if (cached && Date.now() < cached.expiresAt) {
+      return cached.infos;
+    }
+    try {
+      const query = this.options.queryImpl ?? (await this.loadQuery());
+      const session = query({
+        prompt: "",
+        options: {
+          cwd: this.options.cwd ? resolve(this.options.cwd) : process.cwd(),
+          settingSources,
+          permissionMode: this.options.permissionMode,
+        },
+      }) as AsyncIterable<unknown> & {
+        supportedModels?: () => Promise<ClaudeModelInfo[]>;
+        return?: (value?: unknown) => Promise<unknown>;
+      };
+      if (typeof session.supportedModels !== "function") {
+        return [];
+      }
+      const infosRaw = await session.supportedModels();
+      if (typeof session.return === "function") {
+        try {
+          await session.return(undefined);
+        } catch {
+          // ignore
+        }
+      }
+      const infos = Array.isArray(infosRaw) ? infosRaw : [];
+      this.modelInfoCache.set(cacheKey, {
+        infos,
+        expiresAt: Date.now() + this.modelInfoTtlMs,
+      });
+      return infos;
+    } catch {
+      return [];
+    }
   }
 
   private createAbortController(signal: AbortSignal): AbortController {
@@ -563,4 +797,5 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     signal.addEventListener("abort", onAbort);
     return controller;
   }
+
 }

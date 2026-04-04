@@ -99,10 +99,62 @@ function buildRuntimeCwdRelative(
 }
 
 export class Llm4ZoteroAgentBackendAdapter {
-  constructor(private readonly adapter: ClaudeCodeRuntimeAdapter) {}
+  private readonly adapter: ClaudeCodeRuntimeAdapter;
+  private readonly runtimeCwd?: string;
 
-  listTools() {
-    return getToolCatalog();
+  constructor(options: { adapter: ClaudeCodeRuntimeAdapter; runtimeCwd?: string }) {
+    this.adapter = options.adapter;
+    this.runtimeCwd = options.runtimeCwd;
+  }
+
+  listTools(options?: {
+    settingSources?: Array<"user" | "project" | "local">;
+  }) {
+    return getToolCatalog({
+      runtimeCwd: this.runtimeCwd,
+      settingSources: options?.settingSources,
+    });
+  }
+
+  async listModels(
+    options?: {
+      settingSources?: Array<"user" | "project" | "local">;
+    },
+  ): Promise<string[]> {
+    const models = await this.adapter.listRuntimeModels(options);
+    const unique = new Set<string>();
+    unique.add("default");
+    for (const model of models) {
+      const normalized = (model || "").trim();
+      if (normalized) unique.add(normalized);
+    }
+    const envCandidates = [
+      process.env.ANTHROPIC_DEFAULT_OPUS_MODEL,
+      process.env.ANTHROPIC_DEFAULT_SONNET_MODEL,
+      process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL,
+      process.env.ANTHROPIC_CUSTOM_MODEL_OPTION,
+    ];
+    for (const candidate of envCandidates) {
+      const normalized = (candidate || "").trim();
+      if (normalized) unique.add(normalized);
+    }
+    return Array.from(unique);
+  }
+
+  async listEfforts(
+    options?: {
+      model?: string;
+      settingSources?: Array<"user" | "project" | "local">;
+    },
+  ): Promise<string[]> {
+    const efforts = await this.adapter.listRuntimeEfforts(options);
+    const unique = new Set<string>();
+    unique.add("default");
+    for (const effort of efforts) {
+      const normalized = (effort || "").trim().toLowerCase();
+      if (normalized) unique.add(normalized);
+    }
+    return Array.from(unique);
   }
 
   async runTurn(params: Llm4ZoteroRunTurnParams): Promise<Llm4ZoteroRunTurnOutcome> {

@@ -8,7 +8,7 @@ import {
 } from "../src/index.js";
 import type { SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
-import { resolve, relative } from "node:path";
+import { resolve } from "node:path";
 
 function getArg(name: string): string | undefined {
   const flag = `--${name}`;
@@ -117,7 +117,7 @@ async function main() {
     defaultStateDir;
   const forwardFrontendModel = parseBoolean(
     getArg("forward-frontend-model") ?? process.env.ADAPTER_FORWARD_FRONTEND_MODEL,
-    false,
+    true,
   );
   const runtimeCwdRaw =
     getArg("runtime-cwd") ||
@@ -125,18 +125,6 @@ async function main() {
     defaultRuntimeCwd;
   const runtimeCwd = resolve(runtimeCwdRaw);
   const stateDirResolved = resolve(stateDir);
-
-  if (homeDir) {
-    if (zoteroRoot && existsSync(zoteroRoot)) {
-      const rel = relative(zoteroRoot, runtimeCwd);
-      const insideZotero = rel === "" || (!rel.startsWith("..") && !rel.startsWith("/"));
-      if (!insideZotero) {
-        throw new Error(
-          `Invalid runtime cwd: ${runtimeCwd}. runtime-cwd must be inside ${zoteroRoot}.`,
-        );
-      }
-    }
-  }
 
   mkdirSync(runtimeCwd, { recursive: true });
   mkdirSync(stateDirResolved, { recursive: true });
@@ -197,7 +185,10 @@ async function main() {
     ),
   });
 
-  const compat = new Llm4ZoteroAgentBackendAdapter(core);
+  const compat = new Llm4ZoteroAgentBackendAdapter({
+    adapter: core,
+    runtimeCwd,
+  });
   const server = await startHttpBridgeServer({ adapter: compat, host, port });
 
   console.log(`[cc-llm4zotero-adapter] listening on http://${server.host}:${server.port}`);

@@ -36,7 +36,7 @@ describe("Llm4ZoteroAgentBackendAdapter", () => {
       sessionMapper: new InMemorySessionMapper()
     });
 
-    const compat = new Llm4ZoteroAgentBackendAdapter(base);
+    const compat = new Llm4ZoteroAgentBackendAdapter({ adapter: base });
 
     const seen: Array<{ type: string; payload: unknown }> = [];
 
@@ -91,7 +91,7 @@ describe("Llm4ZoteroAgentBackendAdapter", () => {
       sessionMapper: new InMemorySessionMapper()
     });
 
-    const compat = new Llm4ZoteroAgentBackendAdapter(base);
+    const compat = new Llm4ZoteroAgentBackendAdapter({ adapter: base });
     const outcome = await compat.runTurn({
       request: { conversationKey: "conv-fail", userText: "x" }
     });
@@ -119,7 +119,7 @@ describe("Llm4ZoteroAgentBackendAdapter", () => {
       sessionMapper: new InMemorySessionMapper()
     });
 
-    const compat = new Llm4ZoteroAgentBackendAdapter(base);
+    const compat = new Llm4ZoteroAgentBackendAdapter({ adapter: base });
     const seen: string[] = [];
 
     const outcome = await compat.runTurn({
@@ -149,7 +149,7 @@ describe("Llm4ZoteroAgentBackendAdapter", () => {
       runtimeClient,
       sessionMapper: new InMemorySessionMapper(),
     });
-    const compat = new Llm4ZoteroAgentBackendAdapter(base);
+    const compat = new Llm4ZoteroAgentBackendAdapter({ adapter: base });
     const candidateTool = compat.listTools()[0];
     expect(candidateTool).toBeDefined();
 

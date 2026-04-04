@@ -21,6 +21,37 @@ export class ClaudeCodeRuntimeAdapter {
     this.traceStore = options.traceStore;
   }
 
+  async listRuntimeModels(
+    options?: {
+      settingSources?: Array<"user" | "project" | "local">;
+    },
+  ): Promise<string[]> {
+    if (typeof this.runtimeClient.listModels !== "function") {
+      return [];
+    }
+    try {
+      return await this.runtimeClient.listModels(options);
+    } catch {
+      return [];
+    }
+  }
+
+  async listRuntimeEfforts(
+    options?: {
+      model?: string;
+      settingSources?: Array<"user" | "project" | "local">;
+    },
+  ): Promise<string[]> {
+    if (typeof this.runtimeClient.listEfforts !== "function") {
+      return ["default", "low", "medium", "high"];
+    }
+    try {
+      return await this.runtimeClient.listEfforts(options);
+    } catch {
+      return ["default", "low", "medium", "high"];
+    }
+  }
+
   async runTurn(request: RunTurnRequest, hooks: RunTurnHooks = {}): Promise<RunTurnOutcome> {
     const signal = hooks.signal ?? request.signal;
     const initialSessionId = await this.sessionMapper.get(request.conversationKey);

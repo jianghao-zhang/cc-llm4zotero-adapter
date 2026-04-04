@@ -50,6 +50,23 @@ function parseScopeType(
   }
 }
 
+function parseSettingSources(
+  value: string | null | undefined,
+): Array<"user" | "project" | "local"> | undefined {
+  if (!value) return undefined;
+  const normalized = value
+    .split(",")
+    .map((entry) => entry.trim().toLowerCase())
+    .filter(Boolean);
+  const accepted: Array<"user" | "project" | "local"> = [];
+  for (const entry of normalized) {
+    if (entry === "user" || entry === "project" || entry === "local") {
+      if (!accepted.includes(entry)) accepted.push(entry);
+    }
+  }
+  return accepted.length > 0 ? accepted : undefined;
+}
+
 function sendJson(res: ServerResponse, statusCode: number, body: unknown): void {
   res.statusCode = statusCode;
   res.setHeader("Content-Type", "application/json; charset=utf-8");
@@ -157,13 +174,42 @@ export async function startHttpBridgeServer(
 
   const server = createServer(async (req, res) => {
     try {
+      const reqUrl = new URL(req.url || "/", `http://${host}:${port}`);
       if (req.method === "GET" && req.url === "/healthz") {
         sendJson(res, 200, { ok: true, ts: Date.now() });
         return;
       }
 
-      if (req.method === "GET" && req.url === "/tools") {
-        sendJson(res, 200, { tools: options.adapter.listTools() });
+      if (req.method === "GET" && reqUrl.pathname === "/tools") {
+        const settingSources = parseSettingSources(
+          reqUrl.searchParams.get("settingSources"),
+        );
+        sendJson(res, 200, { tools: options.adapter.listTools({ settingSources }) });
+        return;
+      }
+
+      if (req.method === "GET" && reqUrl.pathname === "/models") {
+        const settingSources = parseSettingSources(
+          reqUrl.searchParams.get("settingSources"),
+        );
+        const models = await options.adapter.listModels({ settingSources });
+        sendJson(res, 200, { models });
+        return;
+      }
+
+      if (req.method === "GET" && reqUrl.pathname === "/efforts") {
+        const settingSources = parseSettingSources(
+          reqUrl.searchParams.get("settingSources"),
+        );
+        const model =
+          typeof reqUrl.searchParams.get("model") === "string"
+            ? (reqUrl.searchParams.get("model") || "").trim()
+            : undefined;
+        const efforts = await options.adapter.listEfforts({
+          settingSources,
+          model: model || undefined,
+        });
+        sendJson(res, 200, { efforts });
         return;
       }
 

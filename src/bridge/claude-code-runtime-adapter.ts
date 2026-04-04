@@ -36,6 +36,21 @@ export class ClaudeCodeRuntimeAdapter {
     }
   }
 
+  async listRuntimeCommands(
+    options?: {
+      settingSources?: Array<"user" | "project" | "local">;
+    },
+  ): Promise<Array<{ name: string; description: string; argumentHint: string }>> {
+    if (typeof this.runtimeClient.listCommands !== "function") {
+      return [];
+    }
+    try {
+      return await this.runtimeClient.listCommands(options);
+    } catch {
+      return [];
+    }
+  }
+
   async listRuntimeEfforts(
     options?: {
       model?: string;

@@ -36,6 +36,11 @@ export interface RuntimeTurnStream {
 
 export interface ClaudeCodeRuntimeClient {
   startTurn(request: RuntimeTurnRequest): Promise<RuntimeTurnStream>;
+  listCommands?(
+    options?: {
+      settingSources?: Array<"user" | "project" | "local">;
+    }
+  ): Promise<Array<{ name: string; description: string; argumentHint: string }>>;
   listModels?(
     options?: {
       settingSources?: Array<"user" | "project" | "local">;

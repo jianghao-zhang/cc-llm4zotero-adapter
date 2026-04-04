@@ -116,6 +116,36 @@ export class Llm4ZoteroAgentBackendAdapter {
     });
   }
 
+  async listCommands(
+    options?: {
+      settingSources?: Array<"user" | "project" | "local">;
+    },
+  ): Promise<Array<{ name: string; description: string; argumentHint: string; source: "sdk" | "fallback" }>> {
+    const fromSdk = await this.adapter.listRuntimeCommands(options);
+    const normalizedFromSdk = fromSdk
+      .map((entry) => ({
+        name: (entry.name || "").trim().replace(/^\/+/, ""),
+        description: (entry.description || "").trim(),
+        argumentHint: (entry.argumentHint || "").trim(),
+      }))
+      .filter((entry) => entry.name.length > 0);
+    if (normalizedFromSdk.length > 0) {
+      return normalizedFromSdk.map((entry) => ({
+        ...entry,
+        source: "sdk" as const,
+      }));
+    }
+    return getToolCatalog({
+      runtimeCwd: this.runtimeCwd,
+      settingSources: options?.settingSources,
+    }).map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      argumentHint: "",
+      source: "fallback" as const,
+    }));
+  }
+
   async listModels(
     options?: {
       settingSources?: Array<"user" | "project" | "local">;

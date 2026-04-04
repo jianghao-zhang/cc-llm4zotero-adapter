@@ -188,6 +188,15 @@ export async function startHttpBridgeServer(
         return;
       }
 
+      if (req.method === "GET" && reqUrl.pathname === "/commands") {
+        const settingSources = parseSettingSources(
+          reqUrl.searchParams.get("settingSources"),
+        );
+        const commands = await options.adapter.listCommands({ settingSources });
+        sendJson(res, 200, { commands });
+        return;
+      }
+
       if (req.method === "GET" && reqUrl.pathname === "/models") {
         const settingSources = parseSettingSources(
           reqUrl.searchParams.get("settingSources"),

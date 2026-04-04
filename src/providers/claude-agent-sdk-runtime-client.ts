@@ -17,6 +17,12 @@ type ClaudeModelInfo = {
   supportsEffort?: boolean;
 };
 
+type ClaudeSlashCommandInfo = {
+  name?: string;
+  description?: string;
+  argumentHint?: string;
+};
+
 function normalizeModelName(value: unknown): string {
   if (typeof value !== "string") return "";
   return value
@@ -266,7 +272,11 @@ function buildPromptText(
   userMessage: string,
   runtimeRequest: RuntimeRequestShape | undefined,
 ): string {
-  const lines: string[] = [userMessage.trim()];
+  const trimmedUserMessage = userMessage.trim();
+  if (trimmedUserMessage.startsWith("/")) {
+    return trimmedUserMessage;
+  }
+  const lines: string[] = [trimmedUserMessage];
 
   if (!runtimeRequest) {
     return lines.join("\n\n");
@@ -477,7 +487,12 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     string,
     { expiresAt: number; infos: ClaudeModelInfo[] }
   >();
+  private commandInfoCache = new Map<
+    string,
+    { expiresAt: number; commands: ClaudeSlashCommandInfo[] }
+  >();
   private readonly modelInfoTtlMs = 60_000;
+  private readonly commandInfoTtlMs = 60_000;
 
   constructor(options: ClaudeAgentSdkRuntimeClientOptions = {}) {
     this.options = options;
@@ -592,6 +607,22 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       this.collectModelsFromSettings(settings, unique);
     }
     return Array.from(unique);
+  }
+
+  async listCommands(
+    options?: {
+      settingSources?: Array<"user" | "project" | "local">;
+    },
+  ): Promise<Array<{ name: string; description: string; argumentHint: string }>> {
+    const infos = await this.readSupportedCommandsFromSdk(options);
+    const commands = infos
+      .map((entry) => ({
+        name: (entry.name || "").trim().replace(/^\/+/, ""),
+        description: (entry.description || "").trim(),
+        argumentHint: (entry.argumentHint || "").trim(),
+      }))
+      .filter((entry) => entry.name.length > 0);
+    return commands;
   }
 
   async listEfforts(
@@ -777,6 +808,55 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
         expiresAt: Date.now() + this.modelInfoTtlMs,
       });
       return infos;
+    } catch {
+      return [];
+    }
+  }
+
+  private async readSupportedCommandsFromSdk(
+    options?: {
+      settingSources?: Array<"user" | "project" | "local">;
+    },
+  ): Promise<ClaudeSlashCommandInfo[]> {
+    const requestedSources = options?.settingSources;
+    const settingSources = Array.isArray(requestedSources) && requestedSources.length > 0
+      ? requestedSources
+      : this.options.settingSources ?? ["user", "project"];
+    const cacheKey = settingSources.join(",");
+    const cached = this.commandInfoCache.get(cacheKey);
+    if (cached && Date.now() < cached.expiresAt) {
+      return cached.commands;
+    }
+    try {
+      const query = this.options.queryImpl ?? (await this.loadQuery());
+      const session = query({
+        prompt: "",
+        options: {
+          cwd: this.options.cwd ? resolve(this.options.cwd) : process.cwd(),
+          settingSources,
+          permissionMode: this.options.permissionMode,
+        },
+      }) as AsyncIterable<unknown> & {
+        supportedCommands?: () => Promise<ClaudeSlashCommandInfo[]>;
+        return?: (value?: unknown) => Promise<unknown>;
+      };
+      if (typeof session.supportedCommands !== "function") {
+        return [];
+      }
+      const commandsRaw = await session.supportedCommands();
+      if (typeof session.return === "function") {
+        try {
+          await session.return(undefined);
+        } catch {
+          // ignore
+        }
+      }
+      const commands = Array.isArray(commandsRaw) ? commandsRaw : [];
+      this.commandInfoCache.set(cacheKey, {
+        commands,
+        expiresAt: Date.now() + this.commandInfoTtlMs,
+      });
+      return commands;
     } catch {
       return [];
     }

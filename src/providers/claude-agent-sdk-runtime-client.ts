@@ -739,6 +739,12 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       // Create iterator for SDK stream
       const sdkIterator = sdkStream[Symbol.asyncIterator]();
       let sdkDone = false;
+      // Cache the pending .next() promise — never create a second one while the first is live.
+      // Without this, each 50ms timeout triggers a new sdkIterator.next() call while the
+      // previous one is still pending. Async generators queue .next() calls sequentially, so
+      // event N satisfies pending call #N but we are always awaiting a later call, causing all
+      // SDK events to be silently consumed by abandoned promises → "No response." for every query.
+      let pendingNext: Promise<IteratorResult<unknown>> | null = null;
 
       // Process both SDK events and permission events
       while (!sdkDone || permissionEventBuffer.length > 0) {
@@ -748,19 +754,27 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
           if (event) yield event;
         }
 
-        if (sdkDone) continue;
+        if (sdkDone) break;
+
+        // Reuse the same promise until it resolves
+        if (!pendingNext) {
+          pendingNext = sdkIterator.next();
+        }
 
         // Race between SDK next value and a short delay to check for permission events
         const timeoutPromise = new Promise<null>((resolve) =>
           setTimeout(() => resolve(null), 50)
         );
 
-        const result = await Promise.race([sdkIterator.next(), timeoutPromise]);
+        const result = await Promise.race([pendingNext, timeoutPromise]);
 
         if (result === null) {
-          // Timeout - check if permission events were added during the wait
+          // Timeout - check if permission events were added during the wait, then retry same pendingNext
           continue;
         }
+
+        // pendingNext resolved — consume it and reset so next iteration creates a fresh one
+        pendingNext = null;
 
         if (result.done) {
           sdkDone = true;

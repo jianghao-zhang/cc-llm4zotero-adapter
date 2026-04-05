@@ -67,6 +67,10 @@ export class ClaudeCodeRuntimeAdapter {
     }
   }
 
+  async getMappedProviderSessionId(conversationKey: string): Promise<string | undefined> {
+    return this.sessionMapper.get(conversationKey);
+  }
+
   async runTurn(request: RunTurnRequest, hooks: RunTurnHooks = {}): Promise<RunTurnOutcome> {
     const signal = hooks.signal ?? request.signal;
     const initialSessionId = await this.sessionMapper.get(request.conversationKey);

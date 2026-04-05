@@ -225,6 +225,7 @@ export class Llm4ZoteroAgentBackendAdapter {
   }): Promise<{
     originalConversationKey: string;
     scopedConversationKey: string;
+    providerSessionId?: string;
     scopeType?: ScopeType;
     scopeId?: string;
     scopeLabel?: string;
@@ -243,9 +244,13 @@ export class Llm4ZoteroAgentBackendAdapter {
       scope,
     );
     const runtimeCwdRelative = buildRuntimeCwdRelative(scope, originalConversationKey);
+    const providerSessionId = await this.adapter.getMappedProviderSessionId(
+      scopedConversationKey,
+    );
     return {
       originalConversationKey,
       scopedConversationKey,
+      providerSessionId,
       scopeType: scope?.scopeType,
       scopeId: scope?.scopeId,
       scopeLabel: scope?.scopeLabel,

@@ -370,14 +370,25 @@ export async function startHttpBridgeServer(
           sendJson(res, 400, { error: message });
           return;
         }
-        const accepted = options.adapter.resolveExternalConfirmation(payload.requestId, {
+        const resolution = options.adapter.resolveExternalConfirmation(payload.requestId, {
           approved: payload.approved,
           actionId: payload.actionId,
           data: payload.data,
         });
-        sendJson(res, accepted ? 200 : 404, {
-          ok: accepted,
+        console.log(
+          `[confirm] rid=${payload.requestId} source=${resolution.source} accepted=${resolution.accepted}`,
+        );
+        if (!resolution.accepted) {
+          console.log(
+            `[confirm] pending_count=${resolution.pendingPermissionCount} recent=${resolution.recentPendingRequestIds.join(",") || "-"}`,
+          );
+        }
+        sendJson(res, resolution.accepted ? 200 : 404, {
+          ok: resolution.accepted,
           requestId: payload.requestId,
+          source: resolution.source,
+          pendingPermissionCount: resolution.pendingPermissionCount,
+          recentPendingRequestIds: resolution.recentPendingRequestIds,
         });
         return;
       }

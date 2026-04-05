@@ -8,6 +8,7 @@ import type {
 } from "./llm4zotero-contract.js";
 import { mapToLlm4ZoteroEvent } from "../event-mapper/map-to-llm4zotero-event.js";
 import { findToolByName, getToolCatalog } from "./tool-catalog.js";
+import { globalPermissionStore } from "../permissions/permission-store.js";
 
 const CATASTROPHIC_ARG_PATTERNS: RegExp[] = [
   /\brm\s+-rf\s+\/(?!\S)/i,
@@ -124,16 +125,40 @@ export class Llm4ZoteroAgentBackendAdapter {
   resolveExternalConfirmation(
     requestId: string,
     resolution: { approved: boolean; actionId?: string; data?: unknown },
-  ): boolean {
+  ): {
+    accepted: boolean;
+    source: "pending_map" | "permission_store" | "none";
+    pendingPermissionCount: number;
+    recentPendingRequestIds: string[];
+  } {
+    // First check internal pending confirmations (for debug probes, etc.)
     const resolve = this.pendingExternalConfirmations.get(requestId);
-    if (!resolve) return false;
-    this.pendingExternalConfirmations.delete(requestId);
-    resolve({
-      approved: Boolean(resolution.approved),
-      actionId: resolution.actionId,
+    if (resolve) {
+      this.pendingExternalConfirmations.delete(requestId);
+      resolve({
+        approved: Boolean(resolution.approved),
+        actionId: resolution.actionId,
+        data: resolution.data,
+      });
+      return {
+        accepted: true,
+        source: "pending_map",
+        pendingPermissionCount: globalPermissionStore.pendingCount(),
+        recentPendingRequestIds: globalPermissionStore.listPendingRequestIds(3),
+      };
+    }
+
+    // Then check global permission store (for SDK canUseTool callback)
+    const accepted = globalPermissionStore.resolve(requestId, {
+      approved: resolution.approved,
       data: resolution.data,
     });
-    return true;
+    return {
+      accepted,
+      source: accepted ? "permission_store" : "none",
+      pendingPermissionCount: globalPermissionStore.pendingCount(),
+      recentPendingRequestIds: globalPermissionStore.listPendingRequestIds(3),
+    };
   }
 
   listTools(options?: {
@@ -279,51 +304,6 @@ export class Llm4ZoteroAgentBackendAdapter {
     };
     if (runtimeCwdRelative) {
       mergedMetadata.runtimeCwdRelative = runtimeCwdRelative;
-    }
-
-    const shouldProbePermission =
-      mergedMetadata.debugPermissionProbe === true ||
-      mergedMetadata.debugPermissionProbe === "true";
-    if (shouldProbePermission) {
-      const requestId = `probe-confirm-${Date.now().toString(36)}-${Math.random()
-        .toString(36)
-        .slice(2, 8)}`;
-      await params.onEvent?.({
-        type: "confirmation_required",
-        requestId,
-        action: {
-          toolName: "permission_probe",
-          title: "Permission probe",
-          mode: "approval",
-          confirmLabel: "Approve once",
-          cancelLabel: "Deny",
-          description:
-            "Debug probe: confirms the confirmation event chain from adapter to plugin UI.",
-          fields: [],
-        },
-      });
-      const settled = await new Promise<{
-        approved: boolean;
-        actionId?: string;
-        data?: unknown;
-      }>((resolve) => {
-        this.pendingExternalConfirmations.set(requestId, resolve);
-      });
-      await params.onEvent?.({
-        type: "confirmation_resolved",
-        requestId,
-        approved: settled.approved,
-        actionId: settled.actionId,
-        data: settled.data,
-      });
-      if (!settled.approved) {
-        return {
-          kind: "fallback",
-          runId: `probe-${Date.now()}`,
-          reason: "permission_probe_denied",
-          usedFallback: true,
-        };
-      }
     }
 
     const outcome = await this.adapter.runTurn(

@@ -173,6 +173,7 @@ async function main() {
     includePartialMessages: true,
     appendSystemPrompt: appendSystemPrompt || undefined,
     forwardFrontendModel,
+    permissionMode: "default",
   });
 
   const core = new ClaudeCodeRuntimeAdapter({

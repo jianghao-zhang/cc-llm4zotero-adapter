@@ -5,6 +5,12 @@ import { isAbsolute, relative, resolve } from "node:path";
 import type { ClaudeCodeRuntimeClient, RuntimeTurnRequest, RuntimeTurnStream } from "../runtime.js";
 import { mapSdkMessageToProviderEvents } from "../event-mapper/map-sdk-message.js";
 import type { PermissionMode, SDKUserMessage, SettingSource } from "@anthropic-ai/claude-agent-sdk";
+import { globalPermissionStore } from "../permissions/permission-store.js";
+import type { PermissionResult } from "../permissions/permission-store.js";
+import {
+  resolveModelWithCache,
+  setCachedModels,
+} from "./model-resolver.js";
 
 type QueryFunction = (args: {
   prompt: string | AsyncIterable<SDKUserMessage>;
@@ -530,7 +536,8 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     const requestedModel =
       shouldForwardFrontendModel &&
       requestedModelRaw &&
-      requestedModelRaw.toLowerCase() !== "default"
+      requestedModelRaw.toLowerCase() !== "default" &&
+      requestedModelRaw.toLowerCase() !== "auto"
         ? requestedModelRaw
         : undefined;
     const requestedEffortRaw =
@@ -540,17 +547,129 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     const requestedEffort =
       requestedEffortRaw === "low" ||
       requestedEffortRaw === "medium" ||
-      requestedEffortRaw === "high" ||
       requestedEffortRaw === "max"
         ? requestedEffortRaw
         : undefined;
+
     const settingSourcesOverride = parseSettingSourcesOverride(metadata);
     const permissionModeOverride = parsePermissionModeOverride(metadata);
     const effectiveCwd = this.resolveScopedCwd(request.metadata);
 
+    // Dynamic model resolution with cache
+    const effectiveSettingSources =
+      settingSourcesOverride ?? this.options.settingSources ?? ["user", "project"];
+
+    let resolvedModel: string | undefined;
+    if (
+      shouldForwardFrontendModel &&
+      requestedModelRaw &&
+      requestedModelRaw.toLowerCase() !== "default" &&
+      requestedModelRaw.toLowerCase() !== "auto"
+    ) {
+      // Try to resolve from cache or environment variables
+      const { model: resolvedFromCache, cacheHit } = resolveModelWithCache(
+        requestedModelRaw,
+        effectiveSettingSources
+      );
+
+      if (resolvedFromCache) {
+        // Use resolved model (from cache or env vars)
+        resolvedModel = resolvedFromCache;
+      }
+
+      if (!cacheHit) {
+        // Cache miss: trigger async fetch to populate cache for next time
+        this.fetchAndCacheModels(effectiveSettingSources).catch(() => {
+          // Silently ignore, will retry on next request
+        });
+      }
+    }
+
+    // Permission event buffer for canUseTool callback
+    const permissionEventBuffer: Array<import("../runtime.js").ProviderEvent> = [];
+
+    // Create canUseTool handler that buffers permission events
+    const canUseTool = async (
+      toolName: string,
+      input: Record<string, unknown>,
+      sdkOptions: {
+        signal: AbortSignal;
+        title?: string;
+        description?: string;
+        displayName?: string;
+        toolUseID: string;
+        blockedPath?: string;
+        decisionReason?: string;
+      }
+    ): Promise<PermissionResult> => {
+      const { requestId, promise } = globalPermissionStore.create(
+        sdkOptions.toolUseID,
+        toolName,
+        input,
+        {
+          title: sdkOptions.title,
+          description: sdkOptions.description,
+          displayName: sdkOptions.displayName,
+          blockedPath: sdkOptions.blockedPath,
+          decisionReason: sdkOptions.decisionReason,
+        }
+      );
+
+      // Build confirmation_required event
+      const eventAction: Record<string, unknown> = {
+        toolName,
+        title: sdkOptions.title || `Approve ${toolName}`,
+        mode: "approval",
+        confirmLabel: "Allow",
+        cancelLabel: "Deny",
+        description:
+          sdkOptions.description ||
+          sdkOptions.decisionReason ||
+          "Claude Code requests permission to use a tool.",
+        fields: [],
+      };
+
+      // Add command preview for Bash tool
+      if (toolName === "Bash" && input.command) {
+        const commandStr = String(input.command).slice(0, 200);
+        (eventAction.fields as Array<Record<string, unknown>>).push({
+          type: "text",
+          id: "command",
+          label: "Command",
+          value: commandStr,
+        });
+      }
+
+      // Add blocked path if present
+      if (sdkOptions.blockedPath) {
+        (eventAction.fields as Array<Record<string, unknown>>).push({
+          type: "text",
+          id: "blockedPath",
+          label: "Path",
+          value: sdkOptions.blockedPath,
+        });
+      }
+
+      // Push to buffer for events generator to yield
+      permissionEventBuffer.push({
+        type: "confirmation_required",
+        payload: {
+          requestId,
+          action: eventAction,
+          sessionId: request.providerSessionId,
+        },
+      });
+
+      return promise;
+    };
+
+    // IMPORTANT:
+    // If alias resolution fails (e.g., frontend "sonnet" with non-Anthropic provider),
+    // do NOT forward raw alias to SDK. Omit `model` and let runtime defaults decide.
+    const modelForSdk = resolvedModel;
     const queryOptions: Record<string, unknown> = {
       ...metadata,
-      model: requestedModel,
+      model: modelForSdk,
       effort: requestedEffort,
       cwd: effectiveCwd,
       additionalDirectories: this.options.additionalDirectories,
@@ -564,18 +683,19 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       appendSystemPrompt: this.options.appendSystemPrompt,
       resume: request.providerSessionId,
       abortController: request.signal ? this.createAbortController(request.signal) : undefined,
+      // Add canUseTool callback for permission handling
+      canUseTool,
     };
 
     const cleanedOptions = Object.fromEntries(
       Object.entries(queryOptions).filter(([, value]) => value !== undefined)
     );
-    const effectiveSettingSources =
-      settingSourcesOverride ?? this.options.settingSources ?? ["user", "project"];
+    console.log(`[MODEL] Frontend: ${requestedModelRaw || "(none)"} -> SDK: ${String(cleanedOptions.model ?? "(runtime default)")}`);
 
     const prompt = await buildPromptInput(request, metadata);
     const sdkStream = query({
       prompt,
-      options: cleanedOptions
+      options: cleanedOptions,
     });
     const client = this;
 
@@ -596,8 +716,41 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
           },
         },
       };
-      for await (const message of sdkStream) {
-        const mapped = mapSdkMessageToProviderEvents(message);
+
+      // Create iterator for SDK stream
+      const sdkIterator = sdkStream[Symbol.asyncIterator]();
+      let sdkDone = false;
+
+      // Process both SDK events and permission events
+      while (!sdkDone || permissionEventBuffer.length > 0) {
+        // First, yield any pending permission events
+        while (permissionEventBuffer.length > 0) {
+          const event = permissionEventBuffer.shift();
+          if (event) yield event;
+        }
+
+        if (sdkDone) continue;
+
+        // Race between SDK next value and a short delay to check for permission events
+        const timeoutPromise = new Promise<null>((resolve) =>
+          setTimeout(() => resolve(null), 50)
+        );
+
+        const result = await Promise.race([sdkIterator.next(), timeoutPromise]);
+
+        if (result === null) {
+          // Timeout - check if permission events were added during the wait
+          continue;
+        }
+
+        if (result.done) {
+          sdkDone = true;
+          continue;
+        }
+
+        console.log(`[SDK] Received message:`, JSON.stringify(result.value));
+        const mapped = mapSdkMessageToProviderEvents(result.value);
+        console.log(`[SDK] Mapped to ${mapped.length} events:`, mapped.map(e => e.type));
         for (const event of mapped) {
           yield event;
         }
@@ -607,7 +760,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     return {
       runId: randomUUID(),
       providerSessionId: request.providerSessionId,
-      events
+      events,
     };
   }
 
@@ -885,6 +1038,26 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       return commands;
     } catch {
       return [];
+    }
+  }
+
+  private async fetchAndCacheModels(
+    settingSources: string[],
+  ): Promise<void> {
+    try {
+      const models = await this.readSupportedModelsFromSdk({
+        settingSources: settingSources as Array<"user" | "project" | "local">,
+      });
+      setCachedModels(
+        settingSources,
+        models.map((m) => ({
+          value: m.value,
+          supportsEffort: m.supportsEffort,
+          supportedEffortLevels: m.supportedEffortLevels,
+        })),
+      );
+    } catch {
+      // Silently ignore, will retry on next request
     }
   }
 

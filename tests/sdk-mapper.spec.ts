@@ -91,4 +91,26 @@ describe("mapSdkMessageToProviderEvents", () => {
       }
     ]);
   });
+
+  it("maps error result payload into final output text", () => {
+    const events = mapSdkMessageToProviderEvents({
+      type: "result",
+      session_id: "sess-4",
+      is_error: true,
+      errors: [{ message: "models/sonnet not found" }],
+    });
+
+    expect(events).toHaveLength(2);
+    expect(events[1]).toEqual({
+      type: "final",
+      payload: {
+        output: "Error: models/sonnet not found",
+        isError: true,
+        subtype: undefined,
+        durationMs: undefined,
+        numTurns: undefined,
+        sessionId: "sess-4",
+      },
+    });
+  });
 });

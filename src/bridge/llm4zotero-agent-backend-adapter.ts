@@ -354,6 +354,15 @@ export class Llm4ZoteroAgentBackendAdapter {
       finalText = outcome.finalText;
     }
 
+    if (!finalText.trim()) {
+      return {
+        kind: "fallback",
+        runId: outcome.runId,
+        reason: "runtime_empty_response",
+        usedFallback: true,
+      };
+    }
+
     return {
       kind: "completed",
       runId: outcome.runId,

@@ -61,6 +61,31 @@ function normalizeToolUseResult(result: unknown): string {
   return JSON.stringify(result);
 }
 
+function extractResultOutput(msg: Record<string, unknown>): string {
+  if (typeof msg.result === "string" && msg.result.trim()) {
+    return msg.result;
+  }
+  const error = asRecord(msg.error);
+  if (typeof error.message === "string" && error.message.trim()) {
+    return `Error: ${error.message}`;
+  }
+  if (Array.isArray(msg.errors) && msg.errors.length > 0) {
+    const first = asRecord(msg.errors[0]);
+    const message =
+      (typeof first.message === "string" && first.message.trim()) ||
+      (typeof first.error === "string" && first.error.trim()) ||
+      "";
+    if (message) {
+      return `Error: ${message}`;
+    }
+    return `Error: ${JSON.stringify(msg.errors)}`;
+  }
+  if (Boolean(msg.is_error)) {
+    return "Error: runtime returned an empty error result.";
+  }
+  return "";
+}
+
 export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
   const msg = asRecord(raw);
   const type = typeof msg.type === "string" ? msg.type : "unknown";
@@ -221,12 +246,13 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
   }
 
   if (type === "result") {
+    const output = extractResultOutput(msg);
     return [
       providerEvent,
       {
         type: "final",
         payload: {
-          output: typeof msg.result === "string" ? msg.result : "",
+          output,
           isError: Boolean(msg.is_error),
           subtype: msg.subtype,
           durationMs: msg.duration_ms,

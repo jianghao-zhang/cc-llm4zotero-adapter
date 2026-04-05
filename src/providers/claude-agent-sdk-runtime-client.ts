@@ -69,6 +69,10 @@ const DEFAULT_BLOCKED_METADATA_KEYS = new Set<string>([
   "settingSources",
   "runtimeRequest",
   "runtimeCwdRelative",
+  // Prevent raw frontend selectors from leaking directly via metadata spread.
+  // These fields must be normalized by adapter logic before forwarding to SDK.
+  "model",
+  "effort",
 ]);
 
 type RuntimeAttachment = {
@@ -530,9 +534,12 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
   async startTurn(request: RuntimeTurnRequest): Promise<RuntimeTurnStream> {
     const query = this.options.queryImpl ?? (await this.loadQuery());
     const metadata = parseMetadata(request.metadata, this.options);
+    const rawRequestMetadata = asRecord(request.metadata) ?? {};
     const shouldForwardFrontendModel = this.options.forwardFrontendModel === true;
     const requestedModelRaw =
-      typeof metadata.model === "string" ? metadata.model.trim() : "";
+      typeof rawRequestMetadata.model === "string"
+        ? rawRequestMetadata.model.trim()
+        : "";
     const requestedModel =
       shouldForwardFrontendModel &&
       requestedModelRaw &&
@@ -541,12 +548,13 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
         ? requestedModelRaw
         : undefined;
     const requestedEffortRaw =
-      typeof metadata.effort === "string"
-        ? metadata.effort.trim().toLowerCase()
+      typeof rawRequestMetadata.effort === "string"
+        ? rawRequestMetadata.effort.trim().toLowerCase()
         : "";
     const requestedEffort =
       requestedEffortRaw === "low" ||
       requestedEffortRaw === "medium" ||
+      requestedEffortRaw === "high" ||
       requestedEffortRaw === "max"
         ? requestedEffortRaw
         : undefined;
@@ -573,8 +581,19 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       );
 
       if (resolvedFromCache) {
-        // Use resolved model (from cache or env vars)
-        resolvedModel = resolvedFromCache;
+        // Never forward generic aliases (sonnet/opus/haiku) directly to SDK.
+        // If resolution only bounces back the alias itself, treat as unresolved
+        // and let runtime defaults choose the effective model.
+        const normalizedResolved = resolvedFromCache.trim().toLowerCase();
+        const normalizedRequested = requestedModelRaw.trim().toLowerCase();
+        const isGenericAlias =
+          normalizedRequested === "sonnet" ||
+          normalizedRequested === "opus" ||
+          normalizedRequested === "haiku";
+        if (!(isGenericAlias && normalizedResolved === normalizedRequested)) {
+          // Use resolved model (from cache or env vars)
+          resolvedModel = resolvedFromCache;
+        }
       }
 
       if (!cacheHit) {

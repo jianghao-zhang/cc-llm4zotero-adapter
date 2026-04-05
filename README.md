@@ -130,6 +130,54 @@ interface ClaudeCodeRuntimeClient {
 
 Remaining integration focus is wiring this adapter into `llm-for-zotero` backend entrypoints.
 
+## Debugging: Code Changes & Bridge Restart
+
+The bridge runs as a **launchd daemon** (`com.toha.ccbridge`) via `tsx` (reads TypeScript source directly — no compilation needed). However, launchd auto-restarts it on crash with `KeepAlive: true`, so a plain `kill` won't stop it.
+
+### After changing source code
+
+```bash
+# Force restart to pick up changes
+launchctl unload ~/Library/LaunchAgents/com.toha.ccbridge.plist
+launchctl load ~/Library/LaunchAgents/com.toha.ccbridge.plist
+```
+
+Or use the npm script:
+```bash
+npm run bridge:restart
+```
+
+### Verify the new code is running
+
+```bash
+# Check process start time — should be recent
+ps aux | grep tsx | grep -v grep
+
+# Tail live logs
+tail -f /tmp/cc-bridge-launchd.out
+```
+
+### Common trap: stale bridge
+
+If you edit source and test immediately **without restarting**, the bridge is still running the old code. Symptoms:
+- Your fix appears in the file but behavior is unchanged
+- Logs show old error patterns
+
+Always `unload` + `load` after any source edit. `npm run bridge:restart` is the safe shortcut.
+
+### Log locations
+
+| Log | Path |
+|-----|------|
+| stdout (bridge output) | `/tmp/cc-bridge-launchd.out` |
+| stderr (errors) | `/tmp/cc-bridge-launchd.err` |
+
+### Permission issues with MCP tools
+
+If MCP tools (Exa, Tavily, etc.) are denied with ZodError `updatedInput: undefined`:
+- The `canUseTool` callback must return `{ behavior: "allow", updatedInput: {} }` — `updatedInput` is **required** (not optional) in the SDK's Zod schema.
+- Confirm the bridge was restarted after any fix to `permission-store.ts`.
+
 ## Official References
 - Agent SDK TS reference: [TypeScript SDK](https://platform.claude.com/docs/en/agent-sdk/typescript)
 - Agent SDK overview: [Overview](https://platform.claude.com/docs/en/agent-sdk/overview)

@@ -1,4 +1,5 @@
 import type { ProviderEvent } from "../runtime.js";
+import { globalPermissionStore } from "../permissions/permission-store.js";
 
 interface SessionLikeMessage {
   session_id?: string;
@@ -78,7 +79,18 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
     const requestId =
       (typeof msg.requestId === "string" && msg.requestId.trim()) ||
       (typeof msg.request_id === "string" && msg.request_id.trim()) ||
-      `confirm-${Date.now()}`;
+      "";
+    if (!requestId) {
+      // Do not emit actionable confirmation events without a real requestId.
+      // A synthetic id cannot be resolved by the permission store.
+      return [providerEvent];
+    }
+    if (!globalPermissionStore.hasPending(requestId)) {
+      // SDK can surface confirmation-like events that are not backed by our
+      // canUseTool permission store. Rendering those as actionable cards causes
+      // frontend "Allow" clicks to be no-ops (resolve endpoint returns 404).
+      return [providerEvent];
+    }
     const actionCandidate =
       (msg.action && typeof msg.action === "object" ? msg.action : undefined) ??
       (msg.pendingAction && typeof msg.pendingAction === "object"
@@ -116,6 +128,9 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
       (typeof msg.requestId === "string" && msg.requestId.trim()) ||
       (typeof msg.request_id === "string" && msg.request_id.trim()) ||
       "";
+    if (!requestId) {
+      return [providerEvent];
+    }
     return [
       providerEvent,
       {

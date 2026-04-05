@@ -108,6 +108,7 @@ export class PermissionStore {
     if (result.approved) {
       pending.resolve({
         behavior: "allow",
+        updatedInput: {},  // SDK Zod schema requires this field (even if empty)
         toolUseID: pending.toolUseID,
       });
     } else {

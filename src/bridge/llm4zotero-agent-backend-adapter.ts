@@ -183,20 +183,9 @@ export class Llm4ZoteroAgentBackendAdapter {
         argumentHint: (entry.argumentHint || "").trim(),
       }))
       .filter((entry) => entry.name.length > 0);
-    if (normalizedFromSdk.length > 0) {
-      return normalizedFromSdk.map((entry) => ({
-        ...entry,
-        source: "sdk" as const,
-      }));
-    }
-    return getToolCatalog({
-      runtimeCwd: this.runtimeCwd,
-      settingSources: options?.settingSources,
-    }).map((tool) => ({
-      name: tool.name,
-      description: tool.description,
-      argumentHint: "",
-      source: "fallback" as const,
+    return normalizedFromSdk.map((entry) => ({
+      ...entry,
+      source: "sdk" as const,
     }));
   }
 

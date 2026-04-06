@@ -1,11 +1,6 @@
 import type { ProviderEvent } from "../runtime.js";
 import { globalPermissionStore } from "../permissions/permission-store.js";
 
-interface SessionLikeMessage {
-  session_id?: string;
-  type?: string;
-  tool_use_result?: unknown;
-}
 
 interface ClaudeContentBlock {
   type?: string;
@@ -26,8 +21,10 @@ function asRecord(value: unknown): Record<string, unknown> {
 }
 
 function getSessionId(msg: unknown): string | undefined {
-  const record = asRecord(msg) as SessionLikeMessage;
-  return typeof record.session_id === "string" ? record.session_id : undefined;
+  const record = asRecord(msg);
+  if (typeof record.sessionId === "string" && record.sessionId.trim()) return record.sessionId.trim();
+  if (typeof record.session_id === "string" && record.session_id.trim()) return record.session_id.trim();
+  return undefined;
 }
 
 function normalizeToolResultContent(content: unknown): string {

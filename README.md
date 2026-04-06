@@ -13,88 +13,44 @@ Adapter that connects `llm-for-zotero` frontend-compatible agent flow to Claude 
 - conversationKey <-> provider session id linking
 - trace loading/replay compatibility hooks
 
-## Current Status
-- Implemented `runTurn(request, { onStart, onEvent, signal })`.
-- Implemented event mapping for:
-  - `status/tool_call/tool_result/tool_error`
-  - `confirmation_required/confirmation_resolved`
-  - `message_delta/message_rollback`
-  - `final/fallback`
-- Implemented session mapping:
-  - `InMemorySessionMapper`
-  - `JsonFileSessionMapper`
-- Implemented trace stores:
-  - `InMemoryTraceStore`
-  - `JsonFileTraceStore`
-- Implemented Claude Agent SDK runtime client:
-  - `ClaudeAgentSdkRuntimeClient`
-  - SDK message -> frontend-compatible event mapping
-- Added unit tests for event flow + session/trace behavior.
-
 ## Quick Start
+
 ```bash
 npm install
 npm run build
 npm test
 ```
 
-The bridge runs as a launchd daemon on port **19787**. Manage it with:
-
-```bash
-launchctl unload ~/Library/LaunchAgents/com.toha.ccbridge.plist
-launchctl load ~/Library/LaunchAgents/com.toha.ccbridge.plist
-```
-
-Operational hard rule:
-- Do not ask the user to manually switch bridge settings in Zotero Run JavaScript during normal troubleshooting.
-- Treat bridge routing as a backend service responsibility (daemon health + config), not a user manual pref task.
-
-For local dev (no launchd):
+Local dev (no daemon):
 
 ```bash
 npm run serve:bridge  # port 8787
 ```
 
-Isolation-first (custom workspace):
+## CLI / Environment Options
 
-```bash
-npx tsx bin/start-bridge-server.ts \
-  --host 127.0.0.1 \
-  --port 19787 \
-  --runtime-cwd "$HOME/claude-profiles/zotero-harness" \
-  --setting-sources project,local \
-  --append-system-prompt-file "$HOME/claude-profiles/zotero-harness/prompts/literature-overlay.md"
-```
+| Flag | Env | Description |
+|------|-----|-------------|
+| `--host` | `ADAPTER_HOST` | Bind host (default `127.0.0.1`) |
+| `--port` | `ADAPTER_PORT` | Bind port (default `8787`) |
+| `--runtime-cwd` | `ADAPTER_RUNTIME_CWD` | Workspace root for Claude Agent SDK. Defaults to `$HOME/Zotero/agent-runtime` when `~/Zotero` exists. |
+| `--state-dir` | `ADAPTER_STATE_DIR` | Session/trace persistence directory. Defaults to `$HOME/Zotero/agent-state`. |
+| `--additional-directories` | `ADAPTER_ADDITIONAL_DIRECTORIES` | Extra readable directories (comma-separated, `~` supported). |
+| `--default-allowed-tools` | `ADAPTER_DEFAULT_ALLOWED_TOOLS` | Tools always auto-allowed (comma-separated). Default: `WebFetch,WebSearch`. |
+| `--setting-sources` | `ADAPTER_SETTING_SOURCES` | Claude settings sources: `user`, `project`, `local` (comma-separated). Default: `project,local`. |
+| `--append-system-prompt` | `ADAPTER_APPEND_SYSTEM_PROMPT` | Inline overlay prompt text. |
+| `--append-system-prompt-file` | `ADAPTER_APPEND_SYSTEM_PROMPT_FILE` | File-based overlay prompt. |
+| `--forward-frontend-model` | `ADAPTER_FORWARD_FRONTEND_MODEL` | Pass frontend `metadata.model` to runtime (default `true`). |
 
-CLI/env options:
-- `--runtime-cwd` or `ADAPTER_RUNTIME_CWD`: workspace root Claude Agent SDK should run in.
-- `--additional-directories` or `ADAPTER_ADDITIONAL_DIRECTORIES`: extra readable directories (comma-separated absolute paths, `~` supported).
-- `--default-allowed-tools` or `ADAPTER_DEFAULT_ALLOWED_TOOLS`: tools always auto-allowed by bridge (comma-separated). Default: `WebFetch,WebSearch`.
-- `--setting-sources` or `ADAPTER_SETTING_SOURCES`: comma-separated settings sources (`user,project,local`).
-- `--append-system-prompt` or `ADAPTER_APPEND_SYSTEM_PROMPT`: inline overlay prompt text.
-- `--append-system-prompt-file` or `ADAPTER_APPEND_SYSTEM_PROMPT_FILE`: file-based overlay prompt text.
-- Default `runtime-cwd` is `$HOME/Zotero/agent-runtime` when `~/Zotero` exists.
-- Default additional readable directories are `$HOME/Zotero`, `$HOME/Downloads`, `$HOME/Documents`.
-- Runtime cwd is validated:
-  - runtime cwd must be inside `~/Zotero` when that directory exists
-- Default `state-dir` is `$HOME/Zotero/agent-state` when `~/Zotero` exists (otherwise `$HOME/agent-state`).
-- Default `settingSources` is `project,local` (does not load global `user` settings unless explicitly requested).
-
-Model/profile behavior:
-- By default, frontend `metadata.model` is ignored.
-- Runtime model selection follows your local Claude Code profile (for example `cc-switch` active profile).
-- If you explicitly want frontend model passthrough, start with:
-
-```bash
-ADAPTER_FORWARD_FRONTEND_MODEL=true npx tsx bin/start-bridge-server.ts --host 127.0.0.1 --port 19787
-```
+Default additional readable directories: `$HOME/Zotero`, `$HOME/Downloads`, `$HOME/Documents`.
 
 ## Adapter Contract
+
 ```ts
 runTurn(request, { onStart, onEvent, signal }) -> outcome
 ```
 
-`request` contains:
+`request` fields:
 - `conversationKey`
 - `userMessage`
 - optional `allowedTools`
@@ -102,115 +58,19 @@ runTurn(request, { onStart, onEvent, signal }) -> outcome
 
 Events emitted to `onEvent` are frontend-compatible `AgentEvent` values.
 
-## Next Step (Runtime Binding)
-The adapter runtime interface remains intentionally minimal:
-
-```ts
-interface ClaudeCodeRuntimeClient {
-  startTurn(request: RuntimeTurnRequest): Promise<RuntimeTurnStream>;
-}
-```
-
-`ClaudeAgentSdkRuntimeClient` already binds real `@anthropic-ai/claude-agent-sdk` streaming output into adapter events.
-
-Remaining integration focus is wiring this adapter into `llm-for-zotero` backend entrypoints.
-
-## Debugging: Code Changes & Bridge Restart
-
-The bridge runs as a **launchd daemon** (`com.toha.ccbridge`) via `tsx` (reads TypeScript source directly — no compilation needed). However, launchd auto-restarts it on crash with `KeepAlive: true`, so a plain `kill` won't stop it.
-
-### After changing source code
-
-```bash
-# Force restart to pick up changes
-launchctl unload ~/Library/LaunchAgents/com.toha.ccbridge.plist
-launchctl load ~/Library/LaunchAgents/com.toha.ccbridge.plist
-```
-
-### Verify the new code is running
-
-```bash
-# Check process start time — should be recent
-ps aux | grep tsx | grep -v grep
-
-# Tail live logs
-tail -f /tmp/cc-bridge-launchd.out
-```
-
-### Common trap: stale bridge
-
-If you edit source and test immediately **without restarting**, the bridge is still running the old code. Symptoms:
-- Your fix appears in the file but behavior is unchanged
-- Logs show old error patterns
-
-Always `unload` + `load` after any source edit.
-
-### Log locations
-
-| Log | Path |
-|-----|------|
-| stdout (bridge output) | `/tmp/cc-bridge-launchd.out` |
-| stderr (errors) | `/tmp/cc-bridge-launchd.err` |
-
-### Permission issues with MCP tools
-
-If MCP tools (Exa, Tavily, etc.) are denied with ZodError `updatedInput: undefined`:
-- The `canUseTool` callback must return `{ behavior: "allow", updatedInput: {} }` — `updatedInput` is **required** (not optional) in the SDK's Zod schema.
-- Confirm the bridge was restarted after any fix to `permission-store.ts`.
-
-### StopFailure sound fires after every message (or on abrupt disconnect)
-
-**Root cause**: The bridge spawns one `claude` CLI process per turn. That process inherits your user-level hooks from `~/.claude/settings.json`. Whenever the CLI exits non-zero — whether due to MCP init failures or an abrupt SSE disconnect from the frontend — the `StopFailure` hook fires and plays the error sound.
-
-**Why SDK-level suppression doesn't work**: The SDK accepts a `settings` flag at the highest priority layer, but user-registered hooks live in a separate registry (`ER()`) that the flag-settings layer cannot override. `disableAllHooks: true` only skips plugin-provided hooks (those with `pluginRoot`), not user shell-command hooks like `afplay`. There is no SDK API that can suppress user-level hooks from outside the process.
-
-**Fix**: Gate the StopFailure hook on a `BRIDGE_SESSION` environment variable. Bridge-spawned CLI subprocesses inherit the variable from the launchd daemon; interactive sessions never have it set.
-
-**Step 1** — Edit `~/.claude/settings.json`, change the StopFailure command to:
-
-```json
-"command": "[ -z \"$BRIDGE_SESSION\" ] && afplay ~/.claude/sounds/StopFailure/'555：Error.mp3' 2>/dev/null || true"
-```
-
-(Replace the sound path with whatever your hook uses.)
-
-**Step 2** — Add `BRIDGE_SESSION=1` to the launchd plist `EnvironmentVariables`:
-
-```xml
-<key>BRIDGE_SESSION</key>
-<string>1</string>
-```
-
-**Step 3** — Reload the plist:
-
-```bash
-launchctl unload ~/Library/LaunchAgents/com.toha.ccbridge.plist
-launchctl load ~/Library/LaunchAgents/com.toha.ccbridge.plist
-```
-
-Result: interactive Claude sessions play the sound normally; bridge-spawned subprocesses skip it entirely.
-
-### launchd plist PATH must include `~/.local/bin`
-
-The plist PATH must include `~/.local/bin` for `uvx` (used by grok-search MCP) to be found:
-
-```xml
-<key>PATH</key>
-<string>$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-```
-
-Without this, the grok-search MCP server fails to start (uvx is installed at `~/.local/bin/uvx`, not in system PATH).
-
-## Official References
-- Agent SDK TS reference: [TypeScript SDK](https://platform.claude.com/docs/en/agent-sdk/typescript)
-- Agent SDK overview: [Overview](https://platform.claude.com/docs/en/agent-sdk/overview)
-
 ## Repository Layout
-- `src/bridge`: runtime bridge entrypoints
-- `src/event-mapper`: event protocol translation
-- `src/session-link`: session linking and persistence
-- `docs`: integration notes and migration checklist
+
+- `src/bridge` — runtime bridge entrypoints
+- `src/event-mapper` — event protocol translation
+- `src/session-link` — session linking and persistence
+- `src/providers` — Claude Agent SDK runtime client
+- `src/server` — HTTP bridge server
+- `bin/start-bridge-server.ts` — bridge entrypoint
 
 ## Non-Goals (v0)
 - Rebuilding llm-for-zotero UI
 - Hardcoding domain skills in adapter core
+
+## References
+- [Claude Agent SDK TypeScript](https://platform.claude.com/docs/en/agent-sdk/typescript)
+- [Claude Agent SDK Overview](https://platform.claude.com/docs/en/agent-sdk/overview)

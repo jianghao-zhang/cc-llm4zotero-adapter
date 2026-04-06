@@ -1,33 +1,104 @@
 # cc-llm4zotero-adapter
 
-Adapter that connects `llm-for-zotero` frontend-compatible agent flow to Claude Code runtime via literature-agent-harness contracts.
+HTTP bridge adapter between `llm-for-zotero` (Claude Code Bridge backend mode) and Claude Agent SDK runtime.
 
-## Goal
-- Keep existing `llm-for-zotero` frontend interaction model.
-- Replace agent backend runtime path with Claude Code-backed adapter.
-- Maintain event compatibility for trace/confirmation UX.
+## Overview
 
-## Scope (v0)
-- runTurn bridge wiring
-- event mapping compatibility layer
-- conversationKey <-> provider session id linking
-- trace loading/replay compatibility hooks
+### What this repo does
 
-## Quick Start
+- Streams `/run-turn` events from Claude runtime into llm-for-zotero compatible agent events.
+- Exposes `/commands` for slash command discovery.
+- Exposes `/session-info` for conversation/session recovery.
+- Persists session links and run traces in adapter state storage.
+
+## Quick Start (Foreground)
 
 ```bash
 npm install
 npm run build
 npm test
+npm run serve:bridge
 ```
 
-Local dev (no daemon):
+Default bind:
+
+- Host: `127.0.0.1`
+- Port: `19787`
+- Health: `http://127.0.0.1:19787/healthz`
+
+## Quick Install (macOS Daemon)
+
+For non-technical users, run:
 
 ```bash
-npm run serve:bridge  # port 19787
+./scripts/install-macos-daemon.sh
 ```
 
-## CLI / Environment Options
+This installs a LaunchAgent service: `com.toha.ccbridge`.
+
+Useful daemon commands:
+
+```bash
+npm run daemon:status
+npm run daemon:start
+npm run daemon:stop
+npm run daemon:restart
+npm run daemon:uninstall
+```
+
+## HTTP Endpoints
+
+### GET `/healthz`
+
+Health check endpoint.
+
+### GET `/commands`
+
+Returns Claude slash commands.
+
+- Query: `settingSources=user,project,local` (optional)
+
+### GET `/session-info`
+
+Returns session mapping information for a conversation.
+
+- Query: `conversationKey` (required)
+- Query: `scopeType`, `scopeId`, `scopeLabel` (optional)
+
+### POST `/run-turn`
+
+Runs one agent turn with streaming events.
+
+- Required body: `conversationKey`, `userText`
+- Optional body: `allowedTools`, `scopeType`, `scopeId`, `scopeLabel`, `runtimeRequest`, `metadata`
+
+### POST `/run-action`
+
+Runs a tool/action request.
+
+- Required body: `conversationKey`, `toolName`
+- Optional body: `args`, `approved`, scope fields, metadata/context fields
+
+### POST `/resolve-confirmation`
+
+Resolves pending confirmation requests.
+
+- Required body: `requestId`, `approved`
+- Optional body: `actionId`, `data`
+
+### Additional read endpoints
+
+- `GET /tools`
+- `GET /models`
+- `GET /efforts`
+
+## Runtime / Environment Options
+
+Server start command:
+
+```bash
+npm run serve:bridge
+```
 
 | Flag | Env | Description |
 |------|-----|-------------|
@@ -42,35 +113,49 @@ npm run serve:bridge  # port 19787
 | `--append-system-prompt-file` | `ADAPTER_APPEND_SYSTEM_PROMPT_FILE` | File-based overlay prompt. |
 | `--forward-frontend-model` | `ADAPTER_FORWARD_FRONTEND_MODEL` | Pass frontend `metadata.model` to runtime (default `true`). |
 
-Default additional readable directories: `$HOME/Zotero`, `$HOME/Downloads`, `$HOME/Documents`.
+Default additional readable directories:
 
-## Adapter Contract
+- `$HOME/Zotero`
+- `$HOME/Downloads`
+- `$HOME/Documents`
 
-```ts
-runTurn(request, { onStart, onEvent, signal }) -> outcome
+## Troubleshooting
+
+### 1) Daemon is not running
+
+```bash
+launchctl stop com.toha.ccbridge
+launchctl start com.toha.ccbridge
+curl -fsS http://127.0.0.1:19787/healthz
 ```
 
-`request` fields:
-- `conversationKey`
-- `userMessage`
-- optional `allowedTools`
-- optional `metadata`
+### 2) Bridge URL or port mismatch
 
-Events emitted to `onEvent` are frontend-compatible `AgentEvent` values.
+- Make sure llm-for-zotero Bridge URL matches adapter bind address.
+- Default is `http://127.0.0.1:19787`.
+
+### 3) Claude CLI not ready
+
+If you see `claude: command not found`, install and configure Claude Code CLI first.
+
+### Logs
+
+```bash
+~/Library/Logs/cc-llm4zotero-adapter/
+```
 
 ## Repository Layout
 
-- `src/bridge` — runtime bridge entrypoints
-- `src/event-mapper` — event protocol translation
-- `src/session-link` — session linking and persistence
+- `src/bridge` — bridge/runtime adapter contracts and wrappers
+- `src/event-mapper` — Claude SDK events to llm-for-zotero event mapping
+- `src/session-link` — conversationKey ↔ provider session mapping
+- `src/trace-store` — run trace persistence
 - `src/providers` — Claude Agent SDK runtime client
 - `src/server` — HTTP bridge server
-- `bin/start-bridge-server.ts` — bridge entrypoint
-
-## Non-Goals (v0)
-- Rebuilding llm-for-zotero UI
-- Hardcoding domain skills in adapter core
+- `bin/start-bridge-server.ts` — foreground server entrypoint
+- `bin/manage-daemon.ts` — macOS daemon manager
 
 ## References
+
 - [Claude Agent SDK TypeScript](https://platform.claude.com/docs/en/agent-sdk/typescript)
 - [Claude Agent SDK Overview](https://platform.claude.com/docs/en/agent-sdk/overview)

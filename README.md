@@ -178,27 +178,36 @@ If MCP tools (Exa, Tavily, etc.) are denied with ZodError `updatedInput: undefin
 - The `canUseTool` callback must return `{ behavior: "allow", updatedInput: {} }` — `updatedInput` is **required** (not optional) in the SDK's Zod schema.
 - Confirm the bridge was restarted after any fix to `permission-store.ts`.
 
-### StopFailure sound fires after every message
+### StopFailure sound fires after every message (or on abrupt disconnect)
 
-**Root cause**: The bridge spawns one `claude` CLI process per turn. That process loads user-level plugins (discord, fakechat, imessage, telegram) which fail to connect in the launchd daemon context (no companion daemons running). When these plugins fail at MCP init, the CLI fires `StopFailure` before exiting.
+**Root cause**: The bridge spawns one `claude` CLI process per turn. That process inherits your user-level hooks from `~/.claude/settings.json`. Whenever the CLI exits non-zero — whether due to MCP init failures or an abrupt SSE disconnect from the frontend — the `StopFailure` hook fires and plays the error sound.
 
-**Fix**: Disable the failing plugins in the agent-runtime project settings:
+**Why SDK-level suppression doesn't work**: The SDK accepts a `settings` flag at the highest priority layer, but user-registered hooks live in a separate registry (`ER()`) that the flag-settings layer cannot override. `disableAllHooks: true` only skips plugin-provided hooks (those with `pluginRoot`), not user shell-command hooks like `afplay`. There is no SDK API that can suppress user-level hooks from outside the process.
 
-```bash
-mkdir -p ~/Zotero/agent-runtime/.claude
-cat > ~/Zotero/agent-runtime/.claude/settings.json << 'EOF'
-{
-  "enabledPlugins": {
-    "discord@claude-plugins-official": false,
-    "fakechat@claude-plugins-official": false,
-    "imessage@claude-plugins-official": false,
-    "telegram@claude-plugins-official": false
-  }
-}
-EOF
+**Fix**: Gate the StopFailure hook on a `BRIDGE_SESSION` environment variable. Bridge-spawned CLI subprocesses inherit the variable from the launchd daemon; interactive sessions never have it set.
+
+**Step 1** — Edit `~/.claude/settings.json`, change the StopFailure command to:
+
+```json
+"command": "[ -z \"$BRIDGE_SESSION\" ] && afplay ~/.claude/sounds/StopFailure/'555：Error.mp3' 2>/dev/null || true"
 ```
 
-Claude's plugin loader reads `enabledPlugins` from the cwd's `.claude/settings.json` and merges them (project overrides user-level), regardless of `settingSources`. This disables only the failing plugins in the bridge context, while keeping all other user plugins (github, playwright, context7, etc.) working.
+(Replace the sound path with whatever your hook uses.)
+
+**Step 2** — Add `BRIDGE_SESSION=1` to the launchd plist `EnvironmentVariables`:
+
+```xml
+<key>BRIDGE_SESSION</key>
+<string>1</string>
+```
+
+**Step 3** — Reload the plist:
+
+```bash
+npm run bridge:restart
+```
+
+Result: interactive Claude sessions play the sound normally; bridge-spawned subprocesses skip it entirely.
 
 ### launchd plist PATH must include `~/.local/bin`
 

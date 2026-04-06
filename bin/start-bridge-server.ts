@@ -88,7 +88,7 @@ function readTextFile(path: string | undefined): string {
 
 async function main() {
   const host = getArg("host") || process.env.ADAPTER_HOST || "127.0.0.1";
-  const portRaw = getArg("port") || process.env.ADAPTER_PORT || "8787";
+  const portRaw = getArg("port") || process.env.ADAPTER_PORT || "19787";
   const port = Number(portRaw);
   if (!Number.isFinite(port) || port <= 0) {
     throw new Error(`Invalid port: ${portRaw}`);

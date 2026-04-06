@@ -24,7 +24,7 @@ npm test
 Local dev (no daemon):
 
 ```bash
-npm run serve:bridge  # port 8787
+npm run serve:bridge  # port 19787
 ```
 
 ## CLI / Environment Options
@@ -32,7 +32,7 @@ npm run serve:bridge  # port 8787
 | Flag | Env | Description |
 |------|-----|-------------|
 | `--host` | `ADAPTER_HOST` | Bind host (default `127.0.0.1`) |
-| `--port` | `ADAPTER_PORT` | Bind port (default `8787`) |
+| `--port` | `ADAPTER_PORT` | Bind port (default `19787`) |
 | `--runtime-cwd` | `ADAPTER_RUNTIME_CWD` | Workspace root for Claude Agent SDK. Defaults to `$HOME/Zotero/agent-runtime` when `~/Zotero` exists. |
 | `--state-dir` | `ADAPTER_STATE_DIR` | Session/trace persistence directory. Defaults to `$HOME/Zotero/agent-state`. |
 | `--additional-directories` | `ADAPTER_ADDITIONAL_DIRECTORIES` | Extra readable directories (comma-separated, `~` supported). |

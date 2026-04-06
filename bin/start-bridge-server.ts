@@ -7,7 +7,7 @@ import {
   startHttpBridgeServer,
 } from "../src/index.js";
 import type { SettingSource } from "@anthropic-ai/claude-agent-sdk";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 function getArg(name: string): string | undefined {
@@ -128,6 +128,12 @@ async function main() {
 
   mkdirSync(runtimeCwd, { recursive: true });
   mkdirSync(stateDirResolved, { recursive: true });
+  const projectClaudeDir = resolve(runtimeCwd, ".claude");
+  const projectSettingsFile = resolve(projectClaudeDir, "settings.json");
+  mkdirSync(projectClaudeDir, { recursive: true });
+  if (!existsSync(projectSettingsFile)) {
+    writeFileSync(projectSettingsFile, "{}\n", "utf8");
+  }
   const settingSources = parseSettingSources(
     getArg("setting-sources") || process.env.ADAPTER_SETTING_SOURCES,
   );

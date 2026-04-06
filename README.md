@@ -38,44 +38,29 @@ npm run build
 npm test
 ```
 
-Start bridge server:
+The bridge runs as a launchd daemon on port **19787**. Manage it with:
 
 ```bash
-npx tsx bin/start-bridge-server.ts --host 127.0.0.1 --port 18787
-```
-
-Recommended fixed workflow (process management):
-
-```bash
-npm run bridge:start
-npm run bridge:status
-npm run bridge:logs
-npm run bridge:restart
-npm run bridge:stop
+launchctl unload ~/Library/LaunchAgents/com.toha.ccbridge.plist
+launchctl load ~/Library/LaunchAgents/com.toha.ccbridge.plist
 ```
 
 Operational hard rule:
 - Do not ask the user to manually switch bridge settings in Zotero Run JavaScript during normal troubleshooting.
 - Treat bridge routing as a backend service responsibility (daemon health + config), not a user manual pref task.
 
-Zotero-focused default startup (recommended):
+For local dev (no launchd):
 
 ```bash
-npm run serve:bridge:zotero
+npm run serve:bridge  # port 8787
 ```
 
-This uses:
-- `runtime-cwd = $HOME/Zotero/agent-runtime` (forced into Zotero workspace)
-- `state-dir = $HOME/Zotero/agent-state`
-  - session links: `session-links/sessions.json`
-  - traces: `turn-traces/trace.json`
-
-Isolation-first recommendation (keep Zotero runs separate from your daily Claude Code usage):
+Isolation-first (custom workspace):
 
 ```bash
 npx tsx bin/start-bridge-server.ts \
   --host 127.0.0.1 \
-  --port 18787 \
+  --port 19787 \
   --runtime-cwd "$HOME/claude-profiles/zotero-harness" \
   --setting-sources project,local \
   --append-system-prompt-file "$HOME/claude-profiles/zotero-harness/prompts/literature-overlay.md"
@@ -101,7 +86,7 @@ Model/profile behavior:
 - If you explicitly want frontend model passthrough, start with:
 
 ```bash
-ADAPTER_FORWARD_FRONTEND_MODEL=true npx tsx bin/start-bridge-server.ts --host 127.0.0.1 --port 18787
+ADAPTER_FORWARD_FRONTEND_MODEL=true npx tsx bin/start-bridge-server.ts --host 127.0.0.1 --port 19787
 ```
 
 ## Adapter Contract
@@ -142,11 +127,6 @@ launchctl unload ~/Library/LaunchAgents/com.toha.ccbridge.plist
 launchctl load ~/Library/LaunchAgents/com.toha.ccbridge.plist
 ```
 
-Or use the npm script:
-```bash
-npm run bridge:restart
-```
-
 ### Verify the new code is running
 
 ```bash
@@ -163,7 +143,7 @@ If you edit source and test immediately **without restarting**, the bridge is st
 - Your fix appears in the file but behavior is unchanged
 - Logs show old error patterns
 
-Always `unload` + `load` after any source edit. `npm run bridge:restart` is the safe shortcut.
+Always `unload` + `load` after any source edit.
 
 ### Log locations
 
@@ -204,7 +184,8 @@ If MCP tools (Exa, Tavily, etc.) are denied with ZodError `updatedInput: undefin
 **Step 3** — Reload the plist:
 
 ```bash
-npm run bridge:restart
+launchctl unload ~/Library/LaunchAgents/com.toha.ccbridge.plist
+launchctl load ~/Library/LaunchAgents/com.toha.ccbridge.plist
 ```
 
 Result: interactive Claude sessions play the sound normally; bridge-spawned subprocesses skip it entirely.

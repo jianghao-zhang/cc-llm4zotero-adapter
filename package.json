@@ -14,13 +14,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "demo:llm4zotero": "tsx examples/llm4zotero-runturn-demo.ts",
-    "serve:bridge": "tsx bin/start-bridge-server.ts --host 127.0.0.1 --port 8787",
-    "serve:bridge:zotero": "ADAPTER_RUNTIME_CWD=\"$HOME/Zotero/agent-runtime\" ADAPTER_STATE_DIR=\"$HOME/Zotero/agent-state\" tsx bin/start-bridge-server.ts --host 127.0.0.1 --port 18787",
-    "bridge:start": "bash bin/bridgectl.sh start",
-    "bridge:stop": "bash bin/bridgectl.sh stop",
-    "bridge:restart": "bash bin/bridgectl.sh restart",
-    "bridge:status": "bash bin/bridgectl.sh status",
-    "bridge:logs": "bash bin/bridgectl.sh logs"
+    "serve:bridge": "tsx bin/start-bridge-server.ts --host 127.0.0.1 --port 8787"
   },
   "keywords": [
     "zotero",

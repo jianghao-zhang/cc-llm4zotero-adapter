@@ -304,10 +304,7 @@ function buildPromptText(
     );
   }
 
-  const screenshotCount = Array.isArray(runtimeRequest.screenshots)
-    ? runtimeRequest.screenshots.length
-    : 0;
-  const attachmentPathCount = collectAttachmentPaths(runtimeRequest).length;
+  const attachmentPaths = collectAttachmentPaths(runtimeRequest);
   const selectedPaperPathEntries = collectPaperPathEntries(
     runtimeRequest.selectedPaperContexts ?? runtimeRequest.paperContexts,
     8,
@@ -316,12 +313,9 @@ function buildPromptText(
     runtimeRequest.fullTextPaperContexts,
     6,
   );
-
-  lines.push(
-    "Response protocol for this turn:",
-    `- Start with one short receipt line: RECEIVED papers=${selectedPaperPathEntries.length + fullTextPaperPathEntries.length}, attachments=${attachmentPathCount}, screenshots=${screenshotCount}.`,
-    "- If any referenced file path cannot be read, explicitly report: READ_FAIL <absolute_path> (<reason>).",
-    "- Prefer reading MinerU markdown path before PDF path when both are available.",
+  const pinnedPaperPathEntries = collectPaperPathEntries(
+    runtimeRequest.pinnedPaperContexts,
+    4,
   );
 
   const selectedPapers = collectPaperTitles(
@@ -365,7 +359,13 @@ function buildPromptText(
     );
   }
 
-  const attachmentPaths = collectAttachmentPaths(runtimeRequest);
+  if (pinnedPaperPathEntries.length) {
+    lines.push(
+      "Pinned paper contexts with local readable paths (prefer MinerU md, then attachment path):",
+      ...formatPaperPathLines(pinnedPaperPathEntries),
+    );
+  }
+
   if (attachmentPaths.length) {
     lines.push(
       "Local attachment files (absolute paths). Read these files directly when needed:",

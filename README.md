@@ -178,6 +178,39 @@ If MCP tools (Exa, Tavily, etc.) are denied with ZodError `updatedInput: undefin
 - The `canUseTool` callback must return `{ behavior: "allow", updatedInput: {} }` — `updatedInput` is **required** (not optional) in the SDK's Zod schema.
 - Confirm the bridge was restarted after any fix to `permission-store.ts`.
 
+### StopFailure sound fires after every message
+
+**Root cause**: The bridge spawns one `claude` CLI process per turn. That process loads user-level plugins (discord, fakechat, imessage, telegram) which fail to connect in the launchd daemon context (no companion daemons running). When these plugins fail at MCP init, the CLI fires `StopFailure` before exiting.
+
+**Fix**: Disable the failing plugins in the agent-runtime project settings:
+
+```bash
+mkdir -p ~/Zotero/agent-runtime/.claude
+cat > ~/Zotero/agent-runtime/.claude/settings.json << 'EOF'
+{
+  "enabledPlugins": {
+    "discord@claude-plugins-official": false,
+    "fakechat@claude-plugins-official": false,
+    "imessage@claude-plugins-official": false,
+    "telegram@claude-plugins-official": false
+  }
+}
+EOF
+```
+
+Claude's plugin loader reads `enabledPlugins` from the cwd's `.claude/settings.json` and merges them (project overrides user-level), regardless of `settingSources`. This disables only the failing plugins in the bridge context, while keeping all other user plugins (github, playwright, context7, etc.) working.
+
+### launchd plist PATH must include `~/.local/bin`
+
+The plist PATH must include `~/.local/bin` for `uvx` (used by grok-search MCP) to be found:
+
+```xml
+<key>PATH</key>
+<string>$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+```
+
+Without this, the grok-search MCP server fails to start (uvx is installed at `~/.local/bin/uvx`, not in system PATH).
+
 ## Official References
 - Agent SDK TS reference: [TypeScript SDK](https://platform.claude.com/docs/en/agent-sdk/typescript)
 - Agent SDK overview: [Overview](https://platform.claude.com/docs/en/agent-sdk/overview)

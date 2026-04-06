@@ -293,8 +293,7 @@ function buildPromptText(
 
   const selectedTexts = Array.isArray(runtimeRequest.selectedTexts)
     ? runtimeRequest.selectedTexts
-        .slice(0, 3)
-        .map((entry) => trimInline(entry, 320))
+        .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
         .filter(Boolean)
     : [];
   if (selectedTexts.length) {
@@ -375,13 +374,13 @@ function buildPromptText(
 
   const activeNote = asRecord(runtimeRequest.activeNoteContext);
   if (activeNote) {
-    const noteTitle = trimInline(activeNote.title, 140);
-    const preview = trimInline(activeNote.noteText, 420);
-    if (noteTitle || preview) {
+    const noteTitle = typeof activeNote.title === "string" ? activeNote.title.trim() : "";
+    const noteText = typeof activeNote.noteText === "string" ? activeNote.noteText.trim() : "";
+    if (noteTitle || noteText) {
       lines.push(
         "Active note context:",
         noteTitle ? `- Title: ${noteTitle}` : "- Title: (untitled)",
-        preview ? `- Preview: ${preview}` : "",
+        noteText ? `- Content:\n${noteText}` : "",
       );
     }
   }

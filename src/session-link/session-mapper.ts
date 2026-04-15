@@ -26,23 +26,38 @@ export class InMemorySessionMapper implements SessionMapper {
 }
 
 export class JsonFileSessionMapper implements SessionMapper {
+  private writeChain: Promise<void> = Promise.resolve();
+
   constructor(private readonly filePath: string) {}
 
   async get(conversationKey: string): Promise<string | undefined> {
+    await this.writeChain;
     const state = await this.readState();
     return state[conversationKey];
   }
 
   async set(conversationKey: string, providerSessionId: string): Promise<void> {
-    const state = await this.readState();
-    state[conversationKey] = providerSessionId;
-    await this.writeState(state);
+    await this.enqueueWrite((state) => {
+      state[conversationKey] = providerSessionId;
+    });
   }
 
   async delete(conversationKey: string): Promise<void> {
-    const state = await this.readState();
-    delete state[conversationKey];
-    await this.writeState(state);
+    await this.enqueueWrite((state) => {
+      delete state[conversationKey];
+    });
+  }
+
+  private async enqueueWrite(
+    mutate: (state: SessionMapState) => void,
+  ): Promise<void> {
+    const nextWrite = this.writeChain.then(async () => {
+      const state = await this.readState();
+      mutate(state);
+      await this.writeState(state);
+    });
+    this.writeChain = nextWrite.catch(() => {});
+    await nextWrite;
   }
 
   private async readState(): Promise<SessionMapState> {

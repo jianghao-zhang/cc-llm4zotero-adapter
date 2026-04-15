@@ -1,5 +1,4 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { randomUUID } from "node:crypto";
 import type {
   Llm4ZoteroAgentBackendAdapter
 } from "../bridge/llm4zotero-agent-backend-adapter.js";
@@ -57,12 +56,7 @@ function parseConversationKey(
     return Math.floor(value);
   }
   if (typeof value === "string" && value.trim().length > 0) {
-    const trimmed = value.trim();
-    if (/^-?\d+$/.test(trimmed)) {
-      const parsed = Number.parseInt(trimmed, 10);
-      if (Number.isFinite(parsed)) return parsed;
-    }
-    return trimmed;
+    return value.trim();
   }
   return undefined;
 }
@@ -305,9 +299,6 @@ export async function startHttpBridgeServer(
         res.setHeader("Cache-Control", "no-cache, no-transform");
         res.setHeader("Connection", "keep-alive");
 
-        const startRunId = randomUUID();
-        writeLine(res, { type: "start", runId: startRunId });
-
         const outcome = await options.adapter.runTurn({
           request: payload,
           onStart: (runId) => {
@@ -337,9 +328,6 @@ export async function startHttpBridgeServer(
         res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
         res.setHeader("Cache-Control", "no-cache, no-transform");
         res.setHeader("Connection", "keep-alive");
-
-        const startRunId = randomUUID();
-        writeLine(res, { type: "start", runId: startRunId });
 
         const outcome = await options.adapter.runAction({
           request: payload,

@@ -290,6 +290,23 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
 
   if (type === "stream_event") {
     const event = asRecord(msg.event);
+    if (event.type === "content_block_start") {
+      const contentBlock = asRecord(event.content_block);
+      if (contentBlock.type === "tool_use") {
+        return [
+          providerEvent,
+          {
+            type: "tool_call",
+            payload: {
+              id: typeof contentBlock.id === "string" ? contentBlock.id : undefined,
+              name: typeof contentBlock.name === "string" ? contentBlock.name : undefined,
+              input: contentBlock.input,
+              sessionId,
+            },
+          },
+        ];
+      }
+    }
     if (event.type === "content_block_delta") {
       const delta = asRecord(event.delta);
       if (delta.type === "text_delta" && typeof delta.text === "string") {

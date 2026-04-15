@@ -21,6 +21,36 @@ export class ClaudeCodeRuntimeAdapter {
     this.traceStore = options.traceStore;
   }
 
+  private isStreamingDebugEnabled(): boolean {
+    return process.env.LLM4ZOTERO_BRIDGE_DEBUG_STREAMING === "1";
+  }
+
+  private logStreamingTiming(
+    stage: string,
+    details: {
+      conversationKey: string;
+      runId: string;
+      textLength?: number;
+      eventTs?: number;
+    },
+  ): void {
+    if (!this.isStreamingDebugEnabled()) return;
+    const now = Date.now();
+    console.log(
+      "[STREAMING]",
+      JSON.stringify({
+        stage,
+        conversationKey: details.conversationKey,
+        runId: details.runId,
+        textLength: details.textLength,
+        eventTs: details.eventTs,
+        localTs: now,
+        lagMs:
+          typeof details.eventTs === "number" ? Math.max(0, now - details.eventTs) : undefined,
+      }),
+    );
+  }
+
   async listRuntimeModels(
     options?: {
       settingSources?: Array<"user" | "project" | "local">;
@@ -135,6 +165,28 @@ export class ClaudeCodeRuntimeAdapter {
     });
 
     let finalText = "";
+    let pendingTextDelta = "";
+    let lastTextDeltaTs: number | undefined;
+
+    const flushPendingTextDelta = async (): Promise<void> => {
+      if (!pendingTextDelta) return;
+      const mergedEvent: AgentEvent = {
+        type: "message_delta",
+        ts: Date.now(),
+        payload: {
+          delta: pendingTextDelta,
+        },
+      };
+      this.logStreamingTiming("emit_merged_message_delta", {
+        conversationKey: request.conversationKey,
+        runId: stream.runId,
+        textLength: pendingTextDelta.length,
+        eventTs: lastTextDeltaTs,
+      });
+      pendingTextDelta = "";
+      lastTextDeltaTs = undefined;
+      await this.emitEvent(stream.runId, request.conversationKey, mergedEvent, hooks);
+    };
 
     try {
       for await (const providerEvent of stream.events) {
@@ -144,14 +196,27 @@ export class ClaudeCodeRuntimeAdapter {
           resolvedSessionId = eventSessionId;
           await this.sessionMapper.set(request.conversationKey, eventSessionId);
         }
-        await this.emitEvent(stream.runId, request.conversationKey, event, hooks);
-
         if (event.type === "message_delta") {
           const delta = event.payload.delta;
           if (typeof delta === "string") {
+            pendingTextDelta += delta;
             finalText += delta;
+            lastTextDeltaTs = event.ts;
+            continue;
           }
         }
+
+        await flushPendingTextDelta();
+        if (event.type === "final") {
+          const output = event.payload.output;
+          this.logStreamingTiming("emit_final", {
+            conversationKey: request.conversationKey,
+            runId: stream.runId,
+            textLength: typeof output === "string" ? output.length : finalText.length,
+            eventTs: event.ts,
+          });
+        }
+        await this.emitEvent(stream.runId, request.conversationKey, event, hooks);
 
         if (event.type === "final") {
           const output = event.payload.output;
@@ -160,6 +225,13 @@ export class ClaudeCodeRuntimeAdapter {
           }
         }
       }
+
+      await flushPendingTextDelta();
+      this.logStreamingTiming("return_outcome", {
+        conversationKey: request.conversationKey,
+        runId: stream.runId,
+        textLength: finalText.length,
+      });
 
       return {
         runId: stream.runId,

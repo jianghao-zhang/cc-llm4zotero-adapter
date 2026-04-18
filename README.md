@@ -1,6 +1,6 @@
 # cc-llm4zotero-adapter
 
-HTTP bridge adapter between `llm-for-zotero` (Claude Code Bridge backend mode) and Claude Agent SDK runtime.
+HTTP bridge adapter between [llm-for-zotero](https://github.com/yilewang/llm-for-zotero) (Claude Code Bridge backend mode) and Claude Agent SDK runtime.
 
 ## Overview
 

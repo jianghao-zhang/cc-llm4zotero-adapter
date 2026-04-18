@@ -34,6 +34,15 @@ If Claude Code is not installed, not on `PATH`, or not logged in yet, the bridge
 
 ## Quick Start (Foreground)
 
+If you do not already have this repo locally:
+
+```bash
+git clone https://github.com/jianghao-zhang/cc-llm4zotero-adapter.git
+cd cc-llm4zotero-adapter
+```
+
+Then start the bridge:
+
 ```bash
 npm install
 npm run build
@@ -56,6 +65,13 @@ curl -fsS http://127.0.0.1:19787/healthz
 A healthy bridge only means the adapter server is up. It does **not** guarantee that Claude Code CLI is installed, authenticated, or usable yet.
 
 ## Quick Install (macOS Daemon)
+
+If you do not already have this repo locally:
+
+```bash
+git clone https://github.com/jianghao-zhang/cc-llm4zotero-adapter.git
+cd cc-llm4zotero-adapter
+```
 
 For non-technical users, run:
 

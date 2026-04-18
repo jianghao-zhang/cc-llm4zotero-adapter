@@ -88,6 +88,22 @@ function readTextFile(path: string | undefined): string {
   }
 }
 
+function readProjectSettingsEnv(path: string): Record<string, string> {
+  try {
+    const raw = readFileSync(path, "utf8");
+    const parsed = JSON.parse(raw) as { env?: Record<string, unknown> };
+    const env = parsed?.env;
+    if (!env || typeof env !== "object" || Array.isArray(env)) return {};
+    return Object.fromEntries(
+      Object.entries(env)
+        .filter(([, value]) => typeof value === "string" && value.trim())
+        .map(([key, value]) => [key, String(value).trim()]),
+    );
+  } catch {
+    return {};
+  }
+}
+
 async function main() {
   const host = getArg("host") || process.env.ADAPTER_HOST || "127.0.0.1";
   const portRaw = getArg("port") || process.env.ADAPTER_PORT || "19787";
@@ -124,6 +140,12 @@ async function main() {
   mkdirSync(projectClaudeDir, { recursive: true });
   if (!existsSync(projectSettingsFile)) {
     writeFileSync(projectSettingsFile, "{}\n", "utf8");
+  }
+  const projectSettingsEnv = readProjectSettingsEnv(projectSettingsFile);
+  for (const [key, value] of Object.entries(projectSettingsEnv)) {
+    if (!process.env[key]) {
+      process.env[key] = value;
+    }
   }
   const settingSources = parseSettingSources(
     getArg("setting-sources") || process.env.ADAPTER_SETTING_SOURCES,

@@ -6,6 +6,7 @@ import {
   Llm4ZoteroAgentBackendAdapter,
   startHttpBridgeServer,
 } from "../src/index.js";
+import { resolveLegacyAdapterPaths } from "../src/zotero-profile-paths.js";
 import type { SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -98,21 +99,10 @@ async function main() {
   const homeDir = process.env.HOME && process.env.HOME.trim()
     ? process.env.HOME.trim()
     : undefined;
-  const zoteroRoot = homeDir ? resolve(homeDir, "Zotero") : undefined;
-  const defaultRuntimeCwd =
-    zoteroRoot && existsSync(zoteroRoot)
-      ? resolve(zoteroRoot, "agent-runtime")
-      : process.cwd();
-  const defaultStateDir = (() => {
-    if (zoteroRoot && existsSync(zoteroRoot)) {
-      return resolve(zoteroRoot, "agent-state");
-    }
-    if (homeDir) {
-      return resolve(homeDir, "agent-state");
-    }
-    return resolve(process.cwd(), ".adapter-state");
-  })();
-  const stateDir =
+  const legacyPaths = resolveLegacyAdapterPaths(homeDir, process.cwd());
+  const defaultRuntimeCwd = legacyPaths.runtimeCwd;
+  const defaultStateDir = legacyPaths.stateDir;
+  const stateDirCandidate =
     getArg("state-dir") ||
     process.env.ADAPTER_STATE_DIR ||
     defaultStateDir;
@@ -120,12 +110,12 @@ async function main() {
     getArg("forward-frontend-model") ?? process.env.ADAPTER_FORWARD_FRONTEND_MODEL,
     true,
   );
-  const runtimeCwdRaw =
+  const runtimeCwdCandidate =
     getArg("runtime-cwd") ||
     process.env.ADAPTER_RUNTIME_CWD ||
     defaultRuntimeCwd;
-  const runtimeCwd = resolve(runtimeCwdRaw);
-  const stateDirResolved = resolve(stateDir);
+  const runtimeCwd = resolve(runtimeCwdCandidate);
+  const stateDirResolved = resolve(stateDirCandidate);
 
   mkdirSync(runtimeCwd, { recursive: true });
   mkdirSync(stateDirResolved, { recursive: true });

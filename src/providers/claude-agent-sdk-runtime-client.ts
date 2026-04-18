@@ -766,10 +766,12 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     // If alias resolution fails (e.g., frontend "sonnet" with non-Anthropic provider),
     // do NOT forward raw alias to SDK. Omit `model` and let runtime defaults decide.
     const modelForSdk = resolvedModel;
-    const supportedEfforts = await this.listEfforts({
-      model: modelForSdk || requestedModel,
-      settingSources: effectiveSettingSources,
-    });
+    const supportedEfforts = requestedEffort
+      ? await this.listEfforts({
+          model: modelForSdk || requestedModel,
+          settingSources: effectiveSettingSources,
+        })
+      : ["default", "low", "medium", "high", "xhigh"];
     const supportedEffortSet = new Set(
       supportedEfforts
         .map((entry) => entry.trim().toLowerCase())
@@ -849,6 +851,12 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
             loadedConfigPaths,
             cwd: effectiveCwd,
           },
+        },
+      };
+      yield {
+        type: "status",
+        payload: {
+          text: "Starting Claude runtime",
         },
       };
 

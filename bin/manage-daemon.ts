@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { resolveLegacyAdapterPaths } from "../src/zotero-profile-paths.js";
 
 const SERVICE_LABEL = "com.toha.ccbridge";
 const DEFAULT_PORT = "19787";
@@ -21,8 +22,9 @@ const plistPath = resolve(launchAgentsDir, `${SERVICE_LABEL}.plist`);
 const logsDir = resolve(homeDir, "Library", "Logs", "cc-llm4zotero-adapter");
 const stdoutPath = resolve(logsDir, "bridge.stdout.log");
 const stderrPath = resolve(logsDir, "bridge.stderr.log");
-const defaultRuntimeCwd = resolve(homeDir, "Zotero", "agent-runtime");
-const defaultStateDir = resolve(homeDir, "Zotero", "agent-state");
+const legacyPaths = resolveLegacyAdapterPaths(homeDir, repoRoot);
+const defaultRuntimeCwd = legacyPaths.runtimeCwd;
+const defaultStateDir = legacyPaths.stateDir;
 const runtimeCwd = process.env.ADAPTER_RUNTIME_CWD || defaultRuntimeCwd;
 const stateDir = process.env.ADAPTER_STATE_DIR || defaultStateDir;
 const port = process.env.ADAPTER_PORT || DEFAULT_PORT;
@@ -49,11 +51,11 @@ function ensureDirectories(): void {
 
 function escapeXml(value: string): string {
   return value
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&apos;");
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
 }
 
 function buildPlistXml(): string {

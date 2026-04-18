@@ -322,6 +322,22 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
           }
         ];
       }
+      if (
+        (delta.type === "thinking_delta" || delta.type === "signature_delta") &&
+        typeof delta.text === "string"
+      ) {
+        return [
+          providerEvent,
+          {
+            type: "reasoning",
+            payload: {
+              round: 1,
+              details: delta.text,
+              sessionId,
+            },
+          },
+        ];
+      }
     }
   }
 

@@ -23,6 +23,16 @@ type ClaudeModelInfo = {
   supportsEffort?: boolean;
 };
 
+type RuntimeEffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
+
+const RUNTIME_EFFORT_DESCENDING: RuntimeEffortLevel[] = [
+  "max",
+  "xhigh",
+  "high",
+  "medium",
+  "low",
+];
+
 type ClaudeSlashCommandInfo = {
   name?: string;
   description?: string;
@@ -57,6 +67,8 @@ type ClaudeSettingsShape = {
   availableModels?: unknown;
   modelOverrides?: unknown;
 };
+
+type ConfigSourceMode = "default" | "user-only" | "zotero-only";
 
 const DEFAULT_BLOCKED_METADATA_KEYS = new Set<string>([
   "allowedTools",
@@ -497,6 +509,15 @@ function parsePermissionModeOverride(
   return undefined;
 }
 
+function parseCustomInstruction(
+  metadata: Record<string, unknown>,
+): string {
+  const raw = typeof metadata.customInstruction === "string"
+    ? metadata.customInstruction.trim()
+    : "";
+  return raw;
+}
+
 function mergeAllowedTools(
   requestAllowedTools: string[] | undefined,
   defaultAllowedTools: string[] | undefined,
@@ -530,6 +551,55 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     this.options = options;
   }
 
+  private parseConfigSourceMode(
+    metadata: Record<string, unknown>,
+  ): ConfigSourceMode {
+    const raw = typeof metadata.claudeConfigSource === "string"
+      ? metadata.claudeConfigSource.trim().toLowerCase()
+      : "";
+    if (raw === "user-only") return "user-only";
+    if (raw === "zotero-only") return "zotero-only";
+    return "default";
+  }
+
+  private buildConfigPathMap(
+    effectiveCwd: string | undefined,
+  ): Record<SettingSource, string | undefined> {
+    return {
+      user: this.resolveSettingsPathBySource("user", effectiveCwd),
+      project: this.resolveSettingsPathBySource("project", effectiveCwd),
+      local: this.resolveSettingsPathBySource("local", effectiveCwd),
+    };
+  }
+
+  private buildConfigSourcePrompt(params: {
+    configSourceMode: ConfigSourceMode;
+    effectiveSettingSources: SettingSource[];
+    configPathMap: Record<SettingSource, string | undefined>;
+  }): string {
+    const pathLines = params.effectiveSettingSources
+      .map((source) => {
+        const path = params.configPathMap[source];
+        if (!path) return "";
+        if (source === "user") {
+          return `- user: ${path} (global defaults shared across Claude Code on this machine)`;
+        }
+        if (source === "project") {
+          return `- project: ${path} (shared across all Claude runtimes launched by Zotero)`;
+        }
+        return `- local: ${path} (current conversation window only)`;
+      })
+      .filter(Boolean);
+    if (!pathLines.length) return "";
+    return [
+      "Claude config source for this Zotero conversation:",
+      `- mode: ${params.configSourceMode}`,
+      `- active setting sources: ${params.effectiveSettingSources.join(", ")}`,
+      ...pathLines,
+      "Treat these paths as the active Claude Code config stack for this run.",
+    ].join("\n");
+  }
+
   async startTurn(request: RuntimeTurnRequest): Promise<RuntimeTurnStream> {
     const query = this.options.queryImpl ?? (await this.loadQuery());
     const metadata = parseMetadata(request.metadata, this.options);
@@ -554,17 +624,28 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       requestedEffortRaw === "low" ||
       requestedEffortRaw === "medium" ||
       requestedEffortRaw === "high" ||
+      requestedEffortRaw === "xhigh" ||
       requestedEffortRaw === "max"
-        ? requestedEffortRaw
+        ? (requestedEffortRaw as RuntimeEffortLevel)
         : undefined;
 
     const settingSourcesOverride = parseSettingSourcesOverride(metadata);
     const permissionModeOverride = parsePermissionModeOverride(metadata);
+    const customInstruction = parseCustomInstruction(metadata);
     const effectiveCwd = this.resolveScopedCwd(request.metadata);
 
-    // Dynamic model resolution with cache
     const effectiveSettingSources =
       settingSourcesOverride ?? this.options.settingSources ?? ["user", "project"];
+    const configSourceMode = this.parseConfigSourceMode(rawRequestMetadata);
+    const configPathMap = this.buildConfigPathMap(effectiveCwd);
+    const loadedConfigPaths = effectiveSettingSources
+      .map((source) => configPathMap[source])
+      .filter((entry): entry is string => Boolean(entry));
+    const configSourcePrompt = this.buildConfigSourcePrompt({
+      configSourceMode,
+      effectiveSettingSources,
+      configPathMap,
+    });
 
     let resolvedModel: string | undefined;
     if (
@@ -685,10 +766,34 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     // If alias resolution fails (e.g., frontend "sonnet" with non-Anthropic provider),
     // do NOT forward raw alias to SDK. Omit `model` and let runtime defaults decide.
     const modelForSdk = resolvedModel;
+    const supportedEfforts = await this.listEfforts({
+      model: modelForSdk || requestedModel,
+      settingSources: effectiveSettingSources,
+    });
+    const supportedEffortSet = new Set(
+      supportedEfforts
+        .map((entry) => entry.trim().toLowerCase())
+        .filter(Boolean),
+    );
+    const resolvedEffort = (() => {
+      if (!requestedEffort) return undefined;
+      if (supportedEffortSet.has(requestedEffort)) return requestedEffort;
+      const requestedIndex = RUNTIME_EFFORT_DESCENDING.indexOf(requestedEffort);
+      if (requestedIndex === -1) return undefined;
+      for (let i = requestedIndex + 1; i < RUNTIME_EFFORT_DESCENDING.length; i += 1) {
+        const candidate = RUNTIME_EFFORT_DESCENDING[i];
+        if (supportedEffortSet.has(candidate)) return candidate;
+      }
+      return undefined;
+    })();
+    const effortFallbackNotice =
+      requestedEffort && requestedEffort !== resolvedEffort
+        ? `Requested effort ${requestedEffort} is not supported by the current model. Using ${resolvedEffort || "default"}. Supported effort levels: ${supportedEfforts.join(", ")}.`
+        : undefined;
     const queryOptions: Record<string, unknown> = {
       ...metadata,
       model: modelForSdk,
-      effort: requestedEffort,
+      effort: resolvedEffort,
       cwd: effectiveCwd,
       additionalDirectories: this.options.additionalDirectories,
       allowedTools: mergeAllowedTools(request.allowedTools, this.options.defaultAllowedTools),
@@ -698,7 +803,13 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       includePartialMessages: this.options.includePartialMessages,
       maxTurns: this.options.maxTurns,
       continue: this.options.continue,
-      appendSystemPrompt: this.options.appendSystemPrompt,
+      appendSystemPrompt: [
+        this.options.appendSystemPrompt,
+        customInstruction,
+        configSourcePrompt,
+      ]
+        .filter((entry): entry is string => Boolean(entry && entry.trim()))
+        .join("\n\n") || undefined,
       resume: request.providerSessionId,
       abortController: request.signal ? this.createAbortController(request.signal) : undefined,
       // Add canUseTool callback for permission handling
@@ -726,14 +837,29 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
           ts: Date.now(),
           payload: {
             requestedModel: requestedModel ?? null,
-            resolvedEffort: requestedEffort ?? null,
+            requestedEffort: requestedEffort ?? null,
+            resolvedEffort: resolvedEffort ?? null,
+            supportedEfforts,
+            effortFallbackNotice: effortFallbackNotice ?? null,
             resolvedPermissionMode:
               permissionModeOverride ?? client.options.permissionMode ?? null,
             settingSources: effectiveSettingSources,
+            configSourceMode,
+            configPaths: configPathMap,
+            loadedConfigPaths,
             cwd: effectiveCwd,
           },
         },
       };
+
+      if (effortFallbackNotice) {
+        yield {
+          type: "status",
+          payload: {
+            text: effortFallbackNotice,
+          },
+        };
+      }
 
       // Create iterator for SDK stream
       const sdkIterator = sdkStream[Symbol.asyncIterator]();
@@ -862,6 +988,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
                   entry === "low" ||
                   entry === "medium" ||
                   entry === "high" ||
+                  entry === "xhigh" ||
                   entry === "max",
               ),
           ),
@@ -874,9 +1001,9 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       /opus[\s._-]*4[\s._-]*6/.test(model) ||
       /claude-opus-4-6/.test(model)
     ) {
-      return [...base, "max"];
+      return [...base, "xhigh", "max"];
     }
-    return base;
+    return [...base, "xhigh"];
   }
 
   private resolveScopedCwd(metadata: RuntimeTurnRequest["metadata"]): string | undefined {
@@ -907,11 +1034,13 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
 
   private resolveSettingsPathBySource(
     source: "user" | "project" | "local",
+    cwdOverride?: string,
   ): string | undefined {
     const homeDir = process.env.HOME && process.env.HOME.trim()
       ? resolve(process.env.HOME.trim())
       : undefined;
     const baseCwd = this.options.cwd ? resolve(this.options.cwd) : process.cwd();
+    const effectiveCwd = cwdOverride ? resolve(cwdOverride) : baseCwd;
     if (source === "user") {
       if (!homeDir) return undefined;
       return resolve(homeDir, ".claude/settings.json");
@@ -919,7 +1048,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     if (source === "project") {
       return resolve(baseCwd, ".claude/settings.json");
     }
-    return resolve(baseCwd, ".claude/settings.local.json");
+    return resolve(effectiveCwd, ".claude/settings.local.json");
   }
 
   private async readSettingsFile(path: string): Promise<ClaudeSettingsShape> {

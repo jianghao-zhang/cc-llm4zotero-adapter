@@ -8,6 +8,7 @@ import {
 } from "../src/index.js";
 import type { SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { resolve } from "node:path";
 
 function getArg(name: string): string | undefined {
@@ -145,7 +146,13 @@ async function main() {
     getArg("append-system-prompt-file") ||
       process.env.ADAPTER_APPEND_SYSTEM_PROMPT_FILE,
   );
-  const appendSystemPrompt = [appendPromptInline.trim(), appendPromptFile.trim()]
+  const projectInstructionFile = join(runtimeCwd, "CLAUDE.md");
+  const projectInstruction = readTextFile(projectInstructionFile);
+  const appendSystemPrompt = [
+    appendPromptInline.trim(),
+    appendPromptFile.trim(),
+    projectInstruction.trim(),
+  ]
     .filter(Boolean)
     .join("\n\n");
   const defaultAdditionalDirs = [

@@ -94,10 +94,13 @@ async function main() {
     throw new Error(`Invalid port: ${portRaw}`);
   }
 
-  const homeDir = process.env.HOME && process.env.HOME.trim()
-    ? process.env.HOME.trim()
-    : undefined;
-  const zoteroRoot = homeDir ? resolve(homeDir, "Zotero") : undefined;
+  const homeDir = (process.env.HOME || process.env.USERPROFILE || "").trim() || undefined;
+  const explicitZoteroRoot = (
+    getArg("zotero-root") || process.env.ZOTERO_ROOT || ""
+  ).trim() || undefined;
+  const zoteroRoot = explicitZoteroRoot
+    ? resolve(explicitZoteroRoot)
+    : homeDir ? resolve(homeDir, "Zotero") : undefined;
   const defaultRuntimeCwd =
     zoteroRoot && existsSync(zoteroRoot)
       ? resolve(zoteroRoot, "agent-runtime")

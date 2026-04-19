@@ -303,21 +303,37 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
           }
         ];
       }
-      if (
-        (delta.type === "thinking_delta" || delta.type === "signature_delta") &&
-        typeof delta.text === "string"
-      ) {
-        return [
-          providerEvent,
-          {
-            type: "reasoning",
-            payload: {
-              round: 1,
-              details: delta.text,
-              sessionId,
+      if (delta.type === "thinking_delta") {
+        const thinking = typeof delta.thinking === "string" ? delta.thinking : "";
+        if (thinking) {
+          return [
+            providerEvent,
+            {
+              type: "reasoning",
+              payload: {
+                round: 1,
+                details: thinking,
+                sessionId,
+              },
             },
-          },
-        ];
+          ];
+        }
+      }
+      if (delta.type === "signature_delta") {
+        const thinking = typeof delta.text === "string" ? delta.text : "";
+        if (thinking) {
+          return [
+            providerEvent,
+            {
+              type: "reasoning",
+              payload: {
+                round: 1,
+                details: thinking,
+                sessionId,
+              },
+            },
+          ];
+        }
       }
     }
   }

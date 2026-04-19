@@ -81,6 +81,14 @@ export function mapToLlm4ZoteroEvent(event: AgentEvent): Llm4ZoteroAgentEvent | 
         data: payload.data
       };
     }
+    case "reasoning": {
+      return {
+        type: "reasoning",
+        round: asNumber(payload.round, 1),
+        summary: asString(payload.summary) || undefined,
+        details: asString(payload.details) || undefined,
+      };
+    }
     case "message_delta": {
       return {
         type: "message_delta",

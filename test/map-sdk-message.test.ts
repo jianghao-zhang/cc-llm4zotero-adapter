@@ -3,6 +3,31 @@ import { describe, expect, it } from "vitest";
 import { mapSdkMessageToProviderEvents } from "../src/event-mapper/map-sdk-message.js";
 
 describe("mapSdkMessageToProviderEvents", () => {
+  it("maps thinking deltas to reasoning events", () => {
+    const streamEvent = {
+      type: "stream_event",
+      session_id: "session-1",
+      event: {
+        type: "content_block_delta",
+        index: 0,
+        delta: {
+          type: "thinking_delta",
+          thinking: "Reasoning chunk",
+        },
+      },
+    };
+
+    const events = mapSdkMessageToProviderEvents(streamEvent);
+    expect(events).toContainEqual({
+      type: "reasoning",
+      payload: {
+        round: 1,
+        details: "Reasoning chunk",
+        sessionId: "session-1",
+      },
+    });
+  });
+
   it("maps system subtypes to readable status text", () => {
     const hookStarted = mapSdkMessageToProviderEvents({
       type: "system",

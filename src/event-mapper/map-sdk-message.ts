@@ -48,16 +48,6 @@ function normalizeToolResultContent(content: unknown): string {
   return JSON.stringify(content);
 }
 
-function normalizeToolUseResult(result: unknown): string {
-  if (typeof result === "string") {
-    return result;
-  }
-  if (result === undefined || result === null) {
-    return "";
-  }
-  return JSON.stringify(result);
-}
-
 function extractResultOutput(msg: Record<string, unknown>): string {
   if (typeof msg.result === "string" && msg.result.trim()) {
     return msg.result;
@@ -182,18 +172,6 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
           }
         });
       }
-
-      if (block.type === "tool_use") {
-        events.push({
-          type: "tool_call",
-          payload: {
-            id: block.id,
-            name: block.name,
-            input: block.input,
-            sessionId
-          }
-        });
-      }
     }
 
     if (events.length === 0) {
@@ -211,17 +189,6 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
 
   if (type === "user") {
     const events: ProviderEvent[] = [providerEvent];
-    const directToolUseResult = msg.tool_use_result;
-    if (directToolUseResult !== undefined) {
-      events.push({
-        type: "tool_result",
-        payload: {
-          content: normalizeToolUseResult(directToolUseResult),
-          sessionId
-        }
-      });
-    }
-
     const message = asRecord(msg.message) as MessageContainer;
     for (const block of Array.isArray(message.content) ? message.content : []) {
       if (block.type === "tool_result") {

@@ -15,6 +15,51 @@ function providerEvents(events: ProviderEvent[]): AsyncIterable<ProviderEvent> {
 }
 
 describe("ClaudeCodeRuntimeAdapter", () => {
+  it("coalesces adjacent text deltas before forwarding them", async () => {
+    const runtimeClient: ClaudeCodeRuntimeClient = {
+      async startTurn() {
+        return {
+          runId: "run-coalesce",
+          providerSessionId: "claude-session-coalesce",
+          events: providerEvents([
+            { type: "message_delta", payload: { delta: "Hello" } },
+            { type: "message_delta", payload: { delta: " " } },
+            { type: "message_delta", payload: { delta: "world" } },
+            { type: "final", payload: { output: "Hello world" } }
+          ])
+        };
+      }
+    };
+
+    const seen: Array<{ type: string; delta?: string }> = [];
+    const adapter = new ClaudeCodeRuntimeAdapter({
+      runtimeClient,
+      sessionMapper: new InMemorySessionMapper()
+    });
+
+    const outcome = await adapter.runTurn(
+      {
+        conversationKey: "conv-coalesce",
+        userMessage: "hello"
+      },
+      {
+        onEvent(event) {
+          seen.push({
+            type: event.type,
+            delta: event.type === "message_delta" ? event.payload.delta : undefined,
+          });
+        }
+      }
+    );
+
+    expect(outcome.status).toBe("completed");
+    expect(outcome.finalText).toBe("Hello world");
+    expect(seen).toEqual([
+      { type: "message_delta", delta: "Hello world" },
+      { type: "final", delta: undefined },
+    ]);
+  });
+
   it("maps runtime events and persists session mapping + traces", async () => {
     const runtimeClient: ClaudeCodeRuntimeClient = {
       async startTurn() {
@@ -56,10 +101,10 @@ describe("ClaudeCodeRuntimeAdapter", () => {
     expect(outcome.status).toBe("completed");
     expect(outcome.finalText).toBe("Hello world");
     expect(await sessionMapper.get("conv-A")).toBe("claude-session-1");
-    expect(seenTypes).toEqual(["status", "message_delta", "message_delta", "final"]);
+    expect(seenTypes).toEqual(["status", "message_delta", "final"]);
 
     const traces = await traceStore.list("conv-A");
-    expect(traces).toHaveLength(4);
+    expect(traces).toHaveLength(3);
     expect(traces[0]?.runId).toBe("run-1");
   });
 

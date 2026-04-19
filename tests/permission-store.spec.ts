@@ -86,10 +86,8 @@ describe("PermissionStore", () => {
     });
   });
 
-  it("should timeout after default timeout period", async () => {
-    // Create a store with a short timeout for testing
+  it("should auto-deny after default timeout period", async () => {
     const shortTimeoutStore = new PermissionStore();
-    // Override the timeout by accessing private field (for testing only)
     (shortTimeoutStore as unknown as { defaultTimeoutMs: number }).defaultTimeoutMs = 50;
 
     const { promise } = shortTimeoutStore.create(
@@ -99,7 +97,13 @@ describe("PermissionStore", () => {
       {}
     );
 
-    await expect(promise).rejects.toThrow("timed out");
+    const result = await promise;
+    expect(result.behavior).toBe("deny");
+    if (result.behavior === "deny") {
+      expect(result.message).toContain("timed out");
+      expect(result.interrupt).toBe(false);
+      expect(result.toolUseID).toBe("tool-use-timeout");
+    }
   });
 
   it("should cleanup all pending permissions", async () => {

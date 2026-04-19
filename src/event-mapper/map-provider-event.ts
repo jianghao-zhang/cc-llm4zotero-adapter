@@ -4,6 +4,7 @@ import type { AgentEvent } from "../types.js";
 const SUPPORTED_TYPES = new Set([
   "provider_event",
   "status",
+  "reasoning",
   "tool_call",
   "tool_result",
   "tool_error",

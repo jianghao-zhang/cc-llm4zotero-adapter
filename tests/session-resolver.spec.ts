@@ -1,5 +1,8 @@
+import { rm, mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { InMemorySessionMapper } from "../src/session-link/session-mapper.js";
+import { InMemorySessionMapper, JsonFileSessionMapper } from "../src/session-link/session-mapper.js";
 import { SessionResolver, type SessionDiscoveryClient } from "../src/session-link/session-resolver.js";
 
 describe("SessionResolver", () => {
@@ -55,5 +58,34 @@ describe("SessionResolver", () => {
 
     expect(sessionId).toBeUndefined();
     expect(await mapper.get("conv-3")).toBeUndefined();
+  });
+
+  it("serializes json-file session mapper writes", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "adapter-session-mapper-"));
+    const filePath = join(dir, "sessions.json");
+    const mapper = new JsonFileSessionMapper(filePath);
+
+    try {
+      await Promise.all([
+        mapper.set("conv-1", "sess-1"),
+        mapper.set("conv-2", "sess-2"),
+        mapper.set("conv-3", "sess-3"),
+      ]);
+
+      expect(await mapper.get("conv-1")).toBe("sess-1");
+      expect(await mapper.get("conv-2")).toBe("sess-2");
+      expect(await mapper.get("conv-3")).toBe("sess-3");
+
+      await Promise.all([
+        mapper.delete("conv-1"),
+        mapper.set("conv-2", "sess-2b"),
+      ]);
+
+      expect(await mapper.get("conv-1")).toBeUndefined();
+      expect(await mapper.get("conv-2")).toBe("sess-2b");
+      expect(await mapper.get("conv-3")).toBe("sess-3");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

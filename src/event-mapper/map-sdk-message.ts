@@ -48,16 +48,6 @@ function normalizeToolResultContent(content: unknown): string {
   return JSON.stringify(content);
 }
 
-function normalizeToolUseResult(result: unknown): string {
-  if (typeof result === "string") {
-    return result;
-  }
-  if (result === undefined || result === null) {
-    return "";
-  }
-  return JSON.stringify(result);
-}
-
 function extractResultOutput(msg: Record<string, unknown>): string {
   if (typeof msg.result === "string" && msg.result.trim()) {
     return msg.result;
@@ -182,18 +172,6 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
           }
         });
       }
-
-      if (block.type === "tool_use") {
-        events.push({
-          type: "tool_call",
-          payload: {
-            id: block.id,
-            name: block.name,
-            input: block.input,
-            sessionId
-          }
-        });
-      }
     }
 
     if (events.length === 0) {
@@ -211,17 +189,6 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
 
   if (type === "user") {
     const events: ProviderEvent[] = [providerEvent];
-    const directToolUseResult = msg.tool_use_result;
-    if (directToolUseResult !== undefined) {
-      events.push({
-        type: "tool_result",
-        payload: {
-          content: normalizeToolUseResult(directToolUseResult),
-          sessionId
-        }
-      });
-    }
-
     const message = asRecord(msg.message) as MessageContainer;
     for (const block of Array.isArray(message.content) ? message.content : []) {
       if (block.type === "tool_result") {
@@ -261,13 +228,27 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
   }
 
   if (type === "system") {
+    const subtype = typeof msg.subtype === "string" ? msg.subtype.trim() : "";
+    const text =
+      subtype === "hook_started"
+        ? `Running ${typeof msg.hook_name === "string" && msg.hook_name.trim() ? msg.hook_name.trim() : "runtime hook"}`
+        : subtype === "hook_response"
+          ? `Finished ${typeof msg.hook_name === "string" && msg.hook_name.trim() ? msg.hook_name.trim() : "runtime hook"}`
+          : subtype === "init"
+            ? "Initializing Claude session"
+            : subtype === "api_retry"
+              ? "Retrying provider request"
+              : subtype
+                ? `System event: ${subtype}`
+                : "System event";
     return [
       providerEvent,
       {
         type: "status",
         payload: {
+          text,
           phase: "system",
-          subtype: msg.subtype,
+          subtype,
           sessionId
         }
       }
@@ -290,6 +271,23 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
 
   if (type === "stream_event") {
     const event = asRecord(msg.event);
+    if (event.type === "content_block_start") {
+      const contentBlock = asRecord(event.content_block);
+      if (contentBlock.type === "tool_use") {
+        return [
+          providerEvent,
+          {
+            type: "tool_call",
+            payload: {
+              id: typeof contentBlock.id === "string" ? contentBlock.id : undefined,
+              name: typeof contentBlock.name === "string" ? contentBlock.name : undefined,
+              input: contentBlock.input,
+              sessionId,
+            },
+          },
+        ];
+      }
+    }
     if (event.type === "content_block_delta") {
       const delta = asRecord(event.delta);
       if (delta.type === "text_delta" && typeof delta.text === "string") {
@@ -304,6 +302,38 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
             }
           }
         ];
+      }
+      if (delta.type === "thinking_delta") {
+        const thinking = typeof delta.thinking === "string" ? delta.thinking : "";
+        if (thinking) {
+          return [
+            providerEvent,
+            {
+              type: "reasoning",
+              payload: {
+                round: 1,
+                details: thinking,
+                sessionId,
+              },
+            },
+          ];
+        }
+      }
+      if (delta.type === "signature_delta") {
+        const thinking = typeof delta.text === "string" ? delta.text : "";
+        if (thinking) {
+          return [
+            providerEvent,
+            {
+              type: "reasoning",
+              payload: {
+                round: 1,
+                details: thinking,
+                sessionId,
+              },
+            },
+          ];
+        }
       }
     }
   }

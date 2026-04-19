@@ -88,6 +88,12 @@ type ToolCatalogOptions = {
   settingSources?: Array<"user" | "project" | "local">;
 };
 
+const TOOL_CATALOG_CACHE_TTL_MS = 15_000;
+const toolCatalogCache = new Map<
+  string,
+  { expiresAt: number; tools: Llm4ZoteroToolDescriptor[] }
+>();
+
 function normalizeSettingSources(
   settingSources: Array<"user" | "project" | "local"> | undefined,
 ): Array<"user" | "project" | "local"> {
@@ -183,16 +189,29 @@ function parseCommandDescriptor(filePath: string): Llm4ZoteroToolDescriptor | nu
 }
 
 export function getToolCatalog(options?: ToolCatalogOptions): Llm4ZoteroToolDescriptor[] {
+  const settingSources = normalizeSettingSources(options?.settingSources);
+  const runtimeCwd = resolve(options?.runtimeCwd || process.cwd());
+  const cacheKey = `${runtimeCwd}|${settingSources.join(",")}`;
+  const cached = toolCatalogCache.get(cacheKey);
+  if (cached && Date.now() < cached.expiresAt) {
+    return cached.tools;
+  }
+
   const seen = new Set<string>();
   const tools: Llm4ZoteroToolDescriptor[] = [];
-  for (const file of listCommandFiles(options)) {
+  for (const file of listCommandFiles({ runtimeCwd, settingSources })) {
     const descriptor = parseCommandDescriptor(file);
     if (!descriptor) continue;
     if (seen.has(descriptor.name)) continue;
     seen.add(descriptor.name);
     tools.push(descriptor);
   }
-  return tools.sort((a, b) => a.name.localeCompare(b.name));
+  const sorted = tools.sort((a, b) => a.name.localeCompare(b.name));
+  toolCatalogCache.set(cacheKey, {
+    expiresAt: Date.now() + TOOL_CATALOG_CACHE_TTL_MS,
+    tools: sorted,
+  });
+  return sorted;
 }
 
 export function findToolByName(name: string): Llm4ZoteroToolDescriptor | undefined {

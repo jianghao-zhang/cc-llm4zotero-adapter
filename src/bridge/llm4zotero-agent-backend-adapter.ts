@@ -57,11 +57,12 @@ function normalizeScopeId(value: unknown): string | undefined {
 }
 
 function toSafePathSegment(value: string): string {
+  const invalidChars = process.platform === "win32" ? /[^\w.\-@]/g : /[^\w.\-:@]/g;
   return value
     .trim()
     .replace(/[\/\\]/g, "_")
     .replace(/\s+/g, "_")
-    .replace(/[^\w.\-]/g, "_")
+    .replace(invalidChars, "_")
     .replace(/_+/g, "_")
     .replace(/^_+|_+$/g, "")
     .slice(0, 120) || "unknown";

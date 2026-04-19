@@ -3,6 +3,33 @@ import { describe, expect, it } from "vitest";
 import { mapSdkMessageToProviderEvents } from "../src/event-mapper/map-sdk-message.js";
 
 describe("mapSdkMessageToProviderEvents", () => {
+  it("maps system subtypes to readable status text", () => {
+    const hookStarted = mapSdkMessageToProviderEvents({
+      type: "system",
+      session_id: "session-1",
+      subtype: "hook_started",
+      hook_name: "SessionStart:resume",
+    });
+    const apiRetry = mapSdkMessageToProviderEvents({
+      type: "system",
+      session_id: "session-1",
+      subtype: "api_retry",
+    });
+
+    expect(hookStarted).toContainEqual({
+      type: "status",
+      payload: expect.objectContaining({
+        text: "Running SessionStart:resume",
+      }),
+    });
+    expect(apiRetry).toContainEqual({
+      type: "status",
+      payload: expect.objectContaining({
+        text: "Retrying provider request",
+      }),
+    });
+  });
+
   it("does not duplicate tool_call when assistant content already includes tool_use", () => {
     const assistantMessage = {
       type: "assistant",

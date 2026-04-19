@@ -228,13 +228,27 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
   }
 
   if (type === "system") {
+    const subtype = typeof msg.subtype === "string" ? msg.subtype.trim() : "";
+    const text =
+      subtype === "hook_started"
+        ? `Running ${typeof msg.hook_name === "string" && msg.hook_name.trim() ? msg.hook_name.trim() : "runtime hook"}`
+        : subtype === "hook_response"
+          ? `Finished ${typeof msg.hook_name === "string" && msg.hook_name.trim() ? msg.hook_name.trim() : "runtime hook"}`
+          : subtype === "init"
+            ? "Initializing Claude session"
+            : subtype === "api_retry"
+              ? "Retrying provider request"
+              : subtype
+                ? `System event: ${subtype}`
+                : "System event";
     return [
       providerEvent,
       {
         type: "status",
         payload: {
+          text,
           phase: "system",
-          subtype: msg.subtype,
+          subtype,
           sessionId
         }
       }

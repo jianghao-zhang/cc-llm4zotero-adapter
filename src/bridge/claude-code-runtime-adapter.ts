@@ -192,7 +192,19 @@ export class ClaudeCodeRuntimeAdapter {
       for await (const providerEvent of stream.events) {
         const event = mapProviderEvent(providerEvent);
         const eventSessionId = this.extractSessionId(event.payload);
-        if (eventSessionId && eventSessionId !== resolvedSessionId) {
+        const providerType =
+          event.type === "provider_event" && event.payload && typeof event.payload === "object"
+            ? (event.payload as Record<string, unknown>).providerType
+            : undefined;
+        const canAdoptSessionId =
+          providerType === "assistant" ||
+          providerType === "user" ||
+          providerType === "result" ||
+          event.type === "tool_call" ||
+          event.type === "tool_result" ||
+          event.type === "message_delta" ||
+          event.type === "final";
+        if (canAdoptSessionId && eventSessionId && eventSessionId !== resolvedSessionId) {
           resolvedSessionId = eventSessionId;
           await this.sessionMapper.set(request.conversationKey, eventSessionId);
         }

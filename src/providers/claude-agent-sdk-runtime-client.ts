@@ -203,40 +203,32 @@ async function loadAttachmentImagePayloads(
 function collectAttachmentPaths(runtimeRequest: RuntimeRequestShape | undefined): string[] {
   if (!runtimeRequest || !Array.isArray(runtimeRequest.attachments)) return [];
   const paths: string[] = [];
-  for (const entry of runtimeRequest.attachments as RuntimeAttachment[]) {
-    if (!entry || typeof entry !== "object") continue;
+  for (const raw of runtimeRequest.attachments) {
+    const entry = asRecord(raw);
+    if (!entry) continue;
+    const attachmentId = typeof entry.id === "string" ? entry.id.trim() : "";
+    if (attachmentId.startsWith("pdf-paper-") || attachmentId.startsWith("pdf-page-")) {
+      continue;
+    }
+    const category = trimInline(entry.category, 24).toLowerCase();
+    if (category === "image") continue;
     const storedPath = typeof entry.storedPath === "string" ? entry.storedPath.trim() : "";
     if (!storedPath || !storedPath.startsWith("/")) continue;
     const name = trimInline(entry.name, 120);
     const mimeType = trimInline(entry.mimeType, 80);
-    const category = trimInline(entry.category, 24);
     const meta = [category, mimeType].filter(Boolean).join(", ");
     const suffix = meta ? ` (${meta})` : "";
-    paths.push(`- ${name || "attachment"}: ${storedPath}${suffix}`);
+    paths.push(`${name || "attachment"}: ${storedPath}${suffix}`);
   }
   return paths;
-}
-
-function collectPaperTitles(entries: unknown, limit: number): string[] {
-  if (!Array.isArray(entries)) return [];
-  const titles: string[] = [];
-  for (const entry of entries) {
-    const record = asRecord(entry);
-    if (!record) continue;
-    const title = trimInline(record.title, 140);
-    if (!title) continue;
-    titles.push(title);
-    if (titles.length >= limit) break;
-  }
-  return titles;
 }
 
 type RuntimePaperPathEntry = {
   title: string;
   contextItemId?: number;
+  canonicalTextPath?: string;
   contextFilePath?: string;
   mineruFullMdPath?: string;
-  mineruCacheDir?: string;
 };
 
 function asPath(value: unknown): string | undefined {
@@ -260,16 +252,16 @@ function collectPaperPathEntries(entries: unknown, limit: number): RuntimePaperP
         : undefined;
     const contextFilePath = asPath(record.contextFilePath);
     const mineruFullMdPath = asPath(record.mineruFullMdPath);
-    const mineruCacheDir = asPath(record.mineruCacheDir);
-    if (!contextFilePath && !mineruFullMdPath && !mineruCacheDir && !contextItemId) {
+    const canonicalTextPath = mineruFullMdPath || contextFilePath;
+    if (!canonicalTextPath && !contextItemId) {
       continue;
     }
     collected.push({
       title,
       contextItemId,
+      canonicalTextPath,
       contextFilePath,
       mineruFullMdPath,
-      mineruCacheDir,
     });
   }
   return collected;
@@ -278,9 +270,7 @@ function collectPaperPathEntries(entries: unknown, limit: number): RuntimePaperP
 function formatPaperPathLines(entries: RuntimePaperPathEntry[]): string[] {
   return entries.map((entry) => {
     const pathHints = [
-      entry.mineruFullMdPath ? `MinerU md: ${entry.mineruFullMdPath}` : "",
-      entry.contextFilePath ? `attachment: ${entry.contextFilePath}` : "",
-      entry.mineruCacheDir ? `MinerU dir: ${entry.mineruCacheDir}` : "",
+      entry.canonicalTextPath ? `canonical text source: ${entry.canonicalTextPath}` : "",
       typeof entry.contextItemId === "number"
         ? `contextItemId=${entry.contextItemId}`
         : "",
@@ -315,7 +305,6 @@ function buildPromptText(
     );
   }
 
-  const attachmentPaths = collectAttachmentPaths(runtimeRequest);
   const selectedPaperPathEntries = collectPaperPathEntries(
     runtimeRequest.selectedPaperContexts ?? runtimeRequest.paperContexts,
     8,
@@ -328,59 +317,36 @@ function buildPromptText(
     runtimeRequest.pinnedPaperContexts,
     4,
   );
-
-  const selectedPapers = collectPaperTitles(
-    runtimeRequest.selectedPaperContexts,
-    6,
-  );
-  if (selectedPapers.length) {
-    lines.push(
-      "Selected papers:",
-      ...selectedPapers.map((title) => `- ${title}`),
-    );
-  }
+  const attachmentPaths = collectAttachmentPaths(runtimeRequest);
 
   if (selectedPaperPathEntries.length) {
     lines.push(
-      "Selected paper contexts with local readable paths (prefer MinerU md, then attachment path):",
+      "Selected papers for this turn:",
       ...formatPaperPathLines(selectedPaperPathEntries),
-    );
-  }
-
-  const fullTextPapers = collectPaperTitles(runtimeRequest.fullTextPaperContexts, 4);
-  if (fullTextPapers.length) {
-    lines.push(
-      "Papers marked for full-text reading:",
-      ...fullTextPapers.map((title) => `- ${title}`),
+      "Use them as available paper context for this answer.",
     );
   }
 
   if (fullTextPaperPathEntries.length) {
     lines.push(
-      "Full-text paper contexts with local readable paths:",
+      "Papers marked for full-text reading on this turn:",
       ...formatPaperPathLines(fullTextPaperPathEntries),
-    );
-  }
-
-  const pinnedPapers = collectPaperTitles(runtimeRequest.pinnedPaperContexts, 4);
-  if (pinnedPapers.length) {
-    lines.push(
-      "Pinned papers:",
-      ...pinnedPapers.map((title) => `- ${title}`),
+      "Treat these as the highest-priority paper reading targets before answering.",
     );
   }
 
   if (pinnedPaperPathEntries.length) {
     lines.push(
-      "Pinned paper contexts with local readable paths (prefer MinerU md, then attachment path):",
+      "Pinned papers:",
       ...formatPaperPathLines(pinnedPaperPathEntries),
+      "Keep them available as persistent context, but do not treat them as mandatory full-text reads unless they also appear in the full-text group above.",
     );
   }
 
   if (attachmentPaths.length) {
     lines.push(
-      "Local attachment files (absolute paths). Read these files directly when needed:",
-      ...attachmentPaths,
+      "Attachments:",
+      ...attachmentPaths.map((path) => `- ${path}`),
     );
   }
 

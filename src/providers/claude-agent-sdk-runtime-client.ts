@@ -545,7 +545,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     { expiresAt: number; commands: ClaudeSlashCommandInfo[] }
   >();
   private readonly modelInfoTtlMs = 60_000;
-  private readonly commandInfoTtlMs = 60_000;
+  private readonly commandInfoTtlMs = 5 * 60_000;
 
   constructor(options: ClaudeAgentSdkRuntimeClientOptions = {}) {
     this.options = options;

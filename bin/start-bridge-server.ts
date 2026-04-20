@@ -8,9 +8,59 @@ import {
 } from "../src/index.js";
 import { resolveLegacyAdapterPaths } from "../src/zotero-profile-paths.js";
 import type { SettingSource } from "@anthropic-ai/claude-agent-sdk";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  createWriteStream,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { resolve } from "node:path";
+
+// Tee console.log / console.error to a log file so output survives even when
+// the bridge is spawned without an attached terminal (e.g. by the Zotero
+// plugin via Subprocess.call). The target path is derived below once we know
+// the state dir.
+function installFileLogger(filePath: string): void {
+  try {
+    mkdirSync(resolve(filePath, ".."), { recursive: true });
+    const stream = createWriteStream(filePath, { flags: "a" });
+    const origLog = console.log.bind(console);
+    const origErr = console.error.bind(console);
+    const write = (level: string, args: unknown[]): void => {
+      try {
+        const line =
+          `${new Date().toISOString()} [${level}] ` +
+          args
+            .map((a) =>
+              typeof a === "string" ? a : (() => {
+                try {
+                  return JSON.stringify(a);
+                } catch {
+                  return String(a);
+                }
+              })(),
+            )
+            .join(" ") +
+          "\n";
+        stream.write(line);
+      } catch {
+        // ignore
+      }
+    };
+    console.log = (...args: unknown[]) => {
+      write("log", args);
+      origLog(...args);
+    };
+    console.error = (...args: unknown[]) => {
+      write("err", args);
+      origErr(...args);
+    };
+  } catch {
+    // ignore
+  }
+}
 
 function getArg(name: string): string | undefined {
   const flag = `--${name}`;
@@ -83,6 +133,10 @@ function readTextFile(path: string | undefined): string {
   try {
     return readFileSync(path, "utf8").trim();
   } catch (error) {
+    // Missing optional files (e.g. CLAUDE.md, append-system-prompt-file) must
+    // not prevent the bridge from starting. Only surface non-ENOENT errors.
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    if (code === "ENOENT") return "";
     const message = error instanceof Error ? error.message : String(error);
     throw new Error(`Failed to read file: ${path} (${message})`);
   }
@@ -150,6 +204,20 @@ async function main() {
 
   mkdirSync(runtimeCwd, { recursive: true });
   mkdirSync(stateDirResolved, { recursive: true });
+  // Opt-in diagnostic log file. Set ADAPTER_LOG_FILE to any path (absolute or
+  // relative to cwd) to enable, or "1"/"true" to write to <stateDir>/bridge.log.
+  // Useful when the bridge is spawned without an attached terminal (e.g. via
+  // Zotero's Subprocess API), which otherwise drops all stdout/stderr output.
+  const rawLogFileSetting =
+    getArg("log-file") ?? process.env.ADAPTER_LOG_FILE ?? "";
+  const logFileSetting = rawLogFileSetting.trim();
+  if (logFileSetting) {
+    const resolvedLogPath =
+      ["1", "true", "yes", "on"].includes(logFileSetting.toLowerCase())
+        ? resolve(stateDirResolved, "bridge.log")
+        : resolve(logFileSetting);
+    installFileLogger(resolvedLogPath);
+  }
   const projectClaudeDir = resolve(runtimeCwd, ".claude");
   const projectSettingsFile = resolve(projectClaudeDir, "settings.json");
   mkdirSync(projectClaudeDir, { recursive: true });

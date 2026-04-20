@@ -627,23 +627,22 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       );
 
       if (resolvedFromCache) {
-        // Never forward generic aliases (sonnet/opus/haiku) directly to SDK.
-        // If resolution only bounces back the alias itself, treat as unresolved
-        // and let runtime defaults choose the effective model.
-        const normalizedResolved = resolvedFromCache.trim().toLowerCase();
-        const normalizedRequested = requestedModelRaw.trim().toLowerCase();
-        const isGenericAlias =
-          normalizedRequested === "sonnet" ||
-          normalizedRequested === "opus" ||
-          normalizedRequested === "haiku";
-        if (!(isGenericAlias && normalizedResolved === normalizedRequested)) {
-          // Use resolved model (from cache or env vars)
-          resolvedModel = resolvedFromCache;
+        // resolveModelAlias only returns the alias unchanged when the SDK's
+        // supportedModels() itself reports that alias as a valid value
+        // (e.g. Claude Code SDK reports "default"/"sonnet"/"haiku"). In that
+        // case the alias IS the SDK model identifier and must be forwarded —
+        // dropping it causes the SDK to fall back to its internal default.
+        resolvedModel = resolvedFromCache;
+      } else if (!cacheHit) {
+        // Cache miss: SDK hasn't been queried for available models yet.
+        // For the known Claude Code SDK aliases, forward the alias directly —
+        // the SDK accepts "opus"/"sonnet"/"haiku" as valid model values and
+        // this avoids falling back to the runtime default on the first request.
+        const rawLower = requestedModelRaw.trim().toLowerCase();
+        if (rawLower === "opus" || rawLower === "sonnet" || rawLower === "haiku") {
+          resolvedModel = rawLower;
         }
-      }
-
-      if (!cacheHit) {
-        // Cache miss: trigger async fetch to populate cache for next time
+        // Trigger async fetch to populate cache for subsequent requests
         this.fetchAndCacheModels(effectiveSettingSources).catch(() => {
           // Silently ignore, will retry on next request
         });

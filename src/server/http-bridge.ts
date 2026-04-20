@@ -1,12 +1,12 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { randomUUID } from "node:crypto";
 import type {
   Llm4ZoteroAgentBackendAdapter
 } from "../bridge/llm4zotero-agent-backend-adapter.js";
 import type {
   Llm4ZoteroAgentEvent,
   Llm4ZoteroRunActionRequest,
-  Llm4ZoteroRunTurnRequest
+  Llm4ZoteroRunTurnRequest,
+  Llm4ZoteroRuntimeRetentionRequest,
 } from "../bridge/llm4zotero-contract.js";
 
 export interface HttpBridgeServerOptions {
@@ -57,12 +57,7 @@ function parseConversationKey(
     return Math.floor(value);
   }
   if (typeof value === "string" && value.trim().length > 0) {
-    const trimmed = value.trim();
-    if (/^-?\d+$/.test(trimmed)) {
-      const parsed = Number.parseInt(trimmed, 10);
-      if (Number.isFinite(parsed)) return parsed;
-    }
-    return trimmed;
+    return value.trim();
   }
   return undefined;
 }
@@ -200,6 +195,32 @@ function toResolveConfirmationPayload(body: unknown): {
   };
 }
 
+function toRetentionPayload(body: unknown): Llm4ZoteroRuntimeRetentionRequest {
+  const record = body !== null && typeof body === "object" ? (body as Record<string, unknown>) : {};
+  const conversationKey = record.conversationKey;
+  const mountId = typeof record.mountId === "string" ? record.mountId.trim() : "";
+  if (!(typeof conversationKey === "string" || typeof conversationKey === "number")) {
+    throw new Error("conversationKey must be string or number");
+  }
+  if (!mountId) {
+    throw new Error("mountId must be a non-empty string");
+  }
+  return {
+    conversationKey,
+    scopeType: parseScopeType(record.scopeType),
+    scopeId:
+      typeof record.scopeId === "string" && record.scopeId.trim().length > 0
+        ? record.scopeId.trim()
+        : undefined,
+    scopeLabel:
+      typeof record.scopeLabel === "string" && record.scopeLabel.trim().length > 0
+        ? record.scopeLabel.trim()
+        : undefined,
+    mountId,
+    retain: Boolean(record.retain),
+  };
+}
+
 function writeLine(res: ServerResponse, line: BridgeStreamLine): void {
   res.write(JSON.stringify(line));
   res.write("\n");
@@ -290,6 +311,20 @@ export async function startHttpBridgeServer(
         return;
       }
 
+      if (req.method === "POST" && req.url === "/runtime-retention") {
+        let payload: Llm4ZoteroRuntimeRetentionRequest;
+        try {
+          payload = toRetentionPayload(await readJson(req));
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          sendJson(res, 400, { error: message });
+          return;
+        }
+        const outcome = await options.adapter.updateRuntimeRetention(payload);
+        sendJson(res, 200, outcome);
+        return;
+      }
+
       if (req.method === "POST" && req.url === "/run-turn") {
         let payload: Llm4ZoteroRunTurnRequest;
         try {
@@ -304,9 +339,6 @@ export async function startHttpBridgeServer(
         res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
         res.setHeader("Cache-Control", "no-cache, no-transform");
         res.setHeader("Connection", "keep-alive");
-
-        const startRunId = randomUUID();
-        writeLine(res, { type: "start", runId: startRunId });
 
         const outcome = await options.adapter.runTurn({
           request: payload,
@@ -337,9 +369,6 @@ export async function startHttpBridgeServer(
         res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
         res.setHeader("Cache-Control", "no-cache, no-transform");
         res.setHeader("Connection", "keep-alive");
-
-        const startRunId = randomUUID();
-        writeLine(res, { type: "start", runId: startRunId });
 
         const outcome = await options.adapter.runAction({
           request: payload,

@@ -52,7 +52,7 @@ describe("http bridge server", () => {
     }
   });
 
-  it("streams start/event/outcome lines", async () => {
+  it("streams a single start line with the runtime runId", async () => {
     const runtimeClient: ClaudeCodeRuntimeClient = {
       async startTurn() {
         return {
@@ -84,9 +84,17 @@ describe("http bridge server", () => {
 
       expect(response.ok).toBe(true);
       const lines = await readNdjsonLines(response);
-      const types = lines.map((line) => line.type);
-      expect(types).toContain("start");
-      expect(types).toContain("outcome");
+      const starts = lines.filter((line) => line.type === "start");
+      expect(starts).toEqual([{ type: "start", runId: "run-http-1" }]);
+      expect(lines.at(-1)).toEqual({
+        type: "outcome",
+        outcome: {
+          kind: "completed",
+          runId: "run-http-1",
+          text: "hello",
+          usedFallback: false,
+        },
+      });
     } finally {
       await server.close();
     }
@@ -122,16 +130,15 @@ describe("http bridge server", () => {
     }
   });
 
-  it("streams run-action endpoint", async () => {
+  it("preserves string conversationKey and scoped session info contract", async () => {
+    const seenKeys: string[] = [];
     const runtimeClient: ClaudeCodeRuntimeClient = {
-      async startTurn() {
+      async startTurn(request) {
+        seenKeys.push(request.conversationKey);
         return {
-          runId: "run-http-action",
-          events: providerEvents([
-            { type: "tool_call", payload: { id: "call_1", name: "Read", input: { file_path: "README.md" } } },
-            { type: "tool_result", payload: { toolUseId: "call_1", name: "Read", content: "ok" } },
-            { type: "final", payload: { output: "done" } }
-          ])
+          runId: "run-http-string-key",
+          providerSessionId: "sess-http-string-key",
+          events: providerEvents([{ type: "final", payload: { output: "ok" } }]),
         };
       }
     };
@@ -140,7 +147,110 @@ describe("http bridge server", () => {
       runtimeClient,
       sessionMapper: new InMemorySessionMapper()
     });
-    const compat = new Llm4ZoteroAgentBackendAdapter({ adapter: base });
+    const compat = new Llm4ZoteroAgentBackendAdapter({
+      adapter: base,
+      runtimeCwd: "/tmp/adapter-runtime",
+    });
+    const server = await startHttpBridgeServer({ adapter: compat });
+
+    try {
+      const runResponse = await fetch(`http://${server.host}:${server.port}/run-turn`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          conversationKey: "0042",
+          userText: "hello",
+          scopeType: "paper",
+          scopeId: "1:42",
+          scopeLabel: "Paper 42",
+        })
+      });
+      expect(runResponse.ok).toBe(true);
+      await readNdjsonLines(runResponse);
+
+      const sessionInfoResponse = await fetch(
+        `http://${server.host}:${server.port}/session-info?conversationKey=0042&scopeType=paper&scopeId=1%3A42&scopeLabel=Paper%2042`
+      );
+      expect(sessionInfoResponse.ok).toBe(true);
+      const payload = await sessionInfoResponse.json() as {
+        session?: {
+          originalConversationKey: string;
+          scopedConversationKey: string;
+          providerSessionId?: string;
+          runtimeCwdRelative?: string;
+          cwd?: string;
+        };
+      };
+      expect(seenKeys).toEqual(["0042::paper:1:42"]);
+      expect(payload.session).toEqual({
+        originalConversationKey: "0042",
+        scopedConversationKey: "0042::paper:1:42",
+        providerSessionId: "sess-http-string-key",
+        scopeType: "paper",
+        scopeId: "1:42",
+        scopeLabel: "Paper 42",
+        runtimeCwdRelative: "scopes/paper/1:42/conversations/0042",
+        cwd: "/tmp/adapter-runtime/scopes/paper/1:42/conversations/0042",
+      });
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("streams run-action endpoint with a single start line", async () => {
+    const compat = {
+      listTools() {
+        return [];
+      },
+      async listCommands() {
+        return [];
+      },
+      async listModels() {
+        return [];
+      },
+      async listEfforts() {
+        return [];
+      },
+      async getSessionInfo() {
+        return {
+          originalConversationKey: "conv-action-1",
+          scopedConversationKey: "conv-action-1",
+        };
+      },
+      resolveExternalConfirmation() {
+        return {
+          accepted: false,
+          source: "none" as const,
+          pendingPermissionCount: 0,
+          recentPendingRequestIds: [],
+        };
+      },
+      async runTurn() {
+        throw new Error("runTurn should not be called in this test");
+      },
+      async runAction(params: {
+        request: { conversationKey: string; toolName: string; args?: unknown };
+        onStart?: (runId: string) => void | Promise<void>;
+        onEvent?: (event: Record<string, unknown>) => void | Promise<void>;
+      }) {
+        expect(params.request.conversationKey).toBe("conv-action-1");
+        expect(params.request.toolName).toBe("Read");
+        expect(params.request.args).toEqual({ file_path: "README.md" });
+        await params.onStart?.("run-http-action");
+        await params.onEvent?.({
+          type: "tool_call",
+          callId: "call_1",
+          name: "Read",
+          args: { file_path: "README.md" },
+        });
+        return {
+          kind: "completed" as const,
+          runId: "run-http-action",
+          text: "done",
+          usedFallback: false as const,
+        };
+      },
+    } as unknown as Llm4ZoteroAgentBackendAdapter;
     const server = await startHttpBridgeServer({ adapter: compat });
 
     try {
@@ -157,9 +267,17 @@ describe("http bridge server", () => {
 
       expect(response.ok).toBe(true);
       const lines = await readNdjsonLines(response);
-      const types = lines.map((line) => line.type);
-      expect(types).toContain("start");
-      expect(types).toContain("outcome");
+      const starts = lines.filter((line) => line.type === "start");
+      expect(starts).toEqual([{ type: "start", runId: "run-http-action" }]);
+      expect(lines.at(-1)).toEqual({
+        type: "outcome",
+        outcome: {
+          kind: "completed",
+          runId: "run-http-action",
+          text: "done",
+          usedFallback: false,
+        },
+      });
     } finally {
       await server.close();
     }

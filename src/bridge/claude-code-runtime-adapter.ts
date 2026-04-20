@@ -21,6 +21,36 @@ export class ClaudeCodeRuntimeAdapter {
     this.traceStore = options.traceStore;
   }
 
+  private isStreamingDebugEnabled(): boolean {
+    return process.env.LLM4ZOTERO_BRIDGE_DEBUG_STREAMING === "1";
+  }
+
+  private logStreamingTiming(
+    stage: string,
+    details: {
+      conversationKey: string;
+      runId: string;
+      textLength?: number;
+      eventTs?: number;
+    },
+  ): void {
+    if (!this.isStreamingDebugEnabled()) return;
+    const now = Date.now();
+    console.log(
+      "[STREAMING]",
+      JSON.stringify({
+        stage,
+        conversationKey: details.conversationKey,
+        runId: details.runId,
+        textLength: details.textLength,
+        eventTs: details.eventTs,
+        localTs: now,
+        lagMs:
+          typeof details.eventTs === "number" ? Math.max(0, now - details.eventTs) : undefined,
+      }),
+    );
+  }
+
   async listRuntimeModels(
     options?: {
       settingSources?: Array<"user" | "project" | "local">;
@@ -71,9 +101,24 @@ export class ClaudeCodeRuntimeAdapter {
     return this.sessionMapper.get(conversationKey);
   }
 
+  async retainHotRuntime(request: RunTurnRequest, mountId: string): Promise<void> {
+    await this.runtimeClient.retainHotRuntime?.(request, mountId);
+  }
+
+  async releaseHotRuntime(conversationKey: string, mountId: string): Promise<void> {
+    await this.runtimeClient.releaseHotRuntime?.(conversationKey, mountId);
+  }
+
   async runTurn(request: RunTurnRequest, hooks: RunTurnHooks = {}): Promise<RunTurnOutcome> {
     const signal = hooks.signal ?? request.signal;
-    const initialSessionId = await this.sessionMapper.get(request.conversationKey);
+    const forceFreshSession = Boolean(
+      request.metadata &&
+        typeof request.metadata === "object" &&
+        (request.metadata as Record<string, unknown>).forceFreshSession === true,
+    );
+    const initialSessionId = forceFreshSession
+      ? undefined
+      : await this.sessionMapper.get(request.conversationKey);
     let firstOutcome: RunTurnOutcome;
     try {
       firstOutcome = await this.runTurnOnce(request, hooks, signal, initialSessionId);
@@ -85,8 +130,8 @@ export class ClaudeCodeRuntimeAdapter {
           type: "status",
           ts: Date.now(),
           payload: {
-            text: "Session signature mismatch detected. Retrying with a fresh Claude session."
-          }
+            text: "Session signature mismatch detected. Retrying with a fresh Claude session.",
+          },
         });
         return this.runTurnOnce(request, hooks, signal, undefined);
       }
@@ -98,8 +143,8 @@ export class ClaudeCodeRuntimeAdapter {
         type: "status",
         ts: Date.now(),
         payload: {
-          text: "Session signature mismatch detected. Retrying with a fresh Claude session."
-        }
+          text: "Session signature mismatch detected. Retrying with a fresh Claude session.",
+        },
       });
       firstOutcome = await this.runTurnOnce(request, hooks, signal, undefined);
     }
@@ -110,7 +155,7 @@ export class ClaudeCodeRuntimeAdapter {
     request: RunTurnRequest,
     hooks: RunTurnHooks,
     signal: AbortSignal | undefined,
-    providerSessionId: string | undefined
+    providerSessionId: string | undefined,
   ): Promise<RunTurnOutcome> {
     const stream = await this.runtimeClient.startTurn({
       conversationKey: request.conversationKey,
@@ -119,7 +164,7 @@ export class ClaudeCodeRuntimeAdapter {
       allowedTools: request.allowedTools,
       runtimeRequest: request.runtimeRequest,
       metadata: request.metadata,
-      signal
+      signal,
     });
 
     let resolvedSessionId = providerSessionId;
@@ -131,27 +176,74 @@ export class ClaudeCodeRuntimeAdapter {
     hooks.onStart?.({
       runId: stream.runId,
       conversationKey: request.conversationKey,
-      providerSessionId: stream.providerSessionId ?? providerSessionId
+      providerSessionId: stream.providerSessionId ?? providerSessionId,
     });
 
     let finalText = "";
+    let pendingTextDelta = "";
+    let lastTextDeltaTs: number | undefined;
+
+    const flushPendingTextDelta = async (): Promise<void> => {
+      if (!pendingTextDelta) return;
+      const mergedEvent: AgentEvent = {
+        type: "message_delta",
+        ts: Date.now(),
+        payload: {
+          delta: pendingTextDelta,
+        },
+      };
+      this.logStreamingTiming("emit_merged_message_delta", {
+        conversationKey: request.conversationKey,
+        runId: stream.runId,
+        textLength: pendingTextDelta.length,
+        eventTs: lastTextDeltaTs,
+      });
+      pendingTextDelta = "";
+      lastTextDeltaTs = undefined;
+      await this.emitEvent(stream.runId, request.conversationKey, mergedEvent, hooks);
+    };
 
     try {
       for await (const providerEvent of stream.events) {
         const event = mapProviderEvent(providerEvent);
         const eventSessionId = this.extractSessionId(event.payload);
-        if (eventSessionId && eventSessionId !== resolvedSessionId) {
+        const providerType =
+          event.type === "provider_event" && event.payload && typeof event.payload === "object"
+            ? (event.payload as Record<string, unknown>).providerType
+            : undefined;
+        const canAdoptSessionId =
+          providerType === "assistant" ||
+          providerType === "user" ||
+          providerType === "result" ||
+          event.type === "tool_call" ||
+          event.type === "tool_result" ||
+          event.type === "message_delta" ||
+          event.type === "final";
+        if (canAdoptSessionId && eventSessionId && eventSessionId !== resolvedSessionId) {
           resolvedSessionId = eventSessionId;
           await this.sessionMapper.set(request.conversationKey, eventSessionId);
         }
-        await this.emitEvent(stream.runId, request.conversationKey, event, hooks);
-
         if (event.type === "message_delta") {
           const delta = event.payload.delta;
           if (typeof delta === "string") {
+            pendingTextDelta += delta;
             finalText += delta;
+            lastTextDeltaTs = event.ts;
+            continue;
           }
         }
+
+        await flushPendingTextDelta();
+        if (event.type === "final") {
+          const output = event.payload.output;
+          this.logStreamingTiming("emit_final", {
+            conversationKey: request.conversationKey,
+            runId: stream.runId,
+            textLength: typeof output === "string" ? output.length : finalText.length,
+            eventTs: event.ts,
+          });
+        }
+        await this.emitEvent(stream.runId, request.conversationKey, event, hooks);
 
         if (event.type === "final") {
           const output = event.payload.output;
@@ -161,12 +253,19 @@ export class ClaudeCodeRuntimeAdapter {
         }
       }
 
+      await flushPendingTextDelta();
+      this.logStreamingTiming("return_outcome", {
+        conversationKey: request.conversationKey,
+        runId: stream.runId,
+        textLength: finalText.length,
+      });
+
       return {
         runId: stream.runId,
         conversationKey: request.conversationKey,
         providerSessionId: resolvedSessionId,
         status: signal?.aborted ? "cancelled" : "completed",
-        finalText
+        finalText,
       };
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
@@ -175,8 +274,8 @@ export class ClaudeCodeRuntimeAdapter {
         ts: Date.now(),
         payload: {
           reason: "runtime_error",
-          message: err.message
-        }
+          message: err.message,
+        },
       };
       await this.emitEvent(stream.runId, request.conversationKey, fallbackEvent, hooks);
 
@@ -186,7 +285,7 @@ export class ClaudeCodeRuntimeAdapter {
         providerSessionId: resolvedSessionId,
         status: signal?.aborted ? "cancelled" : "failed",
         finalText,
-        error: err.message
+        error: err.message,
       };
     }
   }
@@ -195,7 +294,7 @@ export class ClaudeCodeRuntimeAdapter {
     runId: string,
     conversationKey: string,
     event: AgentEvent,
-    hooks: RunTurnHooks
+    hooks: RunTurnHooks,
   ): Promise<void> {
     hooks.onEvent?.(event);
     if (this.traceStore) {
@@ -221,13 +320,13 @@ export class ClaudeCodeRuntimeAdapter {
     const normalized = message.toLowerCase();
     return (
       normalized.includes("invalid signature in thinking block") ||
-      normalized.includes("thinking block") && normalized.includes("invalid signature")
+      (normalized.includes("thinking block") && normalized.includes("invalid signature"))
     );
   }
 
   private shouldRetryForThinkingSignature(
     initialSessionId: string | undefined,
-    outcome: RunTurnOutcome
+    outcome: RunTurnOutcome,
   ): boolean {
     if (!initialSessionId) return false;
     if (outcome.status === "failed" && this.isInvalidThinkingSignatureError(outcome.error)) {
@@ -238,5 +337,4 @@ export class ClaudeCodeRuntimeAdapter {
     }
     return false;
   }
-
 }

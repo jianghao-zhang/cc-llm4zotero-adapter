@@ -3,6 +3,7 @@ import type { JsonObject } from "./types.js";
 export type ProviderEventType =
   | "provider_event"
   | "status"
+  | "reasoning"
   | "tool_call"
   | "tool_result"
   | "tool_error"
@@ -36,6 +37,8 @@ export interface RuntimeTurnStream {
 
 export interface ClaudeCodeRuntimeClient {
   startTurn(request: RuntimeTurnRequest): Promise<RuntimeTurnStream>;
+  retainHotRuntime?(request: RuntimeTurnRequest, mountId: string): Promise<void>;
+  releaseHotRuntime?(conversationKey: string, mountId: string): Promise<void>;
   listCommands?(
     options?: {
       settingSources?: Array<"user" | "project" | "local">;

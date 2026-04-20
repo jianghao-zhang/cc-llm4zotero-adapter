@@ -92,6 +92,42 @@ describe("mapSdkMessageToProviderEvents", () => {
     ]);
   });
 
+  it("maps stream_event tool_use block start to tool_call", () => {
+    const events = mapSdkMessageToProviderEvents({
+      type: "stream_event",
+      session_id: "sess-5",
+      event: {
+        type: "content_block_start",
+        index: 2,
+        content_block: {
+          type: "tool_use",
+          id: "tool_abc",
+          name: "Bash",
+          input: {},
+        },
+      },
+    });
+
+    expect(events).toEqual([
+      {
+        type: "provider_event",
+        payload: expect.objectContaining({
+          providerType: "stream_event",
+          sessionId: "sess-5",
+        }),
+      },
+      {
+        type: "tool_call",
+        payload: {
+          id: "tool_abc",
+          name: "Bash",
+          input: {},
+          sessionId: "sess-5",
+        },
+      },
+    ]);
+  });
+
   it("maps error result payload into final output text", () => {
     const events = mapSdkMessageToProviderEvents({
       type: "result",

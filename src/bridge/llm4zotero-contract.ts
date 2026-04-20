@@ -42,6 +42,15 @@ export interface Llm4ZoteroRunTurnRequest {
   metadata?: Record<string, unknown>;
 }
 
+export interface Llm4ZoteroRuntimeRetentionRequest {
+  conversationKey: string | number;
+  scopeType?: "paper" | "open" | "folder" | "tag" | "tagset" | "custom";
+  scopeId?: string;
+  scopeLabel?: string;
+  mountId: string;
+  retain: boolean;
+}
+
 export type Llm4ZoteroToolMutability = "read" | "write";
 export type Llm4ZoteroToolRiskLevel = "low" | "medium" | "high";
 export type Llm4ZoteroToolSource = "claude-runtime" | "zotero-bridge" | "mcp";

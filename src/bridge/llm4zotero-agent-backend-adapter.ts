@@ -4,7 +4,8 @@ import type {
   Llm4ZoteroRunActionParams,
   Llm4ZoteroRunTurnRequest,
   Llm4ZoteroRunTurnOutcome,
-  Llm4ZoteroRunTurnParams
+  Llm4ZoteroRunTurnParams,
+  Llm4ZoteroRuntimeRetentionRequest,
 } from "./llm4zotero-contract.js";
 import { mapToLlm4ZoteroEvent } from "../event-mapper/map-to-llm4zotero-event.js";
 import { findToolByName, getToolCatalog } from "./tool-catalog.js";
@@ -57,11 +58,12 @@ function normalizeScopeId(value: unknown): string | undefined {
 }
 
 function toSafePathSegment(value: string): string {
+  const invalidChars = process.platform === "win32" ? /[^\w.\-@]/g : /[^\w.\-:@]/g;
   return value
     .trim()
     .replace(/[\/\\]/g, "_")
     .replace(/\s+/g, "_")
-    .replace(/[^\w.\-]/g, "_")
+    .replace(invalidChars, "_")
     .replace(/_+/g, "_")
     .replace(/^_+|_+$/g, "")
     .slice(0, 120) || "unknown";
@@ -270,6 +272,42 @@ export class Llm4ZoteroAgentBackendAdapter {
       scopeLabel: scope?.scopeLabel,
       runtimeCwdRelative,
       cwd: resolveSessionCwd(this.runtimeCwd, runtimeCwdRelative),
+    };
+  }
+
+  async updateRuntimeRetention(params: Llm4ZoteroRuntimeRetentionRequest): Promise<{
+    originalConversationKey: string;
+    scopedConversationKey: string;
+    retained: boolean;
+  }> {
+    const originalConversationKey = String(params.conversationKey);
+    const scope = toScopeInfo(params);
+    const scopedConversationKey = buildScopedConversationKey(
+      originalConversationKey,
+      scope,
+    );
+    if (params.retain) {
+      await this.adapter.retainHotRuntime?.(
+        {
+          conversationKey: scopedConversationKey,
+          userMessage: "",
+          metadata: {
+            originalConversationKey,
+            scopeType: scope?.scopeType,
+            scopeId: scope?.scopeId,
+            scopeLabel: scope?.scopeLabel,
+            runtimeCwdRelative: buildRuntimeCwdRelative(scope, originalConversationKey),
+          },
+        },
+        params.mountId,
+      );
+    } else {
+      await this.adapter.releaseHotRuntime?.(scopedConversationKey, params.mountId);
+    }
+    return {
+      originalConversationKey,
+      scopedConversationKey,
+      retained: Boolean(params.retain),
     };
   }
 

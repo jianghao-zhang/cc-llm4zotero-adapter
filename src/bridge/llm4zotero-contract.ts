@@ -28,6 +28,20 @@ export type Llm4ZoteroAgentEvent =
     }
   | { type: "message_delta"; text: string }
   | { type: "message_rollback"; length: number; text: string }
+  | {
+      type: "usage";
+      inputTokens: number;
+      outputTokens: number;
+      cacheCreationInputTokens?: number;
+      cacheReadInputTokens?: number;
+      contextTokens: number;
+      contextWindow?: number;
+      contextWindowIsAuthoritative?: boolean;
+      percentage?: number;
+      sessionId?: string;
+      model?: string;
+    }
+  | { type: "context_compacted"; automatic?: boolean }
   | { type: "fallback"; reason: string }
   | { type: "final"; text: string };
 

@@ -10,6 +10,8 @@ export type HotRuntimeTurn = {
   runId: string;
   sessionId?: string;
   finalText: string;
+  awaitingAutoCompact: boolean;
+  compactOnly: boolean;
   queueEvent: (event: ProviderEvent) => void;
   finish: () => void;
   fail: (error: Error) => void;
@@ -28,6 +30,8 @@ export type HotRuntimeEntry = {
   closeInput: () => void;
   providerSessionId?: string;
   configSignature?: string;
+  providerIdentity?: string;
+  lastUsageSnapshot?: { contextTokens: number; contextWindow?: number };
   currentTurn: HotRuntimeTurn | null;
 };
 
@@ -110,6 +114,8 @@ export function createHotRuntimeTurn(runId: string): HotRuntimeTurn {
   return {
     runId,
     finalText: "",
+    awaitingAutoCompact: false,
+    compactOnly: false,
     queueEvent(event: ProviderEvent) {
       if (done || error) return;
       events.push(event);
@@ -161,6 +167,8 @@ export function createHotRuntimeEntry(conversationKey: string): HotRuntimeEntry 
     closeInput: channel.closeInput,
     providerSessionId: undefined,
     configSignature: undefined,
+    providerIdentity: undefined,
+    lastUsageSnapshot: undefined,
     currentTurn: null,
   };
 }

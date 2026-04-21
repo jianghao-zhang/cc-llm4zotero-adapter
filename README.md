@@ -192,14 +192,16 @@ npm run serve:bridge
 |------|-----|-------------|
 | `--host` | `ADAPTER_HOST` | Bind host (default `127.0.0.1`) |
 | `--port` | `ADAPTER_PORT` | Bind port (default `19787`) |
-| `--runtime-cwd` | `ADAPTER_RUNTIME_CWD` | Workspace root for Claude Agent SDK. Defaults to `$HOME/Zotero/agent-runtime` when `~/Zotero` exists. |
-| `--state-dir` | `ADAPTER_STATE_DIR` | Session/trace persistence directory. Defaults to `$HOME/Zotero/agent-state`. |
+| `--runtime-cwd` | `ADAPTER_RUNTIME_CWD` | Workspace root for Claude Agent SDK. Defaults to the legacy Zotero runtime path when available. |
+| `--state-dir` | `ADAPTER_STATE_DIR` | Session/trace persistence directory. Defaults to the legacy Zotero state path when available. |
+| `--zotero-root` | `ZOTERO_ROOT` | Override the legacy Zotero root used to derive default runtime/state paths. Useful when Zotero data is not under the home directory. |
 | `--additional-directories` | `ADAPTER_ADDITIONAL_DIRECTORIES` | Extra readable directories (comma-separated, `~` supported). |
 | `--default-allowed-tools` | `ADAPTER_DEFAULT_ALLOWED_TOOLS` | Tools always auto-allowed (comma-separated). Default: `WebFetch,WebSearch`. |
 | `--setting-sources` | `ADAPTER_SETTING_SOURCES` | Claude settings sources: `user`, `project`, `local` (comma-separated). Default: `project,local`. |
 | `--append-system-prompt` | `ADAPTER_APPEND_SYSTEM_PROMPT` | Inline overlay prompt text. |
-| `--append-system-prompt-file` | `ADAPTER_APPEND_SYSTEM_PROMPT_FILE` | File-based overlay prompt. |
-| `--forward-frontend-model` | `ADAPTER_FORWARD_FRONTEND_MODEL` | Pass frontend `metadata.model` to runtime (default `true`). |
+| `--append-system-prompt-file` | `ADAPTER_APPEND_SYSTEM_PROMPT_FILE` | File-based overlay prompt. Missing optional files are ignored. |
+| `--forward-frontend-model` | `ADAPTER_FORWARD_FRONTEND_MODEL` | Pass frontend `metadata.model` to runtime (default `true`). Generic aliases like `opus`, `sonnet`, and `haiku` are forwarded when the SDK accepts them. |
+| `--log-file` | `ADAPTER_LOG_FILE` | Mirror bridge stdout/stderr to a file. Use `1` / `true` to write to `<state-dir>/bridge.log`. |
 
 Default additional readable directories:
 
@@ -251,9 +253,13 @@ That usually means one of these layers is wrong:
 
 ### Logs
 
+Daemon logs on macOS still live under:
+
 ```bash
 ~/Library/Logs/cc-llm4zotero-adapter/
 ```
+
+If the bridge is started without an attached terminal and you also want a plain bridge process log, set `ADAPTER_LOG_FILE=1` (or pass `--log-file`) to mirror stdout/stderr into `<state-dir>/bridge.log`.
 
 ## Repository Layout
 

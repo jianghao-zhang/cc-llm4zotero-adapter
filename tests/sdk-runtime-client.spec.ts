@@ -1,9 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { ClaudeCodeRuntimeAdapter } from "../src/bridge/claude-code-runtime-adapter.js";
 import { ClaudeAgentSdkRuntimeClient } from "../src/providers/claude-agent-sdk-runtime-client.js";
+import { setCachedModels } from "../src/providers/model-resolver.js";
 import { InMemorySessionMapper } from "../src/session-link/session-mapper.js";
 
-function makeStream(items: unknown[]): AsyncIterable<unknown> {
+function makeStream(items: unknown[]): any {
   return {
     async *[Symbol.asyncIterator]() {
       for (const item of items) {
@@ -14,6 +15,22 @@ function makeStream(items: unknown[]): AsyncIterable<unknown> {
 }
 
 describe("ClaudeAgentSdkRuntimeClient", () => {
+  const originalHome = process.env.HOME;
+  const originalUserProfile = process.env.USERPROFILE;
+
+  afterEach(() => {
+    if (originalHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = originalHome;
+    }
+    if (originalUserProfile === undefined) {
+      delete process.env.USERPROFILE;
+    } else {
+      process.env.USERPROFILE = originalUserProfile;
+    }
+  });
+
   it("passes resume/allowedTools into query options and maps messages", async () => {
     let seenPrompt = "";
     let seenOptions: Record<string, unknown> = {};
@@ -21,7 +38,7 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
     const runtime = new ClaudeAgentSdkRuntimeClient({
       settingSources: ["user", "project"],
       queryImpl(args) {
-        seenPrompt = args.prompt;
+        seenPrompt = typeof args.prompt === "string" ? args.prompt : "";
         seenOptions = args.options;
         return makeStream([
           { type: "system", session_id: "session-new", subtype: "init" },
@@ -123,6 +140,30 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
     expect(seenOptions.appendSystemPrompt).toBe("Use evidence-first reading style.");
   });
 
+  it("falls back to USERPROFILE for user settings path", async () => {
+    let seenOptions: Record<string, unknown> = {};
+
+    delete process.env.HOME;
+    process.env.USERPROFILE = "/tmp/windows-home";
+
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      settingSources: ["user"],
+      queryImpl(args) {
+        seenOptions = args.options;
+        return makeStream([
+          { type: "result", session_id: "session-new", result: "ok", is_error: false }
+        ]);
+      }
+    });
+
+    await runtime.startTurn({
+      conversationKey: "conv-1",
+      userMessage: "hello"
+    });
+
+    expect(String(seenOptions.appendSystemPrompt)).toContain("/tmp/windows-home/.claude/settings.json");
+  });
+
   it("adapter updates session mapper from streamed sessionId", async () => {
     const runtime = new ClaudeAgentSdkRuntimeClient({
       queryImpl() {
@@ -146,5 +187,57 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
 
     expect(outcome.providerSessionId).toBe("sess-live");
     expect(await sessionMapper.get("conv-session")).toBe("sess-live");
+  });
+
+  it("keeps hot runtime when resolved model changes after cache warmup", async () => {
+    setCachedModels(["user", "project"], []);
+    let queryCount = 0;
+    const seenResumes: Array<unknown> = [];
+    let turnIndex = 0;
+
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      forwardFrontendModel: true,
+      settingSources: ["user", "project"],
+      queryImpl(args) {
+        queryCount += 1;
+        const options = args.options as Record<string, unknown>;
+        seenResumes.push(options.resume);
+        const prompt = args.prompt as AsyncIterable<unknown>;
+        return {
+          async *[Symbol.asyncIterator]() {
+            for await (const _message of prompt) {
+              turnIndex += 1;
+              yield { type: "system", session_id: "sess-hot", subtype: "init" };
+              yield { type: "result", session_id: "sess-hot", result: `ok-${turnIndex}`, is_error: false };
+            }
+          }
+        } as any;
+      }
+    });
+
+    await runtime.retainHotRuntime({ conversationKey: "conv-hot", userMessage: "" }, "mount-1");
+
+    const first = await runtime.startTurn({
+      conversationKey: "conv-hot",
+      userMessage: "hello",
+      metadata: { model: "sonnet" }
+    });
+    for await (const _event of first.events) {
+      void _event;
+    }
+
+    setCachedModels(["user", "project"], [{ value: "claude-sonnet-4-6" }]);
+
+    const second = await runtime.startTurn({
+      conversationKey: "conv-hot",
+      userMessage: "again",
+      metadata: { model: "sonnet" }
+    });
+    for await (const _event of second.events) {
+      void _event;
+    }
+
+    expect(queryCount).toBe(1);
+    expect(seenResumes).toEqual([undefined]);
   });
 });

@@ -97,41 +97,137 @@ export class ClaudeCodeRuntimeAdapter {
     }
   }
 
+  private buildSessionMapKey(requestOrConversationKey: RunTurnRequest | string): string {
+    if (typeof requestOrConversationKey === "string") {
+      return requestOrConversationKey;
+    }
+    const metadata =
+      requestOrConversationKey.metadata && typeof requestOrConversationKey.metadata === "object"
+        ? (requestOrConversationKey.metadata as Record<string, unknown>)
+        : {};
+    const providerIdentity =
+      typeof metadata.providerIdentity === "string" && metadata.providerIdentity.trim()
+        ? metadata.providerIdentity.trim()
+        : "";
+    return providerIdentity
+      ? `${requestOrConversationKey.conversationKey}::provider:${providerIdentity}`
+      : requestOrConversationKey.conversationKey;
+  }
+
   async getMappedProviderSessionId(conversationKey: string): Promise<string | undefined> {
     return this.sessionMapper.get(conversationKey);
   }
 
+  async retainHotRuntime(request: RunTurnRequest, mountId: string): Promise<void> {
+    await this.runtimeClient.retainHotRuntime?.(request, mountId);
+  }
+
+  async releaseHotRuntime(conversationKey: string, mountId: string): Promise<void> {
+    await this.runtimeClient.releaseHotRuntime?.(conversationKey, mountId);
+  }
+
+  private extractProviderIdentity(request: RunTurnRequest): string {
+    const metadata =
+      request.metadata && typeof request.metadata === "object"
+        ? (request.metadata as Record<string, unknown>)
+        : {};
+    return typeof metadata.providerIdentity === "string" ? metadata.providerIdentity.trim() : "";
+  }
+
   async runTurn(request: RunTurnRequest, hooks: RunTurnHooks = {}): Promise<RunTurnOutcome> {
     const signal = hooks.signal ?? request.signal;
-    const initialSessionId = await this.sessionMapper.get(request.conversationKey);
+    const forceFreshSession = Boolean(
+      request.metadata &&
+        typeof request.metadata === "object" &&
+        (request.metadata as Record<string, unknown>).forceFreshSession === true,
+    );
+    const sessionMapKey = this.buildSessionMapKey(request);
+    const initialSessionId = forceFreshSession
+      ? undefined
+      : await this.sessionMapper.get(sessionMapKey);
+    const metadata =
+      request.metadata && typeof request.metadata === "object"
+        ? (request.metadata as Record<string, unknown>)
+        : {};
+    const autoCompactEligible = metadata.claudeAutoCompactEligible === true;
+    const rawThreshold = Number(metadata.claudeAutoCompactThresholdPercent);
+    const estimatedContextTokens = Math.max(0, Number(metadata.claudeEstimatedContextTokens) || 0);
+    const shouldPreCompact =
+      autoCompactEligible &&
+      !/^\/compact(?:\s|$)/i.test(request.userMessage.trim()) &&
+      Number.isFinite(rawThreshold) &&
+      (Math.max(0, Math.min(99, Math.round(rawThreshold))) === 0
+        ? estimatedContextTokens > 0
+        : estimatedContextTokens > 0 && estimatedContextTokens / 200_000 >= rawThreshold / 100);
+
+    let providerSessionId = initialSessionId;
+    if (shouldPreCompact) {
+      await hooks.onEvent?.({
+        type: "status",
+        ts: Date.now(),
+        payload: {
+          text: "Compacting context…",
+        },
+      });
+      const compactRequest: RunTurnRequest = {
+        ...request,
+        userMessage: "/compact",
+        metadata: {
+          ...metadata,
+          claudeAutoCompactEligible: false,
+        },
+      };
+      const compactOutcome = await this.runTurnOnce(compactRequest, hooks, signal, providerSessionId);
+      providerSessionId = compactOutcome.providerSessionId ?? providerSessionId;
+      if (compactOutcome.status !== "completed") {
+        return compactOutcome;
+      }
+    }
+
     let firstOutcome: RunTurnOutcome;
     try {
-      firstOutcome = await this.runTurnOnce(request, hooks, signal, initialSessionId);
+      firstOutcome = await this.runTurnOnce(request, hooks, signal, providerSessionId);
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
-      if (initialSessionId && this.isInvalidThinkingSignatureError(err.message)) {
-        await this.sessionMapper.delete(request.conversationKey);
+      if (providerSessionId && this.isInvalidThinkingSignatureError(err.message)) {
+        await this.sessionMapper.delete(sessionMapKey);
         await hooks.onEvent?.({
           type: "status",
           ts: Date.now(),
           payload: {
-            text: "Session signature mismatch detected. Retrying with a fresh Claude session."
-          }
+            text: "Session signature mismatch detected. Retrying with a fresh Claude session.",
+          },
         });
         return this.runTurnOnce(request, hooks, signal, undefined);
       }
       throw err;
     }
-    if (this.shouldRetryForThinkingSignature(initialSessionId, firstOutcome)) {
-      await this.sessionMapper.delete(request.conversationKey);
+    if (this.shouldRetryForThinkingSignature(providerSessionId, firstOutcome)) {
+      await this.sessionMapper.delete(sessionMapKey);
       await hooks.onEvent?.({
         type: "status",
         ts: Date.now(),
         payload: {
-          text: "Session signature mismatch detected. Retrying with a fresh Claude session."
-        }
+          text: "Session signature mismatch detected. Retrying with a fresh Claude session.",
+        },
       });
       firstOutcome = await this.runTurnOnce(request, hooks, signal, undefined);
+    }
+    if (
+      providerSessionId &&
+      firstOutcome.providerSessionId &&
+      firstOutcome.providerSessionId !== providerSessionId &&
+      this.extractProviderIdentity(request)
+    ) {
+      await this.sessionMapper.delete(sessionMapKey);
+      await hooks.onEvent?.({
+        type: "status",
+        ts: Date.now(),
+        payload: {
+          text: "Claude runtime changed. Rebuilding this conversation on the new runtime while keeping local context.",
+        },
+      });
+      return this.runTurnOnce(request, hooks, signal, undefined);
     }
     return firstOutcome;
   }
@@ -140,8 +236,9 @@ export class ClaudeCodeRuntimeAdapter {
     request: RunTurnRequest,
     hooks: RunTurnHooks,
     signal: AbortSignal | undefined,
-    providerSessionId: string | undefined
+    providerSessionId: string | undefined,
   ): Promise<RunTurnOutcome> {
+    const sessionMapKey = this.buildSessionMapKey(request);
     const stream = await this.runtimeClient.startTurn({
       conversationKey: request.conversationKey,
       userMessage: request.userMessage,
@@ -149,19 +246,19 @@ export class ClaudeCodeRuntimeAdapter {
       allowedTools: request.allowedTools,
       runtimeRequest: request.runtimeRequest,
       metadata: request.metadata,
-      signal
+      signal,
     });
 
     let resolvedSessionId = providerSessionId;
     if (stream.providerSessionId) {
       resolvedSessionId = stream.providerSessionId;
-      await this.sessionMapper.set(request.conversationKey, stream.providerSessionId);
+      await this.sessionMapper.set(sessionMapKey, stream.providerSessionId);
     }
 
     hooks.onStart?.({
       runId: stream.runId,
       conversationKey: request.conversationKey,
-      providerSessionId: stream.providerSessionId ?? providerSessionId
+      providerSessionId: stream.providerSessionId ?? providerSessionId,
     });
 
     let finalText = "";
@@ -206,7 +303,7 @@ export class ClaudeCodeRuntimeAdapter {
           event.type === "final";
         if (canAdoptSessionId && eventSessionId && eventSessionId !== resolvedSessionId) {
           resolvedSessionId = eventSessionId;
-          await this.sessionMapper.set(request.conversationKey, eventSessionId);
+          await this.sessionMapper.set(sessionMapKey, eventSessionId);
         }
         if (event.type === "message_delta") {
           const delta = event.payload.delta;
@@ -250,7 +347,7 @@ export class ClaudeCodeRuntimeAdapter {
         conversationKey: request.conversationKey,
         providerSessionId: resolvedSessionId,
         status: signal?.aborted ? "cancelled" : "completed",
-        finalText
+        finalText,
       };
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
@@ -259,8 +356,8 @@ export class ClaudeCodeRuntimeAdapter {
         ts: Date.now(),
         payload: {
           reason: "runtime_error",
-          message: err.message
-        }
+          message: err.message,
+        },
       };
       await this.emitEvent(stream.runId, request.conversationKey, fallbackEvent, hooks);
 
@@ -270,7 +367,7 @@ export class ClaudeCodeRuntimeAdapter {
         providerSessionId: resolvedSessionId,
         status: signal?.aborted ? "cancelled" : "failed",
         finalText,
-        error: err.message
+        error: err.message,
       };
     }
   }
@@ -279,7 +376,7 @@ export class ClaudeCodeRuntimeAdapter {
     runId: string,
     conversationKey: string,
     event: AgentEvent,
-    hooks: RunTurnHooks
+    hooks: RunTurnHooks,
   ): Promise<void> {
     hooks.onEvent?.(event);
     if (this.traceStore) {
@@ -305,13 +402,13 @@ export class ClaudeCodeRuntimeAdapter {
     const normalized = message.toLowerCase();
     return (
       normalized.includes("invalid signature in thinking block") ||
-      normalized.includes("thinking block") && normalized.includes("invalid signature")
+      (normalized.includes("thinking block") && normalized.includes("invalid signature"))
     );
   }
 
   private shouldRetryForThinkingSignature(
     initialSessionId: string | undefined,
-    outcome: RunTurnOutcome
+    outcome: RunTurnOutcome,
   ): boolean {
     if (!initialSessionId) return false;
     if (outcome.status === "failed" && this.isInvalidThinkingSignatureError(outcome.error)) {
@@ -322,5 +419,4 @@ export class ClaudeCodeRuntimeAdapter {
     }
     return false;
   }
-
 }

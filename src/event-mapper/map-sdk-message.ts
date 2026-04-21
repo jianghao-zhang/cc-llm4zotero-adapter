@@ -14,6 +14,11 @@ interface ClaudeContentBlock {
 
 interface MessageContainer {
   content?: ClaudeContentBlock[];
+  usage?: Record<string, unknown>;
+}
+
+interface ModelUsageEntry {
+  contextWindow?: unknown;
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -25,6 +30,66 @@ function getSessionId(msg: unknown): string | undefined {
   if (typeof record.sessionId === "string" && record.sessionId.trim()) return record.sessionId.trim();
   if (typeof record.session_id === "string" && record.session_id.trim()) return record.session_id.trim();
   return undefined;
+}
+
+function asFiniteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function normalizeUsagePayload(args: {
+  usage?: Record<string, unknown> | undefined;
+  modelUsage?: Record<string, ModelUsageEntry> | undefined;
+  sessionId?: string;
+}): ProviderEvent | null {
+  const inputTokens = asFiniteNumber(args.usage?.input_tokens) ?? asFiniteNumber(args.usage?.inputTokens) ?? 0;
+  const outputTokens = asFiniteNumber(args.usage?.output_tokens) ?? asFiniteNumber(args.usage?.outputTokens) ?? 0;
+  const cacheCreationInputTokens =
+    asFiniteNumber(args.usage?.cache_creation_input_tokens) ??
+    asFiniteNumber(args.usage?.cacheCreationInputTokens) ??
+    0;
+  const cacheReadInputTokens =
+    asFiniteNumber(args.usage?.cache_read_input_tokens) ??
+    asFiniteNumber(args.usage?.cacheReadInputTokens) ??
+    0;
+  const contextTokens = Math.max(0, inputTokens + cacheCreationInputTokens + cacheReadInputTokens);
+
+  let model: string | undefined;
+  let contextWindow: number | undefined;
+  const modelUsageEntries = args.modelUsage ? Object.entries(args.modelUsage) : [];
+  if (modelUsageEntries.length === 1) {
+    const [modelName, entry] = modelUsageEntries[0]!;
+    model = modelName || undefined;
+    contextWindow = asFiniteNumber(entry?.contextWindow);
+  }
+
+  if (
+    contextTokens <= 0 &&
+    !(typeof contextWindow === "number" && Number.isFinite(contextWindow) && contextWindow > 0)
+  ) {
+    return null;
+  }
+
+  const percentage =
+    typeof contextWindow === "number" && Number.isFinite(contextWindow) && contextWindow > 0
+      ? Math.max(0, Math.min(100, Math.round((contextTokens / contextWindow) * 100)))
+      : undefined;
+
+  return {
+    type: "usage",
+    payload: {
+      inputTokens,
+      outputTokens,
+      cacheCreationInputTokens,
+      cacheReadInputTokens,
+      contextTokens,
+      contextWindow,
+      contextWindowIsAuthoritative:
+        typeof contextWindow === "number" && Number.isFinite(contextWindow) && contextWindow > 0,
+      percentage,
+      sessionId: args.sessionId,
+      model,
+    },
+  };
 }
 
 function normalizeToolResultContent(content: unknown): string {
@@ -161,7 +226,24 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
   if (type === "assistant") {
     const events: ProviderEvent[] = [providerEvent];
     const message = asRecord(msg.message) as MessageContainer;
-    for (const block of Array.isArray(message.content) ? message.content : []) {
+    const contentBlocks = Array.isArray(message.content) ? message.content : [];
+     const parentToolUseId =
+      (typeof msg.parent_tool_use_id === "string" && msg.parent_tool_use_id.trim())
+        ? msg.parent_tool_use_id.trim()
+        : null;
+    const usageEvent =
+      parentToolUseId === null
+        ? normalizeUsagePayload({
+            usage: message.usage,
+            sessionId,
+          })
+        : null;
+    if (usageEvent) {
+      events.push(usageEvent);
+    }
+    const hasText = contentBlocks.some((block) => block.type === "text" && typeof block.text === "string");
+    const hasToolUse = contentBlocks.some((block) => block.type === "tool_use");
+    for (const block of contentBlocks) {
       if (block.type === "text" && typeof block.text === "string") {
         events.push({
           type: "message_delta",
@@ -170,6 +252,17 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
             sessionId,
             source: "assistant"
           }
+        });
+      }
+      if (hasText && hasToolUse && block.type === "tool_use") {
+        events.push({
+          type: "tool_call",
+          payload: {
+            id: typeof block.id === "string" ? block.id : undefined,
+            name: typeof block.name === "string" ? block.name : undefined,
+            input: block.input,
+            sessionId,
+          },
         });
       }
     }
@@ -211,24 +304,44 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
 
   if (type === "result") {
     const output = extractResultOutput(msg);
-    return [
-      providerEvent,
-      {
-        type: "final",
-        payload: {
-          output,
-          isError: Boolean(msg.is_error),
-          subtype: msg.subtype,
-          durationMs: msg.duration_ms,
-          numTurns: msg.num_turns,
-          sessionId
-        }
+    const events: ProviderEvent[] = [providerEvent];
+    const usageEvent = normalizeUsagePayload({
+      modelUsage: asRecord(msg.modelUsage) as Record<string, ModelUsageEntry> | undefined,
+      sessionId,
+    });
+    if (usageEvent) {
+      events.push(usageEvent);
+    }
+    events.push({
+      type: "final",
+      payload: {
+        output,
+        isError: Boolean(msg.is_error),
+        subtype: msg.subtype,
+        durationMs: msg.duration_ms,
+        numTurns: msg.num_turns,
+        sessionId
       }
-    ];
+    });
+    return events;
   }
 
   if (type === "system") {
     const subtype = typeof msg.subtype === "string" ? msg.subtype.trim() : "";
+    if (subtype === "compact_boundary") {
+      return [
+        providerEvent,
+        {
+          type: "context_compacted",
+          payload: {
+            automatic: false,
+            phase: "system",
+            subtype,
+            sessionId,
+          },
+        },
+      ];
+    }
     const text =
       subtype === "hook_started"
         ? `Running ${typeof msg.hook_name === "string" && msg.hook_name.trim() ? msg.hook_name.trim() : "runtime hook"}`
@@ -237,7 +350,7 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
           : subtype === "init"
             ? "Initializing Claude session"
             : subtype === "api_retry"
-              ? "Retrying provider request"
+              ? "Rebuilding Claude session after runtime change"
               : subtype
                 ? `System event: ${subtype}`
                 : "System event";

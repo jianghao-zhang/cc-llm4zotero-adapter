@@ -11,6 +11,8 @@ export type ProviderEventType =
   | "confirmation_resolved"
   | "message_delta"
   | "message_rollback"
+  | "usage"
+  | "context_compacted"
   | "final"
   | "unknown";
 
@@ -37,6 +39,8 @@ export interface RuntimeTurnStream {
 
 export interface ClaudeCodeRuntimeClient {
   startTurn(request: RuntimeTurnRequest): Promise<RuntimeTurnStream>;
+  retainHotRuntime?(request: RuntimeTurnRequest, mountId: string): Promise<void>;
+  releaseHotRuntime?(conversationKey: string, mountId: string): Promise<void>;
   listCommands?(
     options?: {
       settingSources?: Array<"user" | "project" | "local">;

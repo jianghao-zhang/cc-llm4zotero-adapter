@@ -12,6 +12,8 @@ const SUPPORTED_TYPES = new Set([
   "confirmation_resolved",
   "message_delta",
   "message_rollback",
+  "usage",
+  "context_compacted",
   "final"
 ]);
 

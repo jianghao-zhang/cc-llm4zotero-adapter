@@ -28,6 +28,20 @@ export type Llm4ZoteroAgentEvent =
     }
   | { type: "message_delta"; text: string }
   | { type: "message_rollback"; length: number; text: string }
+  | {
+      type: "usage";
+      inputTokens: number;
+      outputTokens: number;
+      cacheCreationInputTokens?: number;
+      cacheReadInputTokens?: number;
+      contextTokens: number;
+      contextWindow?: number;
+      contextWindowIsAuthoritative?: boolean;
+      percentage?: number;
+      sessionId?: string;
+      model?: string;
+    }
+  | { type: "context_compacted"; automatic?: boolean }
   | { type: "fallback"; reason: string }
   | { type: "final"; text: string };
 
@@ -40,6 +54,15 @@ export interface Llm4ZoteroRunTurnRequest {
   scopeLabel?: string;
   runtimeRequest?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
+}
+
+export interface Llm4ZoteroRuntimeRetentionRequest {
+  conversationKey: string | number;
+  scopeType?: "paper" | "open" | "folder" | "tag" | "tagset" | "custom";
+  scopeId?: string;
+  scopeLabel?: string;
+  mountId: string;
+  retain: boolean;
 }
 
 export type Llm4ZoteroToolMutability = "read" | "write";

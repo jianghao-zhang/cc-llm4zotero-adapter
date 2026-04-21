@@ -102,6 +102,31 @@ export function mapToLlm4ZoteroEvent(event: AgentEvent): Llm4ZoteroAgentEvent | 
         text: asString(payload.text)
       };
     }
+    case "usage": {
+      return {
+        type: "usage",
+        inputTokens: asNumber(payload.inputTokens),
+        outputTokens: asNumber(payload.outputTokens),
+        cacheCreationInputTokens: asNumber(payload.cacheCreationInputTokens),
+        cacheReadInputTokens: asNumber(payload.cacheReadInputTokens),
+        contextTokens: asNumber(payload.contextTokens),
+        contextWindow: typeof payload.contextWindow === "number" && Number.isFinite(payload.contextWindow)
+          ? payload.contextWindow
+          : undefined,
+        contextWindowIsAuthoritative: payload.contextWindowIsAuthoritative === true,
+        percentage: typeof payload.percentage === "number" && Number.isFinite(payload.percentage)
+          ? payload.percentage
+          : undefined,
+        sessionId: asString(payload.sessionId) || undefined,
+        model: asString(payload.model) || undefined,
+      };
+    }
+    case "context_compacted": {
+      return {
+        type: "context_compacted",
+        automatic: payload.automatic === true,
+      };
+    }
     case "fallback": {
       const reason = asString(payload.reason) || "fallback";
       return {

@@ -15,13 +15,10 @@ import {
   readFileSync,
   writeFileSync,
 } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { resolve } from "node:path";
 
-// Tee console.log / console.error to a log file so output survives even when
-// the bridge is spawned without an attached terminal (e.g. by the Zotero
-// plugin via Subprocess.call). The target path is derived below once we know
-// the state dir.
 function installFileLogger(filePath: string): void {
   try {
     mkdirSync(resolve(filePath, ".."), { recursive: true });
@@ -34,13 +31,15 @@ function installFileLogger(filePath: string): void {
           `${new Date().toISOString()} [${level}] ` +
           args
             .map((a) =>
-              typeof a === "string" ? a : (() => {
-                try {
-                  return JSON.stringify(a);
-                } catch {
-                  return String(a);
-                }
-              })(),
+              typeof a === "string"
+                ? a
+                : (() => {
+                    try {
+                      return JSON.stringify(a);
+                    } catch {
+                      return String(a);
+                    }
+                  })(),
             )
             .join(" ") +
           "\n";
@@ -133,8 +132,6 @@ function readTextFile(path: string | undefined): string {
   try {
     return readFileSync(path, "utf8").trim();
   } catch (error) {
-    // Missing optional files (e.g. CLAUDE.md, append-system-prompt-file) must
-    // not prevent the bridge from starting. Only surface non-ENOENT errors.
     const code = (error as NodeJS.ErrnoException | null)?.code;
     if (code === "ENOENT") return "";
     const message = error instanceof Error ? error.message : String(error);
@@ -169,6 +166,7 @@ async function main() {
   const homeDir = (
     process.env.HOME ||
     process.env.USERPROFILE ||
+    homedir() ||
     ""
   ).trim() || undefined;
   const explicitZoteroRoot = (
@@ -204,10 +202,6 @@ async function main() {
 
   mkdirSync(runtimeCwd, { recursive: true });
   mkdirSync(stateDirResolved, { recursive: true });
-  // Opt-in diagnostic log file. Set ADAPTER_LOG_FILE to any path (absolute or
-  // relative to cwd) to enable, or "1"/"true" to write to <stateDir>/bridge.log.
-  // Useful when the bridge is spawned without an attached terminal (e.g. via
-  // Zotero's Subprocess API), which otherwise drops all stdout/stderr output.
   const rawLogFileSetting =
     getArg("log-file") ?? process.env.ADAPTER_LOG_FILE ?? "";
   const logFileSetting = rawLogFileSetting.trim();

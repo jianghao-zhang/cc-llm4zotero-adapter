@@ -21,12 +21,13 @@ const modelCache = new Map<
 
 const CACHE_TTL_MS = 60_000; // 1 minute cache
 
-function getCacheKey(settingSources: string[]): string {
-  return settingSources.join(",");
+function getCacheKey(settingSources: string[], providerKey = "default"): string {
+  return `${providerKey}::${settingSources.join(",")}`;
 }
 
 export function getCachedModels(
-  settingSources: string[]
+  settingSources: string[],
+  providerKey?: string,
 ): ModelInfo[] | undefined {
   const key = getCacheKey(settingSources);
   const cached = modelCache.get(key);
@@ -38,9 +39,10 @@ export function getCachedModels(
 
 export function setCachedModels(
   settingSources: string[],
-  models: ModelInfo[]
+  models: ModelInfo[],
+  providerKey?: string,
 ): void {
-  const key = getCacheKey(settingSources);
+  const key = getCacheKey(settingSources, providerKey);
   modelCache.set(key, {
     models,
     expiresAt: Date.now() + CACHE_TTL_MS,
@@ -152,7 +154,8 @@ function resolveModelFromEnv(alias: string): string | undefined {
  */
 export function resolveModelWithCache(
   alias: string,
-  settingSources: string[]
+  settingSources: string[],
+  providerKey?: string,
 ): { model: string | undefined; cacheHit: boolean } {
   const normalizedAlias = alias.toLowerCase().trim();
 
@@ -161,7 +164,7 @@ export function resolveModelWithCache(
     return { model: normalizedAlias, cacheHit: true };
   }
 
-  const cached = getCachedModels(settingSources);
+  const cached = getCachedModels(settingSources, providerKey);
   if (cached) {
     return { model: resolveModelAlias(alias, cached), cacheHit: true };
   }

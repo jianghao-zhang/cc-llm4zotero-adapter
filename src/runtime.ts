@@ -11,6 +11,8 @@ export type ProviderEventType =
   | "confirmation_resolved"
   | "message_delta"
   | "message_rollback"
+  | "usage"
+  | "context_compacted"
   | "final"
   | "unknown";
 

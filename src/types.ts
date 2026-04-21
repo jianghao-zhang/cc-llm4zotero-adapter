@@ -9,6 +9,8 @@ export type AgentEventType =
   | "confirmation_resolved"
   | "message_delta"
   | "message_rollback"
+  | "usage"
+  | "context_compacted"
   | "final"
   | "fallback";
 

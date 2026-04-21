@@ -50,7 +50,7 @@ describe("mapSdkMessageToProviderEvents", () => {
     expect(apiRetry).toContainEqual({
       type: "status",
       payload: expect.objectContaining({
-        text: "Retrying provider request",
+        text: "Rebuilding Claude session after runtime change",
       }),
     });
   });

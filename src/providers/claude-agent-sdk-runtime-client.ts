@@ -916,16 +916,21 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
         : "default");
     let resolvedModel: string | undefined;
     if (shouldForwardFrontendModel && requestedModelRaw && requestedModelRaw.toLowerCase() !== "default" && requestedModelRaw.toLowerCase() !== "auto") {
-      const liveModels = await this.listModels({ settingSources: effectiveSettingSources, providerKey });
-      const normalizedRequested = requestedModelRaw.trim().toLowerCase();
+      const modelInfos = await this.readSupportedModelsFromSdk({
+        settingSources: effectiveSettingSources,
+        providerKey,
+      });
       const normalizedResolved = resolveModelAlias(
         requestedModelRaw,
-        liveModels.map((value) => ({ value })),
+        modelInfos,
       )?.trim().toLowerCase();
-      const isGenericAlias =
-        normalizedRequested === "sonnet" || normalizedRequested === "opus" || normalizedRequested === "haiku";
-      if (normalizedResolved && !(isGenericAlias && normalizedResolved === normalizedRequested)) {
+      if (normalizedResolved) {
         resolvedModel = normalizedResolved;
+      } else {
+        const rawLower = requestedModelRaw.trim().toLowerCase();
+        if (rawLower === "opus" || rawLower === "sonnet" || rawLower === "haiku") {
+          resolvedModel = rawLower;
+        }
       }
     }
     const modelForSdk = resolvedModel;

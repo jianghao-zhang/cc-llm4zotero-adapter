@@ -164,6 +164,43 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
     expect(String(seenOptions.appendSystemPrompt)).toContain("/tmp/windows-home/.claude/settings.json");
   });
 
+  it("includes paper, attachment, and note context in prompt text", async () => {
+    let seenPrompt: unknown;
+
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      queryImpl(args) {
+        seenPrompt = args.prompt;
+        return makeStream([
+          { type: "result", session_id: "session-new", result: "ok", is_error: false }
+        ]);
+      }
+    });
+
+    await runtime.startTurn({
+      conversationKey: "conv-light",
+      userMessage: "hello",
+      runtimeRequest: {
+        selectedPaperContexts: [{ title: "Paper A", contextItemId: 1, contextFilePath: "/tmp/a.md" }],
+        fullTextPaperContexts: [{ title: "Paper B", contextItemId: 2, contextFilePath: "/tmp/b.md" }],
+        pinnedPaperContexts: [{ title: "Paper C", contextItemId: 3, contextFilePath: "/tmp/c.md" }],
+        attachments: [{ name: "notes.txt", storedPath: "/tmp/notes.txt", mimeType: "text/plain" }],
+        activeNoteContext: { title: "Note", noteText: "content" },
+      } as Record<string, unknown>,
+    });
+
+    expect(typeof seenPrompt).toBe("string");
+    expect(String(seenPrompt)).toContain("Selected papers for this turn:");
+    expect(String(seenPrompt)).toContain("Paper A");
+    expect(String(seenPrompt)).toContain("Papers marked for full-text reading on this turn:");
+    expect(String(seenPrompt)).toContain("Paper B");
+    expect(String(seenPrompt)).toContain("Pinned papers:");
+    expect(String(seenPrompt)).toContain("Paper C");
+    expect(String(seenPrompt)).toContain("Attachments:");
+    expect(String(seenPrompt)).toContain("notes.txt");
+    expect(String(seenPrompt)).toContain("Active note context:");
+    expect(String(seenPrompt)).toContain("Title: Note");
+  });
+
   it("adapter updates session mapper from streamed sessionId", async () => {
     const runtime = new ClaudeAgentSdkRuntimeClient({
       queryImpl() {
@@ -286,5 +323,48 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
 
     expect(queryCount).toBe(2);
     expect(seenResumes).toEqual([undefined, undefined]);
+  });
+
+  it("keeps hot runtime alive after release within retention window", async () => {
+    let queryCount = 0;
+    let turnIndex = 0;
+
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      queryImpl(args) {
+        queryCount += 1;
+        const prompt = args.prompt as AsyncIterable<unknown>;
+        return {
+          async *[Symbol.asyncIterator]() {
+            for await (const _message of prompt) {
+              turnIndex += 1;
+              yield { type: "system", session_id: "sess-retained", subtype: "init" };
+              yield { type: "result", session_id: "sess-retained", result: `ok-${turnIndex}`, is_error: false };
+            }
+          }
+        } as any;
+      }
+    });
+
+    await runtime.retainHotRuntime({ conversationKey: "conv-retained", userMessage: "" }, "mount-1");
+    const first = await runtime.startTurn({
+      conversationKey: "conv-retained",
+      userMessage: "hello",
+    });
+    for await (const _event of first.events) {
+      void _event;
+    }
+
+    await runtime.releaseHotRuntime("conv-retained", "mount-1");
+    await runtime.retainHotRuntime({ conversationKey: "conv-retained", userMessage: "" }, "mount-2");
+
+    const second = await runtime.startTurn({
+      conversationKey: "conv-retained",
+      userMessage: "again",
+    });
+    for await (const _event of second.events) {
+      void _event;
+    }
+
+    expect(queryCount).toBe(1);
   });
 });

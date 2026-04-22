@@ -412,7 +412,7 @@ export class ClaudeCodeRuntimeAdapter {
   ): Promise<void> {
     hooks.onEvent?.(event);
     if (this.traceStore) {
-      await this.traceStore.append({ runId, conversationKey, event });
+      void this.traceStore.append({ runId, conversationKey, event });
     }
   }
 

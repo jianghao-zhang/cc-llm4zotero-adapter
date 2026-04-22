@@ -130,7 +130,15 @@ function extractResultOutput(msg: Record<string, unknown>): string {
     if (message) {
       return `Error: ${message}`;
     }
-    return `Error: ${JSON.stringify(msg.errors)}`;
+    const rawErrors = JSON.stringify(msg.errors);
+    if (
+      rawErrors.includes("[ede_diagnostic]") &&
+      rawErrors.includes("result_type=assistant") &&
+      rawErrors.includes("last_content_type=none")
+    ) {
+      return "Error: The model returned an empty reply. Please retry.";
+    }
+    return `Error: ${rawErrors}`;
   }
   if (Boolean(msg.is_error)) {
     return "Error: runtime returned an empty error result.";

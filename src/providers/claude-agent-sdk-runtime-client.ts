@@ -327,15 +327,17 @@ function parsePermissionModeOverride(metadata: Record<string, unknown>): Permiss
 function parseCustomInstruction(metadata: Record<string, unknown>): string {
   return typeof metadata.customInstruction === "string" ? metadata.customInstruction.trim() : "";
 }
+const BLOCKED_ALLOWED_TOOLS = new Set<string>(["AskUserQuestion"]);
+
 function mergeAllowedTools(requestAllowedTools: string[] | undefined, defaultAllowedTools: string[] | undefined): string[] | undefined {
   const merged = new Set<string>();
   for (const tool of defaultAllowedTools ?? []) {
     const normalized = tool.trim();
-    if (normalized) merged.add(normalized);
+    if (normalized && !BLOCKED_ALLOWED_TOOLS.has(normalized)) merged.add(normalized);
   }
   for (const tool of requestAllowedTools ?? []) {
     const normalized = tool.trim();
-    if (normalized) merged.add(normalized);
+    if (normalized && !BLOCKED_ALLOWED_TOOLS.has(normalized)) merged.add(normalized);
   }
   return merged.size > 0 ? Array.from(merged) : undefined;
 }
@@ -444,6 +446,8 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
   private readonly commandInfoTtlMs = 5 * 60_000;
   private readonly hotRuntimePool = new HotRuntimePool({ graceMs: 5 * 60_000 });
   private readonly usageSnapshots = new Map<string, { contextTokens: number; contextWindow?: number }>();
+  private readonly runtimeClientInstanceId = `runtime-client-${Math.random().toString(36).slice(2, 10)}`;
+  private readonly hotRuntimePoolInstanceId = `hot-pool-${Math.random().toString(36).slice(2, 10)}`;
 
   private mergeUsageSnapshot(
     conversationKey: string,
@@ -472,7 +476,36 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
   }
 
   async retainHotRuntime(request: RuntimeTurnRequest, mountId: string): Promise<void> {
-    this.hotRuntimePool.retain(request.conversationKey, mountId);
+    const metadata = parseMetadata(request.metadata, this.options);
+    const probeId = typeof metadata.retentionProbeId === "string" ? metadata.retentionProbeId : undefined;
+    const entry = this.hotRuntimePool.retain(request.conversationKey, mountId);
+    entry.lastUsageSnapshot = entry.lastUsageSnapshot;
+    console.log("[RETENTION_PROBE]", JSON.stringify({
+      stage: "runtime.retain_hot_runtime",
+      probeId,
+      conversationKey: request.conversationKey,
+      mountId,
+      runtimeClientInstanceId: this.runtimeClientInstanceId,
+      hotRuntimePoolInstanceId: this.hotRuntimePoolInstanceId,
+      mountCount: entry.mounts.size,
+    }));
+  }
+
+  async warmHotRuntime(request: RuntimeTurnRequest): Promise<void> {
+    const entry = this.hotRuntimePool.get(request.conversationKey);
+    if (!entry || entry.mounts.size === 0 || entry.query || entry.bootstrapPromise) return;
+    entry.bootstrapPromise = (async () => {
+      try {
+        await this.bootstrapHotRuntime(request, entry);
+      } catch {
+        // ignore bootstrap warmup failures
+      } finally {
+        if (entry.bootstrapPromise) {
+          entry.bootstrapPromise = null;
+        }
+      }
+    })();
+    await entry.bootstrapPromise;
   }
 
   async releaseHotRuntime(conversationKey: string, mountId: string): Promise<void> {
@@ -492,27 +525,94 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     this.usageSnapshots.delete(conversationKey);
   }
 
+  private createProfilingEvent(
+    conversationKey: string,
+    stage: string,
+    payload?: Record<string, unknown>,
+  ): ProviderEvent {
+    return {
+      type: "provider_event",
+      payload: {
+        providerType: "profiling",
+        ts: Date.now(),
+        payload: {
+          stage,
+          conversationKey,
+          ...(payload || {}),
+        },
+      },
+    };
+  }
+
   async startTurn(request: RuntimeTurnRequest): Promise<RuntimeTurnStream> {
     const metadata = parseMetadata(request.metadata, this.options);
+    const probeId = typeof metadata.retentionProbeId === "string" ? metadata.retentionProbeId : undefined;
     const hotEntry = this.hotRuntimePool.get(request.conversationKey);
     const forceFreshSession = metadata.forceFreshSession === true;
+    const hotEntrySnapshot = hotEntry
+      ? {
+          hasHotEntry: true,
+          mountCount: hotEntry.mounts.size,
+          hasQuery: Boolean(hotEntry.query),
+          hasProviderSessionId: Boolean(hotEntry.providerSessionId),
+          hasConfigSignature: Boolean(hotEntry.configSignature),
+          hasProviderIdentity: Boolean(hotEntry.providerIdentity),
+          closeRequested: hotEntry.closeRequested,
+          runtimeClientInstanceId: this.runtimeClientInstanceId,
+          hotRuntimePoolInstanceId: this.hotRuntimePoolInstanceId,
+          probeId,
+        }
+      : {
+          hasHotEntry: false,
+          mountCount: 0,
+          hasQuery: false,
+          hasProviderSessionId: false,
+          hasConfigSignature: false,
+          hasProviderIdentity: false,
+          closeRequested: false,
+          runtimeClientInstanceId: this.runtimeClientInstanceId,
+          hotRuntimePoolInstanceId: this.hotRuntimePoolInstanceId,
+          probeId,
+        };
     const autoCompactNeeded =
       !/^\/compact(?:\s|$)/i.test(request.userMessage.trim()) &&
       shouldAutoCompact(
         metadata,
         this.usageSnapshots.get(request.conversationKey) ?? hotEntry?.lastUsageSnapshot,
       );
+    const createProfilingEvent = this.createProfilingEvent.bind(this);
     if (forceFreshSession) {
       await this.invalidateHotRuntime(request.conversationKey);
-      return this.startColdTurn({
+      const stream = await this.startColdTurn({
         ...request,
         providerSessionId: undefined,
       }, { metadata, autoCompactNeeded });
+      async function* withProfiling() {
+        yield createProfilingEvent(request.conversationKey, "runtime.start_turn.force_fresh_cold", hotEntrySnapshot);
+        for await (const event of stream.events) {
+          yield event;
+        }
+      }
+      return { ...stream, events: withProfiling() };
     }
     if (hotEntry && hotEntry.mounts.size > 0) {
-      return this.startHotTurn(request, hotEntry, { metadata, autoCompactNeeded });
+      const stream = await this.startHotTurn(request, hotEntry, { metadata, autoCompactNeeded });
+      async function* withProfiling() {
+        yield createProfilingEvent(request.conversationKey, "runtime.start_turn.hot_entry_found", hotEntrySnapshot);
+        for await (const event of stream.events) {
+          yield event;
+        }
+      }
+      return { ...stream, events: withProfiling() };
     }
-    return this.startColdTurn(request, { metadata, autoCompactNeeded });
+    const stream = await this.startColdTurn(request, { metadata, autoCompactNeeded });
+    async function* withProfiling() {
+      yield createProfilingEvent(request.conversationKey, "runtime.start_turn.cold_entry", hotEntrySnapshot);
+      for await (const event of stream.events) {
+        yield event;
+      }
+    }
+    return { ...stream, events: withProfiling() };
   }
 
   private async startHotTurn(
@@ -547,24 +647,32 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       signature = buildHotRuntimeSignature(queryOptions, metadata);
     }
 
+    const hotDecisionEvent = this.createProfilingEvent(request.conversationKey,"runtime.start_hot_turn.decision", {
+      mountCount: entry.mounts.size,
+      hasExistingQuery: Boolean(entry.query),
+      hasExistingProviderSessionId: Boolean(entry.providerSessionId),
+      hasExistingConfigSignature: Boolean(entry.configSignature),
+      hasExistingProviderIdentity: Boolean(entry.providerIdentity),
+      shouldReuseProviderSession,
+      shouldRestartForConfigChange,
+      shouldForceFreshSession,
+      configSignatureMatched: entry.configSignature === signature,
+      providerIdentityMatched:
+        !providerIdentity || !entry.providerIdentity || entry.providerIdentity === providerIdentity,
+    });
+
+    if (entry.bootstrapPromise) {
+      await entry.bootstrapPromise;
+    }
+
     if (!entry.query || entry.configSignature !== signature || shouldForceFreshSession) {
-      if (entry.query || entry.configSignature || entry.providerSessionId) {
-        const preservedMounts = Array.from(entry.mounts);
-        const preservedSessionId = shouldForceFreshSession ? undefined : entry.providerSessionId;
-        await this.closeHotRuntime(entry);
-        this.hotRuntimePool.delete(request.conversationKey);
-        entry = this.hotRuntimePool.ensure(request.conversationKey);
-        for (const mountId of preservedMounts) {
-          entry.mounts.add(mountId);
-        }
-        entry.providerSessionId = preservedSessionId;
-      }
-      const query = this.options.queryImpl ?? (await this.loadQuery());
-      const liveQuery = query({ prompt: entry.input, options: queryOptions });
-      entry.query = liveQuery;
-      entry.configSignature = signature;
-      entry.providerIdentity = providerIdentity || undefined;
-      void this.consumeHotRuntime(entry, metadata, queryOptions);
+      entry = await this.bootstrapHotRuntime(request, entry, {
+        metadata,
+        queryOptions,
+        signature,
+        providerIdentity,
+        shouldForceFreshSession,
+      });
     }
     const runId = randomUUID();
     const turn = createHotRuntimeTurn(runId);
@@ -577,11 +685,77 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       providerSessionId,
     });
     entry.pushMessage(message);
+    async function* withHotDecision() {
+      yield hotDecisionEvent;
+      for await (const event of turn.events) {
+        yield event;
+      }
+    }
     return {
       runId,
       providerSessionId: entry.providerSessionId,
-      events: turn.events,
+      events: withHotDecision(),
     };
+  }
+
+  private async bootstrapHotRuntime(
+    request: RuntimeTurnRequest,
+    entry: HotRuntimeEntry,
+    seed?: {
+      metadata?: Record<string, unknown>;
+      queryOptions?: Record<string, unknown>;
+      signature?: string;
+      providerIdentity?: string | null;
+      shouldForceFreshSession?: boolean;
+    },
+  ): Promise<HotRuntimeEntry> {
+    const metadata = seed?.metadata ?? parseMetadata(request.metadata, this.options);
+    const settingSourcesOverride = parseSettingSourcesOverride(metadata);
+    const effectiveSettingSources = settingSourcesOverride ?? this.options.settingSources ?? ["user", "project"];
+    const effectiveCwd = this.resolveScopedCwd(request.metadata);
+    const providerIdentity = seed?.providerIdentity ?? await buildSettingsStackIdentity(
+      effectiveSettingSources,
+      this.resolveSettingsPathBySource.bind(this),
+      effectiveCwd,
+    );
+    const shouldReuseProviderSession =
+      !providerIdentity || !entry.providerIdentity || entry.providerIdentity === providerIdentity;
+    let queryOptions = seed?.queryOptions ?? await this.buildQueryOptions(
+      request,
+      metadata,
+      shouldReuseProviderSession ? entry.providerSessionId || request.providerSessionId : undefined,
+    );
+    let signature = seed?.signature ?? buildHotRuntimeSignature(queryOptions, metadata);
+    const shouldRestartForConfigChange =
+      Boolean(entry.query || entry.configSignature) && entry.configSignature !== signature;
+    const shouldForceFreshSession = seed?.shouldForceFreshSession ?? (!shouldReuseProviderSession || shouldRestartForConfigChange);
+
+    if (shouldForceFreshSession) {
+      queryOptions = await this.buildQueryOptions(request, metadata, undefined);
+      signature = buildHotRuntimeSignature(queryOptions, metadata);
+    }
+
+    if (entry.query || entry.configSignature || entry.providerSessionId) {
+      const preservedMounts = Array.from(entry.mounts);
+      const preservedSessionId = shouldForceFreshSession ? undefined : entry.providerSessionId;
+      await this.closeHotRuntime(entry);
+      this.hotRuntimePool.delete(request.conversationKey);
+      entry = this.hotRuntimePool.ensure(request.conversationKey);
+      for (const mountId of preservedMounts) {
+        entry.mounts.add(mountId);
+      }
+      entry.providerSessionId = preservedSessionId ?? request.providerSessionId;
+    } else if (request.providerSessionId && !entry.providerSessionId) {
+      entry.providerSessionId = request.providerSessionId;
+    }
+
+    const query = this.options.queryImpl ?? (await this.loadQuery());
+    const liveQuery = query({ prompt: entry.input, options: queryOptions });
+    entry.query = liveQuery;
+    entry.configSignature = signature;
+    entry.providerIdentity = providerIdentity || undefined;
+    void this.consumeHotRuntime(entry, metadata, queryOptions);
+    return entry;
   }
 
   private async consumeHotRuntime(
@@ -1165,6 +1339,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     try { entry.closeInput(); } catch {}
     try { entry.query?.close(); } catch {}
     entry.query = null;
+    entry.bootstrapPromise = null;
     entry.currentTurn = null;
     entry.configSignature = undefined;
     entry.providerIdentity = undefined;

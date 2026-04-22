@@ -63,6 +63,7 @@ export interface Llm4ZoteroRuntimeRetentionRequest {
   scopeLabel?: string;
   mountId: string;
   retain: boolean;
+  probeId?: string;
 }
 
 export interface Llm4ZoteroSessionInvalidationRequest {

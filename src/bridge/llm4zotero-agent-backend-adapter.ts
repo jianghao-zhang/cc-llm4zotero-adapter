@@ -298,6 +298,7 @@ export class Llm4ZoteroAgentBackendAdapter {
             scopeId: scope?.scopeId,
             scopeLabel: scope?.scopeLabel,
             runtimeCwdRelative: buildRuntimeCwdRelative(scope, originalConversationKey),
+            retentionProbeId: params.probeId,
           },
         },
         params.mountId,

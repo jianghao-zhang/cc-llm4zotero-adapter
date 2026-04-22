@@ -67,6 +67,7 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
     expect(types).toEqual([
       "provider_event",
       "provider_event",
+      "provider_event",
       "status",
       "provider_event",
       "message_delta",
@@ -247,12 +248,18 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
               yield { type: "system", session_id: "sess-hot", subtype: "init" };
               yield { type: "result", session_id: "sess-hot", result: `ok-${turnIndex}`, is_error: false };
             }
-          }
+          },
+          close() {},
         } as any;
       }
     });
 
     await runtime.retainHotRuntime({ conversationKey: "conv-hot", userMessage: "" }, "mount-1");
+    await runtime.warmHotRuntime?.({
+      conversationKey: "conv-hot",
+      userMessage: "",
+      metadata: { model: "sonnet" }
+    });
 
     const first = await runtime.startTurn({
       conversationKey: "conv-hot",
@@ -340,7 +347,8 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
               yield { type: "system", session_id: "sess-retained", subtype: "init" };
               yield { type: "result", session_id: "sess-retained", result: `ok-${turnIndex}`, is_error: false };
             }
-          }
+          },
+          close() {},
         } as any;
       }
     });
@@ -366,5 +374,53 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
     }
 
     expect(queryCount).toBe(1);
+  });
+
+  it("warms retained hot runtime before the first follow-up turn", async () => {
+    let queryCount = 0;
+    const seenResumes: Array<unknown> = [];
+    let turnIndex = 0;
+
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      queryImpl(args) {
+        queryCount += 1;
+        const options = args.options as Record<string, unknown>;
+        seenResumes.push(options.resume);
+        const prompt = args.prompt as AsyncIterable<unknown>;
+        return {
+          async *[Symbol.asyncIterator]() {
+            for await (const _message of prompt) {
+              turnIndex += 1;
+              yield { type: "system", session_id: "sess-warm", subtype: "init" };
+              yield { type: "result", session_id: "sess-warm", result: `ok-${turnIndex}`, is_error: false };
+            }
+          },
+          close() {},
+        } as any;
+      }
+    });
+
+    await runtime.retainHotRuntime({ conversationKey: "conv-warm", userMessage: "" }, "mount-1");
+    await runtime.warmHotRuntime?.({
+      conversationKey: "conv-warm",
+      userMessage: "",
+      providerSessionId: "sess-existing",
+    });
+
+    const warmedEntry = (runtime as any).hotRuntimePool.get("conv-warm");
+    expect(Boolean(warmedEntry?.query)).toBe(true);
+    expect(warmedEntry?.providerSessionId).toBe("sess-existing");
+
+    const first = await runtime.startTurn({
+      conversationKey: "conv-warm",
+      userMessage: "hello after retain",
+      providerSessionId: "sess-existing",
+    });
+    for await (const _event of first.events) {
+      void _event;
+    }
+
+    expect(queryCount).toBe(1);
+    expect(seenResumes).toEqual(["sess-existing"]);
   });
 });

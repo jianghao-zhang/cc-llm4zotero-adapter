@@ -41,6 +41,7 @@ export interface ClaudeCodeRuntimeClient {
   startTurn(request: RuntimeTurnRequest): Promise<RuntimeTurnStream>;
   retainHotRuntime?(request: RuntimeTurnRequest, mountId: string): Promise<void>;
   releaseHotRuntime?(conversationKey: string, mountId: string): Promise<void>;
+  invalidateHotRuntime?(conversationKey: string): Promise<void>;
   listCommands?(
     options?: {
       settingSources?: Array<"user" | "project" | "local">;

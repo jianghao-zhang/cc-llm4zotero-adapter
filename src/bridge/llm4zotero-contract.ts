@@ -65,6 +65,14 @@ export interface Llm4ZoteroRuntimeRetentionRequest {
   retain: boolean;
 }
 
+export interface Llm4ZoteroSessionInvalidationRequest {
+  conversationKey: string | number;
+  scopeType?: "paper" | "open" | "folder" | "tag" | "tagset" | "custom";
+  scopeId?: string;
+  scopeLabel?: string;
+  metadata?: Record<string, unknown>;
+}
+
 export type Llm4ZoteroToolMutability = "read" | "write";
 export type Llm4ZoteroToolRiskLevel = "low" | "medium" | "high";
 export type Llm4ZoteroToolSource = "claude-runtime" | "zotero-bridge" | "mcp";

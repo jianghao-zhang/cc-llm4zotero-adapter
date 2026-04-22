@@ -6,6 +6,7 @@ import type {
   Llm4ZoteroRunTurnOutcome,
   Llm4ZoteroRunTurnParams,
   Llm4ZoteroRuntimeRetentionRequest,
+  Llm4ZoteroSessionInvalidationRequest,
 } from "./llm4zotero-contract.js";
 import { mapToLlm4ZoteroEvent } from "../event-mapper/map-to-llm4zotero-event.js";
 import { findToolByName, getToolCatalog } from "./tool-catalog.js";
@@ -308,6 +309,28 @@ export class Llm4ZoteroAgentBackendAdapter {
       originalConversationKey,
       scopedConversationKey,
       retained: Boolean(params.retain),
+    };
+  }
+
+  async invalidateSession(params: Llm4ZoteroSessionInvalidationRequest): Promise<{
+    originalConversationKey: string;
+    scopedConversationKey: string;
+    invalidated: boolean;
+  }> {
+    const originalConversationKey = String(params.conversationKey);
+    const scope = toScopeInfo(params);
+    const scopedConversationKey = buildScopedConversationKey(
+      originalConversationKey,
+      scope,
+    );
+    await this.adapter.invalidateConversationSession({
+      conversationKey: scopedConversationKey,
+      metadata: params.metadata,
+    });
+    return {
+      originalConversationKey,
+      scopedConversationKey,
+      invalidated: true,
     };
   }
 

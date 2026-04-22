@@ -5,8 +5,10 @@ type SessionMapState = Record<string, string>;
 
 export interface SessionMapper {
   get(conversationKey: string): Promise<string | undefined>;
+  getByPrefix(prefix: string): Promise<string | undefined>;
   set(conversationKey: string, providerSessionId: string): Promise<void>;
   delete(conversationKey: string): Promise<void>;
+  deleteByPrefix(prefix: string): Promise<void>;
 }
 
 export class InMemorySessionMapper implements SessionMapper {
@@ -16,12 +18,27 @@ export class InMemorySessionMapper implements SessionMapper {
     return this.map.get(conversationKey);
   }
 
+  async getByPrefix(prefix: string): Promise<string | undefined> {
+    for (const [key, value] of this.map.entries()) {
+      if (key.startsWith(prefix)) return value;
+    }
+    return undefined;
+  }
+
   async set(conversationKey: string, providerSessionId: string): Promise<void> {
     this.map.set(conversationKey, providerSessionId);
   }
 
   async delete(conversationKey: string): Promise<void> {
     this.map.delete(conversationKey);
+  }
+
+  async deleteByPrefix(prefix: string): Promise<void> {
+    for (const key of Array.from(this.map.keys())) {
+      if (key.startsWith(prefix)) {
+        this.map.delete(key);
+      }
+    }
   }
 }
 
@@ -36,6 +53,15 @@ export class JsonFileSessionMapper implements SessionMapper {
     return state[conversationKey];
   }
 
+  async getByPrefix(prefix: string): Promise<string | undefined> {
+    await this.writeChain;
+    const state = await this.readState();
+    for (const [key, value] of Object.entries(state)) {
+      if (key.startsWith(prefix)) return value;
+    }
+    return undefined;
+  }
+
   async set(conversationKey: string, providerSessionId: string): Promise<void> {
     await this.enqueueWrite((state) => {
       state[conversationKey] = providerSessionId;
@@ -45,6 +71,16 @@ export class JsonFileSessionMapper implements SessionMapper {
   async delete(conversationKey: string): Promise<void> {
     await this.enqueueWrite((state) => {
       delete state[conversationKey];
+    });
+  }
+
+  async deleteByPrefix(prefix: string): Promise<void> {
+    await this.enqueueWrite((state) => {
+      for (const key of Object.keys(state)) {
+        if (key.startsWith(prefix)) {
+          delete state[key];
+        }
+      }
     });
   }
 

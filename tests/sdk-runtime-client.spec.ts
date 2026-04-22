@@ -240,4 +240,51 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
     expect(queryCount).toBe(1);
     expect(seenResumes).toEqual([undefined]);
   });
+
+  it("bypasses retained hot runtime when forceFreshSession is requested", async () => {
+    let queryCount = 0;
+    const seenResumes: Array<unknown> = [];
+    let turnIndex = 0;
+
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      queryImpl(args) {
+        queryCount += 1;
+        const options = args.options as Record<string, unknown>;
+        seenResumes.push(options.resume);
+        const prompt = args.prompt as AsyncIterable<unknown>;
+        return {
+          async *[Symbol.asyncIterator]() {
+            for await (const _message of prompt) {
+              turnIndex += 1;
+              yield { type: "system", session_id: turnIndex === 1 ? "sess-old" : "sess-fresh", subtype: "init" };
+              yield { type: "result", session_id: turnIndex === 1 ? "sess-old" : "sess-fresh", result: `ok-${turnIndex}`, is_error: false };
+            }
+          }
+        } as any;
+      }
+    });
+
+    await runtime.retainHotRuntime({ conversationKey: "conv-fresh-hot", userMessage: "" }, "mount-1");
+
+    const first = await runtime.startTurn({
+      conversationKey: "conv-fresh-hot",
+      userMessage: "hello",
+    });
+    for await (const _event of first.events) {
+      void _event;
+    }
+
+    const second = await runtime.startTurn({
+      conversationKey: "conv-fresh-hot",
+      userMessage: "fresh please",
+      providerSessionId: "stale-session",
+      metadata: { forceFreshSession: true },
+    });
+    for await (const _event of second.events) {
+      void _event;
+    }
+
+    expect(queryCount).toBe(2);
+    expect(seenResumes).toEqual([undefined, undefined]);
+  });
 });

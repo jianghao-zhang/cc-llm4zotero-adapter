@@ -118,6 +118,35 @@ export class ClaudeCodeRuntimeAdapter {
     return this.sessionMapper.get(conversationKey);
   }
 
+  async invalidateConversationSession(
+    requestOrConversationKey:
+      | RunTurnRequest
+      | {
+          conversationKey: string;
+          metadata?: Record<string, unknown>;
+        }
+      | string,
+  ): Promise<void> {
+    const baseConversationKey =
+      typeof requestOrConversationKey === "string"
+        ? requestOrConversationKey
+        : requestOrConversationKey.conversationKey;
+    const explicitMapKey =
+      typeof requestOrConversationKey === "string"
+        ? requestOrConversationKey
+        : this.buildSessionMapKey({
+            conversationKey: requestOrConversationKey.conversationKey,
+            userMessage: "",
+            metadata: requestOrConversationKey.metadata,
+          });
+    await this.sessionMapper.delete(baseConversationKey);
+    await this.sessionMapper.deleteByPrefix(`${baseConversationKey}::provider:`);
+    if (explicitMapKey !== baseConversationKey) {
+      await this.sessionMapper.delete(explicitMapKey);
+    }
+    await this.runtimeClient.invalidateHotRuntime?.(baseConversationKey);
+  }
+
   async retainHotRuntime(request: RunTurnRequest, mountId: string): Promise<void> {
     await this.runtimeClient.retainHotRuntime?.(request, mountId);
   }
@@ -142,6 +171,9 @@ export class ClaudeCodeRuntimeAdapter {
         (request.metadata as Record<string, unknown>).forceFreshSession === true,
     );
     const sessionMapKey = this.buildSessionMapKey(request);
+    if (forceFreshSession) {
+      await this.invalidateConversationSession(request);
+    }
     const initialSessionId = forceFreshSession
       ? undefined
       : await this.sessionMapper.get(sessionMapKey);

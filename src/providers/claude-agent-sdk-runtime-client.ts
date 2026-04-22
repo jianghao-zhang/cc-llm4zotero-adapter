@@ -7,7 +7,7 @@ import type { ClaudeCodeRuntimeClient, ProviderEvent, RuntimeTurnRequest, Runtim
 import { mapSdkMessageToProviderEvents } from "../event-mapper/map-sdk-message.js";
 import { globalPermissionStore } from "../permissions/permission-store.js";
 import type { PermissionResult } from "../permissions/permission-store.js";
-import { resolveModelAlias } from "./model-resolver.js";
+import { getCachedModels, resolveModelAlias, resolveModelWithCache, setCachedModels } from "./model-resolver.js";
 import { createHotRuntimeTurn, HotRuntimePool, type HotRuntimeEntry } from "./hotRuntimePool.js";
 
 type QueryFunction = (args: {
@@ -481,15 +481,34 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     });
   }
 
+  async invalidateHotRuntime(conversationKey: string): Promise<void> {
+    const entry = this.hotRuntimePool.get(conversationKey);
+    if (!entry) {
+      this.usageSnapshots.delete(conversationKey);
+      return;
+    }
+    await this.closeHotRuntime(entry);
+    this.hotRuntimePool.delete(conversationKey);
+    this.usageSnapshots.delete(conversationKey);
+  }
+
   async startTurn(request: RuntimeTurnRequest): Promise<RuntimeTurnStream> {
     const metadata = parseMetadata(request.metadata, this.options);
     const hotEntry = this.hotRuntimePool.get(request.conversationKey);
+    const forceFreshSession = metadata.forceFreshSession === true;
     const autoCompactNeeded =
       !/^\/compact(?:\s|$)/i.test(request.userMessage.trim()) &&
       shouldAutoCompact(
         metadata,
         this.usageSnapshots.get(request.conversationKey) ?? hotEntry?.lastUsageSnapshot,
       );
+    if (forceFreshSession) {
+      await this.invalidateHotRuntime(request.conversationKey);
+      return this.startColdTurn({
+        ...request,
+        providerSessionId: undefined,
+      }, { metadata, autoCompactNeeded });
+    }
     if (hotEntry && hotEntry.mounts.size > 0) {
       return this.startHotTurn(request, hotEntry, { metadata, autoCompactNeeded });
     }
@@ -916,20 +935,29 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
         : "default");
     let resolvedModel: string | undefined;
     if (shouldForwardFrontendModel && requestedModelRaw && requestedModelRaw.toLowerCase() !== "default" && requestedModelRaw.toLowerCase() !== "auto") {
-      const modelInfos = await this.readSupportedModelsFromSdk({
-        settingSources: effectiveSettingSources,
-        providerKey,
-      });
-      const normalizedResolved = resolveModelAlias(
+      const cachedResolution = resolveModelWithCache(
         requestedModelRaw,
-        modelInfos,
-      )?.trim().toLowerCase();
-      if (normalizedResolved) {
-        resolvedModel = normalizedResolved;
+        effectiveSettingSources,
+        providerKey,
+      );
+      if (cachedResolution.model) {
+        resolvedModel = cachedResolution.model.trim().toLowerCase();
       } else {
-        const rawLower = requestedModelRaw.trim().toLowerCase();
-        if (rawLower === "opus" || rawLower === "sonnet" || rawLower === "haiku") {
-          resolvedModel = rawLower;
+        const modelInfos = await this.readSupportedModelsFromSdk({
+          settingSources: effectiveSettingSources,
+          providerKey,
+        });
+        const normalizedResolved = resolveModelAlias(
+          requestedModelRaw,
+          modelInfos,
+        )?.trim().toLowerCase();
+        if (normalizedResolved) {
+          resolvedModel = normalizedResolved;
+        } else {
+          const rawLower = requestedModelRaw.trim().toLowerCase();
+          if (rawLower === "opus" || rawLower === "sonnet" || rawLower === "haiku") {
+            resolvedModel = rawLower;
+          }
         }
       }
     }
@@ -1070,9 +1098,16 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
   private async readSupportedModelsFromSdk(options?: { settingSources?: Array<"user" | "project" | "local">; providerKey?: string }): Promise<ClaudeModelInfo[]> {
     const requestedSources = options?.settingSources;
     const settingSources = Array.isArray(requestedSources) && requestedSources.length > 0 ? requestedSources : this.options.settingSources ?? ["user", "project"];
-    const cacheKey = `${options?.providerKey || "default"}::${settingSources.join(",")}`;
+    const providerKey = options?.providerKey || "default";
+    const cacheKey = `${providerKey}::${settingSources.join(",")}`;
     const cached = this.modelInfoCache.get(cacheKey);
     if (cached && Date.now() < cached.expiresAt) return cached.infos;
+    const sharedCached = getCachedModels(settingSources, providerKey);
+    if (sharedCached && sharedCached.length > 0) {
+      const infos = sharedCached as ClaudeModelInfo[];
+      this.modelInfoCache.set(cacheKey, { infos, expiresAt: Date.now() + this.modelInfoTtlMs });
+      return infos;
+    }
     try {
       const query = this.options.queryImpl ?? (await this.loadQuery());
       const session = query({
@@ -1083,6 +1118,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       try { await session.return(undefined); } catch {}
       const infos = Array.isArray(infosRaw) ? infosRaw : [];
       this.modelInfoCache.set(cacheKey, { infos, expiresAt: Date.now() + this.modelInfoTtlMs });
+      setCachedModels(settingSources, infos, providerKey);
       return infos;
     } catch {
       return [];

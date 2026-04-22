@@ -29,7 +29,7 @@ export function getCachedModels(
   settingSources: string[],
   providerKey?: string,
 ): ModelInfo[] | undefined {
-  const key = getCacheKey(settingSources);
+  const key = getCacheKey(settingSources, providerKey);
   const cached = modelCache.get(key);
   if (cached && Date.now() < cached.expiresAt) {
     return cached.models;

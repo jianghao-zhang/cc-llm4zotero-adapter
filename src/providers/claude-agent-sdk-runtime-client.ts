@@ -3,11 +3,11 @@ import { readFile } from "node:fs/promises";
 import { mkdirSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import type { ClaudeCodeRuntimeClient, ProviderEvent, RuntimeTurnRequest, RuntimeTurnStream } from "../runtime.js";
+import type { ClaudeCodeRuntimeClient, McpServerStatus, ProviderEvent, RuntimeTurnRequest, RuntimeTurnStream } from "../runtime.js";
 import { mapSdkMessageToProviderEvents } from "../event-mapper/map-sdk-message.js";
 import { globalPermissionStore } from "../permissions/permission-store.js";
 import type { PermissionResult } from "../permissions/permission-store.js";
-import { resolveModelAlias } from "./model-resolver.js";
+import { getCachedModels, resolveModelAlias, resolveModelWithCache, setCachedModels } from "./model-resolver.js";
 import { createHotRuntimeTurn, HotRuntimePool, type HotRuntimeEntry } from "./hotRuntimePool.js";
 
 type QueryFunction = (args: {
@@ -25,6 +25,10 @@ type ClaudeSlashCommandInfo = {
   name?: string;
   description?: string;
   argumentHint?: string;
+};
+
+type QueryWithMcpStatus = Query & {
+  mcpServerStatus?: () => Promise<unknown>;
 };
 
 type RuntimeEffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
@@ -104,6 +108,21 @@ function trimInline(value: unknown, max = 280): string {
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   return value as Record<string, unknown>;
+}
+function redactMcpConfig(value: unknown): Record<string, unknown> | undefined {
+  const record = asRecord(value);
+  if (!record) return undefined;
+  const redacted: Record<string, unknown> = { ...record };
+  const headers = asRecord(redacted.headers);
+  if (headers) {
+    redacted.headers = Object.fromEntries(
+      Object.entries(headers).map(([key, headerValue]) => [
+        key,
+        /authorization|api[-_]?key|token|secret|password/i.test(key) ? "[redacted]" : headerValue,
+      ]),
+    );
+  }
+  return redacted;
 }
 function toRuntimeRequest(request: RuntimeTurnRequest, metadata: Record<string, unknown>): RuntimeRequestShape | undefined {
   const direct = asRecord(request.runtimeRequest);
@@ -327,15 +346,17 @@ function parsePermissionModeOverride(metadata: Record<string, unknown>): Permiss
 function parseCustomInstruction(metadata: Record<string, unknown>): string {
   return typeof metadata.customInstruction === "string" ? metadata.customInstruction.trim() : "";
 }
+const BLOCKED_ALLOWED_TOOLS = new Set<string>(["AskUserQuestion"]);
+
 function mergeAllowedTools(requestAllowedTools: string[] | undefined, defaultAllowedTools: string[] | undefined): string[] | undefined {
   const merged = new Set<string>();
   for (const tool of defaultAllowedTools ?? []) {
     const normalized = tool.trim();
-    if (normalized) merged.add(normalized);
+    if (normalized && !BLOCKED_ALLOWED_TOOLS.has(normalized)) merged.add(normalized);
   }
   for (const tool of requestAllowedTools ?? []) {
     const normalized = tool.trim();
-    if (normalized) merged.add(normalized);
+    if (normalized && !BLOCKED_ALLOWED_TOOLS.has(normalized)) merged.add(normalized);
   }
   return merged.size > 0 ? Array.from(merged) : undefined;
 }
@@ -442,8 +463,10 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
   private commandInfoCache = new Map<string, { expiresAt: number; commands: ClaudeSlashCommandInfo[] }>();
   private readonly modelInfoTtlMs = 60_000;
   private readonly commandInfoTtlMs = 5 * 60_000;
-  private readonly hotRuntimePool = new HotRuntimePool({ graceMs: 3000 });
+  private readonly hotRuntimePool = new HotRuntimePool({ graceMs: 5 * 60_000 });
   private readonly usageSnapshots = new Map<string, { contextTokens: number; contextWindow?: number }>();
+  private readonly runtimeClientInstanceId = `runtime-client-${Math.random().toString(36).slice(2, 10)}`;
+  private readonly hotRuntimePoolInstanceId = `hot-pool-${Math.random().toString(36).slice(2, 10)}`;
 
   private mergeUsageSnapshot(
     conversationKey: string,
@@ -472,7 +495,36 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
   }
 
   async retainHotRuntime(request: RuntimeTurnRequest, mountId: string): Promise<void> {
-    this.hotRuntimePool.retain(request.conversationKey, mountId);
+    const metadata = parseMetadata(request.metadata, this.options);
+    const probeId = typeof metadata.retentionProbeId === "string" ? metadata.retentionProbeId : undefined;
+    const entry = this.hotRuntimePool.retain(request.conversationKey, mountId);
+    entry.lastUsageSnapshot = entry.lastUsageSnapshot;
+    console.log("[RETENTION_PROBE]", JSON.stringify({
+      stage: "runtime.retain_hot_runtime",
+      probeId,
+      conversationKey: request.conversationKey,
+      mountId,
+      runtimeClientInstanceId: this.runtimeClientInstanceId,
+      hotRuntimePoolInstanceId: this.hotRuntimePoolInstanceId,
+      mountCount: entry.mounts.size,
+    }));
+  }
+
+  async warmHotRuntime(request: RuntimeTurnRequest): Promise<void> {
+    const entry = this.hotRuntimePool.get(request.conversationKey);
+    if (!entry || entry.mounts.size === 0 || entry.query || entry.bootstrapPromise) return;
+    entry.bootstrapPromise = (async () => {
+      try {
+        await this.bootstrapHotRuntime(request, entry);
+      } catch {
+        // ignore bootstrap warmup failures
+      } finally {
+        if (entry.bootstrapPromise) {
+          entry.bootstrapPromise = null;
+        }
+      }
+    })();
+    await entry.bootstrapPromise;
   }
 
   async releaseHotRuntime(conversationKey: string, mountId: string): Promise<void> {
@@ -481,19 +533,105 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     });
   }
 
+  async invalidateHotRuntime(conversationKey: string): Promise<void> {
+    const entry = this.hotRuntimePool.get(conversationKey);
+    if (!entry) {
+      this.usageSnapshots.delete(conversationKey);
+      return;
+    }
+    await this.closeHotRuntime(entry);
+    this.hotRuntimePool.delete(conversationKey);
+    this.usageSnapshots.delete(conversationKey);
+  }
+
+  private createProfilingEvent(
+    conversationKey: string,
+    stage: string,
+    payload?: Record<string, unknown>,
+  ): ProviderEvent {
+    return {
+      type: "provider_event",
+      payload: {
+        providerType: "profiling",
+        ts: Date.now(),
+        payload: {
+          stage,
+          conversationKey,
+          ...(payload || {}),
+        },
+      },
+    };
+  }
+
   async startTurn(request: RuntimeTurnRequest): Promise<RuntimeTurnStream> {
     const metadata = parseMetadata(request.metadata, this.options);
+    const probeId = typeof metadata.retentionProbeId === "string" ? metadata.retentionProbeId : undefined;
     const hotEntry = this.hotRuntimePool.get(request.conversationKey);
+    const forceFreshSession = metadata.forceFreshSession === true;
+    const hotEntrySnapshot = hotEntry
+      ? {
+          hasHotEntry: true,
+          mountCount: hotEntry.mounts.size,
+          hasQuery: Boolean(hotEntry.query),
+          hasProviderSessionId: Boolean(hotEntry.providerSessionId),
+          hasConfigSignature: Boolean(hotEntry.configSignature),
+          hasProviderIdentity: Boolean(hotEntry.providerIdentity),
+          closeRequested: hotEntry.closeRequested,
+          runtimeClientInstanceId: this.runtimeClientInstanceId,
+          hotRuntimePoolInstanceId: this.hotRuntimePoolInstanceId,
+          probeId,
+        }
+      : {
+          hasHotEntry: false,
+          mountCount: 0,
+          hasQuery: false,
+          hasProviderSessionId: false,
+          hasConfigSignature: false,
+          hasProviderIdentity: false,
+          closeRequested: false,
+          runtimeClientInstanceId: this.runtimeClientInstanceId,
+          hotRuntimePoolInstanceId: this.hotRuntimePoolInstanceId,
+          probeId,
+        };
     const autoCompactNeeded =
       !/^\/compact(?:\s|$)/i.test(request.userMessage.trim()) &&
       shouldAutoCompact(
         metadata,
         this.usageSnapshots.get(request.conversationKey) ?? hotEntry?.lastUsageSnapshot,
       );
-    if (hotEntry && hotEntry.mounts.size > 0) {
-      return this.startHotTurn(request, hotEntry, { metadata, autoCompactNeeded });
+    const createProfilingEvent = this.createProfilingEvent.bind(this);
+    if (forceFreshSession) {
+      await this.invalidateHotRuntime(request.conversationKey);
+      const stream = await this.startColdTurn({
+        ...request,
+        providerSessionId: undefined,
+      }, { metadata, autoCompactNeeded });
+      async function* withProfiling() {
+        yield createProfilingEvent(request.conversationKey, "runtime.start_turn.force_fresh_cold", hotEntrySnapshot);
+        for await (const event of stream.events) {
+          yield event;
+        }
+      }
+      return { ...stream, events: withProfiling() };
     }
-    return this.startColdTurn(request, { metadata, autoCompactNeeded });
+    if (hotEntry && hotEntry.mounts.size > 0) {
+      const stream = await this.startHotTurn(request, hotEntry, { metadata, autoCompactNeeded });
+      async function* withProfiling() {
+        yield createProfilingEvent(request.conversationKey, "runtime.start_turn.hot_entry_found", hotEntrySnapshot);
+        for await (const event of stream.events) {
+          yield event;
+        }
+      }
+      return { ...stream, events: withProfiling() };
+    }
+    const stream = await this.startColdTurn(request, { metadata, autoCompactNeeded });
+    async function* withProfiling() {
+      yield createProfilingEvent(request.conversationKey, "runtime.start_turn.cold_entry", hotEntrySnapshot);
+      for await (const event of stream.events) {
+        yield event;
+      }
+    }
+    return { ...stream, events: withProfiling() };
   }
 
   private async startHotTurn(
@@ -503,7 +641,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
   ): Promise<RuntimeTurnStream> {
     const metadata = parseMetadata(request.metadata, this.options);
     const settingSourcesOverride = parseSettingSourcesOverride(metadata);
-    const effectiveSettingSources = settingSourcesOverride ?? this.options.settingSources ?? ["user", "project"];
+    const effectiveSettingSources = settingSourcesOverride ?? this.options.settingSources ?? ["user", "project", "local"];
     const effectiveCwd = this.resolveScopedCwd(request.metadata);
     const providerIdentity = await buildSettingsStackIdentity(
       effectiveSettingSources,
@@ -528,24 +666,32 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       signature = buildHotRuntimeSignature(queryOptions, metadata);
     }
 
+    const hotDecisionEvent = this.createProfilingEvent(request.conversationKey,"runtime.start_hot_turn.decision", {
+      mountCount: entry.mounts.size,
+      hasExistingQuery: Boolean(entry.query),
+      hasExistingProviderSessionId: Boolean(entry.providerSessionId),
+      hasExistingConfigSignature: Boolean(entry.configSignature),
+      hasExistingProviderIdentity: Boolean(entry.providerIdentity),
+      shouldReuseProviderSession,
+      shouldRestartForConfigChange,
+      shouldForceFreshSession,
+      configSignatureMatched: entry.configSignature === signature,
+      providerIdentityMatched:
+        !providerIdentity || !entry.providerIdentity || entry.providerIdentity === providerIdentity,
+    });
+
+    if (entry.bootstrapPromise) {
+      await entry.bootstrapPromise;
+    }
+
     if (!entry.query || entry.configSignature !== signature || shouldForceFreshSession) {
-      if (entry.query || entry.configSignature || entry.providerSessionId) {
-        const preservedMounts = Array.from(entry.mounts);
-        const preservedSessionId = shouldForceFreshSession ? undefined : entry.providerSessionId;
-        await this.closeHotRuntime(entry);
-        this.hotRuntimePool.delete(request.conversationKey);
-        entry = this.hotRuntimePool.ensure(request.conversationKey);
-        for (const mountId of preservedMounts) {
-          entry.mounts.add(mountId);
-        }
-        entry.providerSessionId = preservedSessionId;
-      }
-      const query = this.options.queryImpl ?? (await this.loadQuery());
-      const liveQuery = query({ prompt: entry.input, options: queryOptions });
-      entry.query = liveQuery;
-      entry.configSignature = signature;
-      entry.providerIdentity = providerIdentity || undefined;
-      void this.consumeHotRuntime(entry, metadata, queryOptions);
+      entry = await this.bootstrapHotRuntime(request, entry, {
+        metadata,
+        queryOptions,
+        signature,
+        providerIdentity,
+        shouldForceFreshSession,
+      });
     }
     const runId = randomUUID();
     const turn = createHotRuntimeTurn(runId);
@@ -558,11 +704,77 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       providerSessionId,
     });
     entry.pushMessage(message);
+    async function* withHotDecision() {
+      yield hotDecisionEvent;
+      for await (const event of turn.events) {
+        yield event;
+      }
+    }
     return {
       runId,
       providerSessionId: entry.providerSessionId,
-      events: turn.events,
+      events: withHotDecision(),
     };
+  }
+
+  private async bootstrapHotRuntime(
+    request: RuntimeTurnRequest,
+    entry: HotRuntimeEntry,
+    seed?: {
+      metadata?: Record<string, unknown>;
+      queryOptions?: Record<string, unknown>;
+      signature?: string;
+      providerIdentity?: string | null;
+      shouldForceFreshSession?: boolean;
+    },
+  ): Promise<HotRuntimeEntry> {
+    const metadata = seed?.metadata ?? parseMetadata(request.metadata, this.options);
+    const settingSourcesOverride = parseSettingSourcesOverride(metadata);
+    const effectiveSettingSources = settingSourcesOverride ?? this.options.settingSources ?? ["user", "project", "local"];
+    const effectiveCwd = this.resolveScopedCwd(request.metadata);
+    const providerIdentity = seed?.providerIdentity ?? await buildSettingsStackIdentity(
+      effectiveSettingSources,
+      this.resolveSettingsPathBySource.bind(this),
+      effectiveCwd,
+    );
+    const shouldReuseProviderSession =
+      !providerIdentity || !entry.providerIdentity || entry.providerIdentity === providerIdentity;
+    let queryOptions = seed?.queryOptions ?? await this.buildQueryOptions(
+      request,
+      metadata,
+      shouldReuseProviderSession ? entry.providerSessionId || request.providerSessionId : undefined,
+    );
+    let signature = seed?.signature ?? buildHotRuntimeSignature(queryOptions, metadata);
+    const shouldRestartForConfigChange =
+      Boolean(entry.query || entry.configSignature) && entry.configSignature !== signature;
+    const shouldForceFreshSession = seed?.shouldForceFreshSession ?? (!shouldReuseProviderSession || shouldRestartForConfigChange);
+
+    if (shouldForceFreshSession) {
+      queryOptions = await this.buildQueryOptions(request, metadata, undefined);
+      signature = buildHotRuntimeSignature(queryOptions, metadata);
+    }
+
+    if (entry.query || entry.configSignature || entry.providerSessionId) {
+      const preservedMounts = Array.from(entry.mounts);
+      const preservedSessionId = shouldForceFreshSession ? undefined : entry.providerSessionId;
+      await this.closeHotRuntime(entry);
+      this.hotRuntimePool.delete(request.conversationKey);
+      entry = this.hotRuntimePool.ensure(request.conversationKey);
+      for (const mountId of preservedMounts) {
+        entry.mounts.add(mountId);
+      }
+      entry.providerSessionId = preservedSessionId ?? request.providerSessionId;
+    } else if (request.providerSessionId && !entry.providerSessionId) {
+      entry.providerSessionId = request.providerSessionId;
+    }
+
+    const query = this.options.queryImpl ?? (await this.loadQuery());
+    const liveQuery = query({ prompt: entry.input, options: queryOptions });
+    entry.query = liveQuery;
+    entry.configSignature = signature;
+    entry.providerIdentity = providerIdentity || undefined;
+    void this.consumeHotRuntime(entry, metadata, queryOptions);
+    return entry;
   }
 
   private async consumeHotRuntime(
@@ -833,7 +1045,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
   async listModels(options?: { settingSources?: Array<"user" | "project" | "local">; providerKey?: string }): Promise<string[]> {
     const sdkInfos = await this.readSupportedModelsFromSdk(options);
     const requestedSources = options?.settingSources;
-    const settingSources = Array.isArray(requestedSources) && requestedSources.length > 0 ? requestedSources : this.options.settingSources ?? ["user", "project"];
+    const settingSources = Array.isArray(requestedSources) && requestedSources.length > 0 ? requestedSources : this.options.settingSources ?? ["user", "project", "local"];
     const unique = new Set<string>();
     for (const info of sdkInfos) {
       const value = normalizeModelName(info.value);
@@ -875,6 +1087,57 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     return [...base, "xhigh"];
   }
 
+  async listMcpServers(options?: { settingSources?: Array<"user" | "project" | "local"> }): Promise<McpServerStatus[]> {
+    const requestedSources = options?.settingSources;
+    const settingSources = Array.isArray(requestedSources) && requestedSources.length > 0 ? requestedSources : this.options.settingSources ?? ["user", "project", "local"];
+    try {
+      const query = this.options.queryImpl ?? (await this.loadQuery());
+      const session = query({
+        prompt: "",
+        options: {
+          cwd: this.options.cwd ? resolve(this.options.cwd) : process.cwd(),
+          settingSources,
+          permissionMode: this.options.permissionMode,
+        },
+      }) as QueryWithMcpStatus;
+      if (typeof session.mcpServerStatus !== "function") {
+        try { await session.return(undefined); } catch {}
+        return [];
+      }
+      const statusesRaw = await session.mcpServerStatus();
+      try { await session.return(undefined); } catch {}
+      return Array.isArray(statusesRaw) ? statusesRaw.map((entry) => this.normalizeMcpServerStatus(entry)).filter((entry): entry is McpServerStatus => Boolean(entry)) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  private normalizeMcpServerStatus(value: unknown): McpServerStatus | null {
+    const record = asRecord(value);
+    if (!record || typeof record.name !== "string" || typeof record.status !== "string") return null;
+    return {
+      name: record.name,
+      status: record.status,
+      serverInfo: asRecord(record.serverInfo),
+      error: typeof record.error === "string" ? record.error : undefined,
+      config: redactMcpConfig(record.config),
+      scope: typeof record.scope === "string" ? record.scope : undefined,
+      tools: Array.isArray(record.tools)
+        ? record.tools
+            .map((tool) => {
+              const toolRecord = asRecord(tool);
+              if (!toolRecord || typeof toolRecord.name !== "string") return null;
+              return {
+                name: toolRecord.name,
+                description: typeof toolRecord.description === "string" ? toolRecord.description : undefined,
+                annotations: asRecord(toolRecord.annotations),
+              };
+            })
+            .filter((tool): tool is NonNullable<typeof tool> => Boolean(tool))
+        : undefined,
+    };
+  }
+
   private buildConfigSourcePrompt(effectiveSettingSources: SettingSource[], effectiveCwd: string | undefined, metadata: Record<string, unknown>): string {
     const configSourceMode = typeof metadata.claudeConfigSource === "string" ? String(metadata.claudeConfigSource).trim().toLowerCase() : "default";
     const configPathMap = {
@@ -904,7 +1167,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     const permissionModeOverride = parsePermissionModeOverride(metadata);
     const customInstruction = parseCustomInstruction(metadata);
     const effectiveCwd = this.resolveScopedCwd(request.metadata);
-    const effectiveSettingSources = settingSourcesOverride ?? this.options.settingSources ?? ["user", "project"];
+    const effectiveSettingSources = settingSourcesOverride ?? this.options.settingSources ?? ["user", "project", "local"];
     const providerKey =
       (await buildSettingsStackIdentity(
         effectiveSettingSources,
@@ -916,20 +1179,29 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
         : "default");
     let resolvedModel: string | undefined;
     if (shouldForwardFrontendModel && requestedModelRaw && requestedModelRaw.toLowerCase() !== "default" && requestedModelRaw.toLowerCase() !== "auto") {
-      const modelInfos = await this.readSupportedModelsFromSdk({
-        settingSources: effectiveSettingSources,
-        providerKey,
-      });
-      const normalizedResolved = resolveModelAlias(
+      const cachedResolution = resolveModelWithCache(
         requestedModelRaw,
-        modelInfos,
-      )?.trim().toLowerCase();
-      if (normalizedResolved) {
-        resolvedModel = normalizedResolved;
+        effectiveSettingSources,
+        providerKey,
+      );
+      if (cachedResolution.model) {
+        resolvedModel = cachedResolution.model.trim().toLowerCase();
       } else {
-        const rawLower = requestedModelRaw.trim().toLowerCase();
-        if (rawLower === "opus" || rawLower === "sonnet" || rawLower === "haiku") {
-          resolvedModel = rawLower;
+        const modelInfos = await this.readSupportedModelsFromSdk({
+          settingSources: effectiveSettingSources,
+          providerKey,
+        });
+        const normalizedResolved = resolveModelAlias(
+          requestedModelRaw,
+          modelInfos,
+        )?.trim().toLowerCase();
+        if (normalizedResolved) {
+          resolvedModel = normalizedResolved;
+        } else {
+          const rawLower = requestedModelRaw.trim().toLowerCase();
+          if (rawLower === "opus" || rawLower === "sonnet" || rawLower === "haiku") {
+            resolvedModel = rawLower;
+          }
         }
       }
     }
@@ -1069,10 +1341,17 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
 
   private async readSupportedModelsFromSdk(options?: { settingSources?: Array<"user" | "project" | "local">; providerKey?: string }): Promise<ClaudeModelInfo[]> {
     const requestedSources = options?.settingSources;
-    const settingSources = Array.isArray(requestedSources) && requestedSources.length > 0 ? requestedSources : this.options.settingSources ?? ["user", "project"];
-    const cacheKey = `${options?.providerKey || "default"}::${settingSources.join(",")}`;
+    const settingSources = Array.isArray(requestedSources) && requestedSources.length > 0 ? requestedSources : this.options.settingSources ?? ["user", "project", "local"];
+    const providerKey = options?.providerKey || "default";
+    const cacheKey = `${providerKey}::${settingSources.join(",")}`;
     const cached = this.modelInfoCache.get(cacheKey);
     if (cached && Date.now() < cached.expiresAt) return cached.infos;
+    const sharedCached = getCachedModels(settingSources, providerKey);
+    if (sharedCached && sharedCached.length > 0) {
+      const infos = sharedCached as ClaudeModelInfo[];
+      this.modelInfoCache.set(cacheKey, { infos, expiresAt: Date.now() + this.modelInfoTtlMs });
+      return infos;
+    }
     try {
       const query = this.options.queryImpl ?? (await this.loadQuery());
       const session = query({
@@ -1083,6 +1362,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       try { await session.return(undefined); } catch {}
       const infos = Array.isArray(infosRaw) ? infosRaw : [];
       this.modelInfoCache.set(cacheKey, { infos, expiresAt: Date.now() + this.modelInfoTtlMs });
+      setCachedModels(settingSources, infos, providerKey);
       return infos;
     } catch {
       return [];
@@ -1091,7 +1371,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
 
   private async readSupportedCommandsFromSdk(options?: { settingSources?: Array<"user" | "project" | "local">; providerKey?: string }): Promise<ClaudeSlashCommandInfo[]> {
     const requestedSources = options?.settingSources;
-    const settingSources = Array.isArray(requestedSources) && requestedSources.length > 0 ? requestedSources : this.options.settingSources ?? ["user", "project"];
+    const settingSources = Array.isArray(requestedSources) && requestedSources.length > 0 ? requestedSources : this.options.settingSources ?? ["user", "project", "local"];
     const cacheKey = `${options?.providerKey || "default"}::${settingSources.join(",")}`;
     const cached = this.commandInfoCache.get(cacheKey);
     if (cached && Date.now() < cached.expiresAt) return cached.commands;
@@ -1129,6 +1409,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     try { entry.closeInput(); } catch {}
     try { entry.query?.close(); } catch {}
     entry.query = null;
+    entry.bootstrapPromise = null;
     entry.currentTurn = null;
     entry.configSignature = undefined;
     entry.providerIdentity = undefined;

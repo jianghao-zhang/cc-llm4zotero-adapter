@@ -197,7 +197,7 @@ npm run serve:bridge
 | `--zotero-root` | `ZOTERO_ROOT` | Override the legacy Zotero root used to derive default runtime/state paths. Useful when Zotero data is not under the home directory. |
 | `--additional-directories` | `ADAPTER_ADDITIONAL_DIRECTORIES` | Extra readable directories (comma-separated, `~` supported). |
 | `--default-allowed-tools` | `ADAPTER_DEFAULT_ALLOWED_TOOLS` | Tools always auto-allowed (comma-separated). Default: `WebFetch,WebSearch`. |
-| `--setting-sources` | `ADAPTER_SETTING_SOURCES` | Claude settings sources: `user`, `project`, `local` (comma-separated). Default: `project,local`. |
+| `--setting-sources` | `ADAPTER_SETTING_SOURCES` | Claude settings sources: `user`, `project`, `local` (comma-separated). Default: `user,project,local`. |
 | `--append-system-prompt` | `ADAPTER_APPEND_SYSTEM_PROMPT` | Inline overlay prompt text. |
 | `--append-system-prompt-file` | `ADAPTER_APPEND_SYSTEM_PROMPT_FILE` | File-based overlay prompt. Missing optional files are ignored. |
 | `--forward-frontend-model` | `ADAPTER_FORWARD_FRONTEND_MODEL` | Pass frontend `metadata.model` to runtime (default `true`). Generic aliases like `opus`, `sonnet`, and `haiku` are forwarded when the SDK accepts them. |

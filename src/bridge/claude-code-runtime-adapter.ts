@@ -97,6 +97,21 @@ export class ClaudeCodeRuntimeAdapter {
     }
   }
 
+  async listRuntimeMcpServers(
+    options?: {
+      settingSources?: Array<"user" | "project" | "local">;
+    },
+  ) {
+    if (typeof this.runtimeClient.listMcpServers !== "function") {
+      return [];
+    }
+    try {
+      return await this.runtimeClient.listMcpServers(options);
+    } catch {
+      return [];
+    }
+  }
+
   private buildSessionMapKey(requestOrConversationKey: RunTurnRequest | string): string {
     if (typeof requestOrConversationKey === "string") {
       return requestOrConversationKey;
@@ -118,8 +133,56 @@ export class ClaudeCodeRuntimeAdapter {
     return this.sessionMapper.get(conversationKey);
   }
 
-  async retainHotRuntime(request: RunTurnRequest, mountId: string): Promise<void> {
+  async invalidateConversationSession(
+    requestOrConversationKey:
+      | RunTurnRequest
+      | {
+          conversationKey: string;
+          metadata?: Record<string, unknown>;
+        }
+      | string,
+  ): Promise<void> {
+    const baseConversationKey =
+      typeof requestOrConversationKey === "string"
+        ? requestOrConversationKey
+        : requestOrConversationKey.conversationKey;
+    const explicitMapKey =
+      typeof requestOrConversationKey === "string"
+        ? requestOrConversationKey
+        : this.buildSessionMapKey({
+            conversationKey: requestOrConversationKey.conversationKey,
+            userMessage: "",
+            metadata: requestOrConversationKey.metadata,
+          });
+    await this.sessionMapper.delete(baseConversationKey);
+    await this.sessionMapper.deleteByPrefix(`${baseConversationKey}::provider:`);
+    if (explicitMapKey !== baseConversationKey) {
+      await this.sessionMapper.delete(explicitMapKey);
+    }
+    await this.runtimeClient.invalidateHotRuntime?.(baseConversationKey);
+  }
+
+  async retainHotRuntime(request: RunTurnRequest, mountId: string): Promise<{ conversationKey: string; mountId: string; retained: boolean; probeId?: string } | void> {
     await this.runtimeClient.retainHotRuntime?.(request, mountId);
+    const metadata = request.metadata && typeof request.metadata === "object"
+      ? (request.metadata as Record<string, unknown>)
+      : {};
+    const sessionMapKey = this.buildSessionMapKey(request);
+    const providerSessionId = await this.sessionMapper.get(sessionMapKey);
+    await this.runtimeClient.warmHotRuntime?.({
+      conversationKey: request.conversationKey,
+      userMessage: "",
+      providerSessionId,
+      allowedTools: request.allowedTools,
+      runtimeRequest: request.runtimeRequest,
+      metadata: request.metadata,
+    });
+    return {
+      conversationKey: request.conversationKey,
+      mountId,
+      retained: true,
+      probeId: typeof metadata.retentionProbeId === "string" ? metadata.retentionProbeId : undefined,
+    };
   }
 
   async releaseHotRuntime(conversationKey: string, mountId: string): Promise<void> {
@@ -136,15 +199,40 @@ export class ClaudeCodeRuntimeAdapter {
 
   async runTurn(request: RunTurnRequest, hooks: RunTurnHooks = {}): Promise<RunTurnOutcome> {
     const signal = hooks.signal ?? request.signal;
+    if (hooks.onEvent) {
+      await hooks.onEvent({
+        type: "provider_event",
+        ts: Date.now(),
+        payload: {
+          providerType: "profiling",
+          stage: "adapter.run_turn.enter",
+        },
+      });
+    }
     const forceFreshSession = Boolean(
       request.metadata &&
         typeof request.metadata === "object" &&
         (request.metadata as Record<string, unknown>).forceFreshSession === true,
     );
     const sessionMapKey = this.buildSessionMapKey(request);
+    if (forceFreshSession) {
+      await this.invalidateConversationSession(request);
+    }
     const initialSessionId = forceFreshSession
       ? undefined
       : await this.sessionMapper.get(sessionMapKey);
+    if (hooks.onEvent) {
+      await hooks.onEvent({
+        type: "provider_event",
+        ts: Date.now(),
+        payload: {
+          providerType: "profiling",
+          stage: "adapter.session_lookup.ready",
+          forceFreshSession,
+          hasInitialSessionId: Boolean(initialSessionId),
+        },
+      });
+    }
     const metadata =
       request.metadata && typeof request.metadata === "object"
         ? (request.metadata as Record<string, unknown>)
@@ -162,7 +250,7 @@ export class ClaudeCodeRuntimeAdapter {
 
     let providerSessionId = initialSessionId;
     if (shouldPreCompact) {
-      await hooks.onEvent?.({
+      hooks.onEvent?.({
         type: "status",
         ts: Date.now(),
         payload: {
@@ -191,7 +279,7 @@ export class ClaudeCodeRuntimeAdapter {
       const err = error instanceof Error ? error : new Error(String(error));
       if (providerSessionId && this.isInvalidThinkingSignatureError(err.message)) {
         await this.sessionMapper.delete(sessionMapKey);
-        await hooks.onEvent?.({
+        hooks.onEvent?.({
           type: "status",
           ts: Date.now(),
           payload: {
@@ -204,7 +292,7 @@ export class ClaudeCodeRuntimeAdapter {
     }
     if (this.shouldRetryForThinkingSignature(providerSessionId, firstOutcome)) {
       await this.sessionMapper.delete(sessionMapKey);
-      await hooks.onEvent?.({
+      hooks.onEvent?.({
         type: "status",
         ts: Date.now(),
         payload: {
@@ -220,7 +308,7 @@ export class ClaudeCodeRuntimeAdapter {
       this.extractProviderIdentity(request)
     ) {
       await this.sessionMapper.delete(sessionMapKey);
-      await hooks.onEvent?.({
+      hooks.onEvent?.({
         type: "status",
         ts: Date.now(),
         payload: {
@@ -380,7 +468,7 @@ export class ClaudeCodeRuntimeAdapter {
   ): Promise<void> {
     hooks.onEvent?.(event);
     if (this.traceStore) {
-      await this.traceStore.append({ runId, conversationKey, event });
+      void this.traceStore.append({ runId, conversationKey, event });
     }
   }
 

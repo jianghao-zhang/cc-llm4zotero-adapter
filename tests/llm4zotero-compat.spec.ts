@@ -150,7 +150,7 @@ describe("Llm4ZoteroAgentBackendAdapter", () => {
       sessionMapper: new InMemorySessionMapper(),
     });
     const compat = new Llm4ZoteroAgentBackendAdapter({ adapter: base });
-    const candidateTool = compat.listTools()[0];
+    const candidateTool = (await compat.listTools())[0];
     expect(candidateTool).toBeDefined();
 
     const seen: string[] = [];

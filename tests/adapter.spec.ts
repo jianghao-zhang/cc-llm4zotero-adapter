@@ -187,4 +187,73 @@ describe("ClaudeCodeRuntimeAdapter", () => {
     expect(await sessionMapper.get("conv-retry")).toBe("fresh-session-id");
     expect(seenStatuses.some((line) => line.includes("Session signature mismatch"))).toBe(true);
   });
+
+  it("clears mapper and hot runtime on explicit invalidation", async () => {
+    let invalidatedConversationKey = "";
+    const runtimeClient: ClaudeCodeRuntimeClient = {
+      async startTurn() {
+        return {
+          runId: "noop",
+          events: providerEvents([]),
+        };
+      },
+      async invalidateHotRuntime(conversationKey) {
+        invalidatedConversationKey = conversationKey;
+      },
+    };
+
+    const sessionMapper = new InMemorySessionMapper();
+    await sessionMapper.set("conv-invalidate", "stale-session");
+    await sessionMapper.set("conv-invalidate::provider:provider-a", "stale-session-provider");
+    const adapter = new ClaudeCodeRuntimeAdapter({
+      runtimeClient,
+      sessionMapper,
+    });
+
+    await sessionMapper.set("conv-invalidate::provider:provider-b", "stale-session-provider-b");
+
+    await adapter.invalidateConversationSession({
+      conversationKey: "conv-invalidate",
+      metadata: { providerIdentity: "provider-a" },
+    });
+
+    expect(await sessionMapper.get("conv-invalidate")).toBeUndefined();
+    expect(await sessionMapper.get("conv-invalidate::provider:provider-a")).toBeUndefined();
+    expect(await sessionMapper.get("conv-invalidate::provider:provider-b")).toBeUndefined();
+    expect(invalidatedConversationKey).toBe("conv-invalidate");
+  });
+
+  it("deletes stale mappings before force-fresh retry", async () => {
+    const seenResumes: Array<string | undefined> = [];
+    const runtimeClient: ClaudeCodeRuntimeClient = {
+      async startTurn(request) {
+        seenResumes.push(request.providerSessionId);
+        return {
+          runId: "run-fresh",
+          providerSessionId: "fresh-session",
+          events: providerEvents([
+            { type: "final", payload: { output: "fresh" } },
+          ]),
+        };
+      },
+      async invalidateHotRuntime() {},
+    };
+
+    const sessionMapper = new InMemorySessionMapper();
+    await sessionMapper.set("conv-fresh::provider:provider-a", "stale-session");
+    const adapter = new ClaudeCodeRuntimeAdapter({
+      runtimeClient,
+      sessionMapper,
+    });
+
+    const outcome = await adapter.runTurn({
+      conversationKey: "conv-fresh",
+      userMessage: "new chat",
+      metadata: { forceFreshSession: true, providerIdentity: "provider-a" },
+    });
+
+    expect(outcome.status).toBe("completed");
+    expect(seenResumes).toEqual([undefined]);
+    expect(await sessionMapper.get("conv-fresh::provider:provider-a")).toBe("fresh-session");
+  });
 });

@@ -6,6 +6,7 @@ import type {
   Llm4ZoteroRunTurnOutcome,
   Llm4ZoteroRunTurnParams,
   Llm4ZoteroRuntimeRetentionRequest,
+  Llm4ZoteroSessionInvalidationRequest,
 } from "./llm4zotero-contract.js";
 import { mapToLlm4ZoteroEvent } from "../event-mapper/map-to-llm4zotero-event.js";
 import { findToolByName, getToolCatalog } from "./tool-catalog.js";
@@ -163,13 +164,45 @@ export class Llm4ZoteroAgentBackendAdapter {
     };
   }
 
-  listTools(options?: {
+  async listTools(options?: {
     settingSources?: Array<"user" | "project" | "local">;
   }) {
-    return getToolCatalog({
+    const catalog = getToolCatalog({
       runtimeCwd: this.runtimeCwd,
       settingSources: options?.settingSources,
     });
+    const mcpTools = await this.listMcpToolDescriptors(options);
+    const seen = new Set<string>();
+    return [...catalog, ...mcpTools].filter((tool) => {
+      if (seen.has(tool.name)) return false;
+      seen.add(tool.name);
+      return true;
+    });
+  }
+
+  private async listMcpToolDescriptors(options?: {
+    settingSources?: Array<"user" | "project" | "local">;
+  }) {
+    const servers = await this.adapter.listRuntimeMcpServers(options);
+    return servers.flatMap((server) => {
+      if (server.status !== "connected" || !Array.isArray(server.tools)) return [];
+      return server.tools.map((tool) => {
+        const destructive = Boolean(tool.annotations?.destructive);
+        return {
+          name: `${server.name}.${tool.name}`,
+          description: tool.description || `MCP tool ${tool.name} from ${server.name}`,
+          inputSchema: {
+            type: "object",
+            properties: {},
+            additionalProperties: true,
+          },
+          mutability: destructive ? "write" as const : "read" as const,
+          riskLevel: destructive ? "high" as const : "medium" as const,
+          requiresConfirmation: destructive,
+          source: "mcp" as const,
+        };
+      });
+    }).sort((a, b) => a.name.localeCompare(b.name));
   }
 
   async listCommands(
@@ -230,6 +263,14 @@ export class Llm4ZoteroAgentBackendAdapter {
       if (normalized) unique.add(normalized);
     }
     return Array.from(unique);
+  }
+
+  async listMcpServers(
+    options?: {
+      settingSources?: Array<"user" | "project" | "local">;
+    },
+  ) {
+    return this.adapter.listRuntimeMcpServers(options);
   }
 
   async getSessionInfo(params: {
@@ -297,6 +338,7 @@ export class Llm4ZoteroAgentBackendAdapter {
             scopeId: scope?.scopeId,
             scopeLabel: scope?.scopeLabel,
             runtimeCwdRelative: buildRuntimeCwdRelative(scope, originalConversationKey),
+            retentionProbeId: params.probeId,
           },
         },
         params.mountId,
@@ -308,6 +350,28 @@ export class Llm4ZoteroAgentBackendAdapter {
       originalConversationKey,
       scopedConversationKey,
       retained: Boolean(params.retain),
+    };
+  }
+
+  async invalidateSession(params: Llm4ZoteroSessionInvalidationRequest): Promise<{
+    originalConversationKey: string;
+    scopedConversationKey: string;
+    invalidated: boolean;
+  }> {
+    const originalConversationKey = String(params.conversationKey);
+    const scope = toScopeInfo(params);
+    const scopedConversationKey = buildScopedConversationKey(
+      originalConversationKey,
+      scope,
+    );
+    await this.adapter.invalidateConversationSession({
+      conversationKey: scopedConversationKey,
+      metadata: params.metadata,
+    });
+    return {
+      originalConversationKey,
+      scopedConversationKey,
+      invalidated: true,
     };
   }
 

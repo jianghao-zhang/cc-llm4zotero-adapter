@@ -63,6 +63,15 @@ export interface Llm4ZoteroRuntimeRetentionRequest {
   scopeLabel?: string;
   mountId: string;
   retain: boolean;
+  probeId?: string;
+}
+
+export interface Llm4ZoteroSessionInvalidationRequest {
+  conversationKey: string | number;
+  scopeType?: "paper" | "open" | "folder" | "tag" | "tagset" | "custom";
+  scopeId?: string;
+  scopeLabel?: string;
+  metadata?: Record<string, unknown>;
 }
 
 export type Llm4ZoteroToolMutability = "read" | "write";

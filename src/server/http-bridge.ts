@@ -7,6 +7,7 @@ import type {
   Llm4ZoteroRunActionRequest,
   Llm4ZoteroRunTurnRequest,
   Llm4ZoteroRuntimeRetentionRequest,
+  Llm4ZoteroSessionInvalidationRequest,
 } from "../bridge/llm4zotero-contract.js";
 
 export interface HttpBridgeServerOptions {
@@ -83,6 +84,17 @@ function sendJson(res: ServerResponse, statusCode: number, body: unknown): void 
   res.statusCode = statusCode;
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.end(JSON.stringify(body));
+}
+
+function redactSecrets(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((entry) => redactSecrets(entry));
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).map(([key, entry]) => [
+      key,
+      /authorization|api[-_]?key|token|secret|password/i.test(key) ? "[redacted]" : redactSecrets(entry),
+    ]),
+  );
 }
 
 async function readJson(req: IncomingMessage): Promise<unknown> {
@@ -221,6 +233,30 @@ function toRetentionPayload(body: unknown): Llm4ZoteroRuntimeRetentionRequest {
   };
 }
 
+function toSessionInvalidationPayload(body: unknown): Llm4ZoteroSessionInvalidationRequest {
+  const record = body !== null && typeof body === "object" ? (body as Record<string, unknown>) : {};
+  const conversationKey = record.conversationKey;
+  if (!(typeof conversationKey === "string" || typeof conversationKey === "number")) {
+    throw new Error("conversationKey must be string or number");
+  }
+  return {
+    conversationKey,
+    scopeType: parseScopeType(record.scopeType),
+    scopeId:
+      typeof record.scopeId === "string" && record.scopeId.trim().length > 0
+        ? record.scopeId.trim()
+        : undefined,
+    scopeLabel:
+      typeof record.scopeLabel === "string" && record.scopeLabel.trim().length > 0
+        ? record.scopeLabel.trim()
+        : undefined,
+    metadata:
+      record.metadata && typeof record.metadata === "object"
+        ? (record.metadata as Record<string, unknown>)
+        : undefined,
+  };
+}
+
 function writeLine(res: ServerResponse, line: BridgeStreamLine): void {
   res.write(JSON.stringify(line));
   res.write("\n");
@@ -244,7 +280,17 @@ export async function startHttpBridgeServer(
         const settingSources = parseSettingSources(
           reqUrl.searchParams.get("settingSources"),
         );
-        sendJson(res, 200, { tools: options.adapter.listTools({ settingSources }) });
+        const tools = await options.adapter.listTools({ settingSources });
+        sendJson(res, 200, { tools });
+        return;
+      }
+
+      if (req.method === "GET" && reqUrl.pathname === "/mcp-servers") {
+        const settingSources = parseSettingSources(
+          reqUrl.searchParams.get("settingSources"),
+        );
+        const servers = await options.adapter.listMcpServers({ settingSources });
+        sendJson(res, 200, { servers: redactSecrets(servers) });
         return;
       }
 
@@ -321,6 +367,20 @@ export async function startHttpBridgeServer(
           return;
         }
         const outcome = await options.adapter.updateRuntimeRetention(payload);
+        sendJson(res, 200, outcome);
+        return;
+      }
+
+      if (req.method === "POST" && req.url === "/invalidate-session") {
+        let payload: Llm4ZoteroSessionInvalidationRequest;
+        try {
+          payload = toSessionInvalidationPayload(await readJson(req));
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          sendJson(res, 400, { error: message });
+          return;
+        }
+        const outcome = await options.adapter.invalidateSession(payload);
         sendJson(res, 200, outcome);
         return;
       }

@@ -37,10 +37,26 @@ export interface RuntimeTurnStream {
   events: AsyncIterable<ProviderEvent>;
 }
 
+export interface McpServerStatus {
+  name: string;
+  status: string;
+  serverInfo?: JsonObject;
+  error?: string;
+  config?: JsonObject;
+  scope?: string;
+  tools?: Array<{
+    name: string;
+    description?: string;
+    annotations?: JsonObject;
+  }>;
+}
+
 export interface ClaudeCodeRuntimeClient {
   startTurn(request: RuntimeTurnRequest): Promise<RuntimeTurnStream>;
   retainHotRuntime?(request: RuntimeTurnRequest, mountId: string): Promise<void>;
+  warmHotRuntime?(request: RuntimeTurnRequest): Promise<void>;
   releaseHotRuntime?(conversationKey: string, mountId: string): Promise<void>;
+  invalidateHotRuntime?(conversationKey: string): Promise<void>;
   listCommands?(
     options?: {
       settingSources?: Array<"user" | "project" | "local">;
@@ -57,4 +73,9 @@ export interface ClaudeCodeRuntimeClient {
       settingSources?: Array<"user" | "project" | "local">;
     }
   ): Promise<string[]>;
+  listMcpServers?(
+    options?: {
+      settingSources?: Array<"user" | "project" | "local">;
+    }
+  ): Promise<McpServerStatus[]>;
 }

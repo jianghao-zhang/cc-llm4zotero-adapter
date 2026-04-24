@@ -130,7 +130,15 @@ function extractResultOutput(msg: Record<string, unknown>): string {
     if (message) {
       return `Error: ${message}`;
     }
-    return `Error: ${JSON.stringify(msg.errors)}`;
+    const rawErrors = JSON.stringify(msg.errors);
+    if (
+      rawErrors.includes("[ede_diagnostic]") &&
+      rawErrors.includes("result_type=assistant") &&
+      rawErrors.includes("last_content_type=none")
+    ) {
+      return "Error: The model returned an empty reply. Please retry.";
+    }
+    return `Error: ${rawErrors}`;
   }
   if (Boolean(msg.is_error)) {
     return "Error: runtime returned an empty error result.";
@@ -158,14 +166,6 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
       (typeof msg.request_id === "string" && msg.request_id.trim()) ||
       "";
     if (!requestId) {
-      // Do not emit actionable confirmation events without a real requestId.
-      // A synthetic id cannot be resolved by the permission store.
-      return [providerEvent];
-    }
-    if (!globalPermissionStore.hasPending(requestId)) {
-      // SDK can surface confirmation-like events that are not backed by our
-      // canUseTool permission store. Rendering those as actionable cards causes
-      // frontend "Allow" clicks to be no-ops (resolve endpoint returns 404).
       return [providerEvent];
     }
     const actionCandidate =
@@ -176,16 +176,25 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
       (msg.pending_action && typeof msg.pending_action === "object"
         ? msg.pending_action
         : undefined);
+    const looksLikeSdkPermission = globalPermissionStore.hasPending(requestId);
+    const isAskUserQuestion =
+      (typeof msg.tool_name === "string" && msg.tool_name === "AskUserQuestion") ||
+      (typeof msg.toolName === "string" && msg.toolName === "AskUserQuestion") ||
+      (typeof msg.name === "string" && msg.name === "AskUserQuestion") ||
+      (typeof msg.message === "string" && msg.message.includes("AskUserQuestion"));
+    if (!looksLikeSdkPermission && !isAskUserQuestion && !actionCandidate) {
+      return [providerEvent];
+    }
     const action =
       (actionCandidate as Record<string, unknown> | undefined) ?? {
-        toolName: "action",
-        title: "Approval required",
-        mode: "approval",
-        confirmLabel: "Approve",
-        cancelLabel: "Deny",
+        toolName: isAskUserQuestion ? "AskUserQuestion" : "action",
+        title: isAskUserQuestion ? "Question from Claude" : "Approval required",
+        mode: isAskUserQuestion ? "question" : "approval",
+        confirmLabel: isAskUserQuestion ? "Submit" : "Approve",
+        cancelLabel: isAskUserQuestion ? "Cancel" : "Deny",
         description:
           typeof msg.message === "string" ? msg.message : "The runtime requests confirmation.",
-        fields: [],
+        fields: Array.isArray(msg.fields) ? msg.fields : [],
       };
     return [
       providerEvent,

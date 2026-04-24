@@ -25,6 +25,7 @@ export type HotRuntimeEntry = {
   closeRequested: boolean;
   lastActivityAt: number;
   query: Query | null;
+  bootstrapPromise: Promise<void> | null;
   input: AsyncIterable<SDKUserMessage>;
   pushMessage: (message: SDKUserMessage) => void;
   closeInput: () => void;
@@ -162,6 +163,7 @@ export function createHotRuntimeEntry(conversationKey: string): HotRuntimeEntry 
     closeRequested: false,
     lastActivityAt: Date.now(),
     query: null,
+    bootstrapPromise: null,
     input: channel.input,
     pushMessage: channel.pushMessage,
     closeInput: channel.closeInput,

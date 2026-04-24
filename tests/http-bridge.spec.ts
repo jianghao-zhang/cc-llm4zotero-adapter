@@ -52,6 +52,56 @@ describe("http bridge server", () => {
     }
   });
 
+  it("merges connected MCP tools into /tools", async () => {
+    const runtimeClient: ClaudeCodeRuntimeClient = {
+      async startTurn() {
+        return {
+          runId: "run-http-mcp-tools",
+          events: providerEvents([])
+        };
+      },
+      async listMcpServers() {
+        return [
+          {
+            name: "grok-search",
+            status: "connected",
+            scope: "user",
+            tools: [
+              { name: "web_search", description: "Search with Grok" },
+              { name: "switch_model", annotations: { destructive: true } },
+            ],
+          },
+          {
+            name: "broken-mcp",
+            status: "failed",
+            tools: [{ name: "should_not_show" }],
+          },
+        ];
+      }
+    };
+    const base = new ClaudeCodeRuntimeAdapter({
+      runtimeClient,
+      sessionMapper: new InMemorySessionMapper()
+    });
+    const compat = new Llm4ZoteroAgentBackendAdapter({ adapter: base });
+    const server = await startHttpBridgeServer({ adapter: compat });
+
+    try {
+      const response = await fetch(`http://${server.host}:${server.port}/tools?settingSources=user`);
+      expect(response.ok).toBe(true);
+      const payload = await response.json() as { tools?: Array<{ name: string; source: string; mutability: string; requiresConfirmation: boolean }> };
+      const tools = payload.tools || [];
+      expect(tools.some((tool) => tool.name === "grok-search.web_search" && tool.source === "mcp")).toBe(true);
+      expect(tools.some((tool) => tool.name === "broken-mcp.should_not_show")).toBe(false);
+      expect(tools.find((tool) => tool.name === "grok-search.switch_model")).toMatchObject({
+        mutability: "write",
+        requiresConfirmation: true,
+      });
+    } finally {
+      await server.close();
+    }
+  });
+
   it("streams a single start line with the runtime runId", async () => {
     const runtimeClient: ClaudeCodeRuntimeClient = {
       async startTurn() {

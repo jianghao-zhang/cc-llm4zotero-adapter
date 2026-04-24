@@ -280,7 +280,8 @@ export async function startHttpBridgeServer(
         const settingSources = parseSettingSources(
           reqUrl.searchParams.get("settingSources"),
         );
-        sendJson(res, 200, { tools: options.adapter.listTools({ settingSources }) });
+        const tools = await options.adapter.listTools({ settingSources });
+        sendJson(res, 200, { tools });
         return;
       }
 

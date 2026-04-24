@@ -164,13 +164,45 @@ export class Llm4ZoteroAgentBackendAdapter {
     };
   }
 
-  listTools(options?: {
+  async listTools(options?: {
     settingSources?: Array<"user" | "project" | "local">;
   }) {
-    return getToolCatalog({
+    const catalog = getToolCatalog({
       runtimeCwd: this.runtimeCwd,
       settingSources: options?.settingSources,
     });
+    const mcpTools = await this.listMcpToolDescriptors(options);
+    const seen = new Set<string>();
+    return [...catalog, ...mcpTools].filter((tool) => {
+      if (seen.has(tool.name)) return false;
+      seen.add(tool.name);
+      return true;
+    });
+  }
+
+  private async listMcpToolDescriptors(options?: {
+    settingSources?: Array<"user" | "project" | "local">;
+  }) {
+    const servers = await this.adapter.listRuntimeMcpServers(options);
+    return servers.flatMap((server) => {
+      if (server.status !== "connected" || !Array.isArray(server.tools)) return [];
+      return server.tools.map((tool) => {
+        const destructive = Boolean(tool.annotations?.destructive);
+        return {
+          name: `${server.name}.${tool.name}`,
+          description: tool.description || `MCP tool ${tool.name} from ${server.name}`,
+          inputSchema: {
+            type: "object",
+            properties: {},
+            additionalProperties: true,
+          },
+          mutability: destructive ? "write" as const : "read" as const,
+          riskLevel: destructive ? "high" as const : "medium" as const,
+          requiresConfirmation: destructive,
+          source: "mcp" as const,
+        };
+      });
+    }).sort((a, b) => a.name.localeCompare(b.name));
   }
 
   async listCommands(

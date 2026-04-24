@@ -97,6 +97,21 @@ export class ClaudeCodeRuntimeAdapter {
     }
   }
 
+  async listRuntimeMcpServers(
+    options?: {
+      settingSources?: Array<"user" | "project" | "local">;
+    },
+  ) {
+    if (typeof this.runtimeClient.listMcpServers !== "function") {
+      return [];
+    }
+    try {
+      return await this.runtimeClient.listMcpServers(options);
+    } catch {
+      return [];
+    }
+  }
+
   private buildSessionMapKey(requestOrConversationKey: RunTurnRequest | string): string {
     if (typeof requestOrConversationKey === "string") {
       return requestOrConversationKey;

@@ -77,8 +77,10 @@ function parseBoolean(value: string | undefined, defaultValue: boolean): boolean
   return defaultValue;
 }
 
+const DEFAULT_SETTING_SOURCES: SettingSource[] = ["user", "project", "local"];
+
 function parseSettingSources(value: string | undefined): SettingSource[] {
-  const raw = (value || "project,local")
+  const raw = (value || DEFAULT_SETTING_SOURCES.join(","))
     .split(",")
     .map((entry) => entry.trim())
     .filter(Boolean);
@@ -88,7 +90,7 @@ function parseSettingSources(value: string | undefined): SettingSource[] {
       accepted.push(source);
     }
   }
-  return accepted.length > 0 ? accepted : ["project", "local"];
+  return accepted.length > 0 ? accepted : DEFAULT_SETTING_SOURCES;
 }
 
 function normalizePathWithHome(value: string, homeDir: string | undefined): string | undefined {

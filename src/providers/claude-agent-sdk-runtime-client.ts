@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import { mkdirSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import type { ClaudeCodeRuntimeClient, ProviderEvent, RuntimeTurnRequest, RuntimeTurnStream } from "../runtime.js";
+import type { ClaudeCodeRuntimeClient, McpServerStatus, ProviderEvent, RuntimeTurnRequest, RuntimeTurnStream } from "../runtime.js";
 import { mapSdkMessageToProviderEvents } from "../event-mapper/map-sdk-message.js";
 import { globalPermissionStore } from "../permissions/permission-store.js";
 import type { PermissionResult } from "../permissions/permission-store.js";
@@ -25,6 +25,10 @@ type ClaudeSlashCommandInfo = {
   name?: string;
   description?: string;
   argumentHint?: string;
+};
+
+type QueryWithMcpStatus = Query & {
+  mcpServerStatus?: () => Promise<unknown>;
 };
 
 type RuntimeEffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
@@ -104,6 +108,21 @@ function trimInline(value: unknown, max = 280): string {
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   return value as Record<string, unknown>;
+}
+function redactMcpConfig(value: unknown): Record<string, unknown> | undefined {
+  const record = asRecord(value);
+  if (!record) return undefined;
+  const redacted: Record<string, unknown> = { ...record };
+  const headers = asRecord(redacted.headers);
+  if (headers) {
+    redacted.headers = Object.fromEntries(
+      Object.entries(headers).map(([key, headerValue]) => [
+        key,
+        /authorization|api[-_]?key|token|secret|password/i.test(key) ? "[redacted]" : headerValue,
+      ]),
+    );
+  }
+  return redacted;
 }
 function toRuntimeRequest(request: RuntimeTurnRequest, metadata: Record<string, unknown>): RuntimeRequestShape | undefined {
   const direct = asRecord(request.runtimeRequest);
@@ -622,7 +641,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
   ): Promise<RuntimeTurnStream> {
     const metadata = parseMetadata(request.metadata, this.options);
     const settingSourcesOverride = parseSettingSourcesOverride(metadata);
-    const effectiveSettingSources = settingSourcesOverride ?? this.options.settingSources ?? ["user", "project"];
+    const effectiveSettingSources = settingSourcesOverride ?? this.options.settingSources ?? ["user", "project", "local"];
     const effectiveCwd = this.resolveScopedCwd(request.metadata);
     const providerIdentity = await buildSettingsStackIdentity(
       effectiveSettingSources,
@@ -711,7 +730,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
   ): Promise<HotRuntimeEntry> {
     const metadata = seed?.metadata ?? parseMetadata(request.metadata, this.options);
     const settingSourcesOverride = parseSettingSourcesOverride(metadata);
-    const effectiveSettingSources = settingSourcesOverride ?? this.options.settingSources ?? ["user", "project"];
+    const effectiveSettingSources = settingSourcesOverride ?? this.options.settingSources ?? ["user", "project", "local"];
     const effectiveCwd = this.resolveScopedCwd(request.metadata);
     const providerIdentity = seed?.providerIdentity ?? await buildSettingsStackIdentity(
       effectiveSettingSources,
@@ -1026,7 +1045,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
   async listModels(options?: { settingSources?: Array<"user" | "project" | "local">; providerKey?: string }): Promise<string[]> {
     const sdkInfos = await this.readSupportedModelsFromSdk(options);
     const requestedSources = options?.settingSources;
-    const settingSources = Array.isArray(requestedSources) && requestedSources.length > 0 ? requestedSources : this.options.settingSources ?? ["user", "project"];
+    const settingSources = Array.isArray(requestedSources) && requestedSources.length > 0 ? requestedSources : this.options.settingSources ?? ["user", "project", "local"];
     const unique = new Set<string>();
     for (const info of sdkInfos) {
       const value = normalizeModelName(info.value);
@@ -1068,6 +1087,57 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     return [...base, "xhigh"];
   }
 
+  async listMcpServers(options?: { settingSources?: Array<"user" | "project" | "local"> }): Promise<McpServerStatus[]> {
+    const requestedSources = options?.settingSources;
+    const settingSources = Array.isArray(requestedSources) && requestedSources.length > 0 ? requestedSources : this.options.settingSources ?? ["user", "project", "local"];
+    try {
+      const query = this.options.queryImpl ?? (await this.loadQuery());
+      const session = query({
+        prompt: "",
+        options: {
+          cwd: this.options.cwd ? resolve(this.options.cwd) : process.cwd(),
+          settingSources,
+          permissionMode: this.options.permissionMode,
+        },
+      }) as QueryWithMcpStatus;
+      if (typeof session.mcpServerStatus !== "function") {
+        try { await session.return(undefined); } catch {}
+        return [];
+      }
+      const statusesRaw = await session.mcpServerStatus();
+      try { await session.return(undefined); } catch {}
+      return Array.isArray(statusesRaw) ? statusesRaw.map((entry) => this.normalizeMcpServerStatus(entry)).filter((entry): entry is McpServerStatus => Boolean(entry)) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  private normalizeMcpServerStatus(value: unknown): McpServerStatus | null {
+    const record = asRecord(value);
+    if (!record || typeof record.name !== "string" || typeof record.status !== "string") return null;
+    return {
+      name: record.name,
+      status: record.status,
+      serverInfo: asRecord(record.serverInfo),
+      error: typeof record.error === "string" ? record.error : undefined,
+      config: redactMcpConfig(record.config),
+      scope: typeof record.scope === "string" ? record.scope : undefined,
+      tools: Array.isArray(record.tools)
+        ? record.tools
+            .map((tool) => {
+              const toolRecord = asRecord(tool);
+              if (!toolRecord || typeof toolRecord.name !== "string") return null;
+              return {
+                name: toolRecord.name,
+                description: typeof toolRecord.description === "string" ? toolRecord.description : undefined,
+                annotations: asRecord(toolRecord.annotations),
+              };
+            })
+            .filter((tool): tool is NonNullable<typeof tool> => Boolean(tool))
+        : undefined,
+    };
+  }
+
   private buildConfigSourcePrompt(effectiveSettingSources: SettingSource[], effectiveCwd: string | undefined, metadata: Record<string, unknown>): string {
     const configSourceMode = typeof metadata.claudeConfigSource === "string" ? String(metadata.claudeConfigSource).trim().toLowerCase() : "default";
     const configPathMap = {
@@ -1097,7 +1167,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     const permissionModeOverride = parsePermissionModeOverride(metadata);
     const customInstruction = parseCustomInstruction(metadata);
     const effectiveCwd = this.resolveScopedCwd(request.metadata);
-    const effectiveSettingSources = settingSourcesOverride ?? this.options.settingSources ?? ["user", "project"];
+    const effectiveSettingSources = settingSourcesOverride ?? this.options.settingSources ?? ["user", "project", "local"];
     const providerKey =
       (await buildSettingsStackIdentity(
         effectiveSettingSources,
@@ -1271,7 +1341,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
 
   private async readSupportedModelsFromSdk(options?: { settingSources?: Array<"user" | "project" | "local">; providerKey?: string }): Promise<ClaudeModelInfo[]> {
     const requestedSources = options?.settingSources;
-    const settingSources = Array.isArray(requestedSources) && requestedSources.length > 0 ? requestedSources : this.options.settingSources ?? ["user", "project"];
+    const settingSources = Array.isArray(requestedSources) && requestedSources.length > 0 ? requestedSources : this.options.settingSources ?? ["user", "project", "local"];
     const providerKey = options?.providerKey || "default";
     const cacheKey = `${providerKey}::${settingSources.join(",")}`;
     const cached = this.modelInfoCache.get(cacheKey);
@@ -1301,7 +1371,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
 
   private async readSupportedCommandsFromSdk(options?: { settingSources?: Array<"user" | "project" | "local">; providerKey?: string }): Promise<ClaudeSlashCommandInfo[]> {
     const requestedSources = options?.settingSources;
-    const settingSources = Array.isArray(requestedSources) && requestedSources.length > 0 ? requestedSources : this.options.settingSources ?? ["user", "project"];
+    const settingSources = Array.isArray(requestedSources) && requestedSources.length > 0 ? requestedSources : this.options.settingSources ?? ["user", "project", "local"];
     const cacheKey = `${options?.providerKey || "default"}::${settingSources.join(",")}`;
     const cached = this.commandInfoCache.get(cacheKey);
     if (cached && Date.now() < cached.expiresAt) return cached.commands;

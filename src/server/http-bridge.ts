@@ -86,6 +86,17 @@ function sendJson(res: ServerResponse, statusCode: number, body: unknown): void 
   res.end(JSON.stringify(body));
 }
 
+function redactSecrets(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((entry) => redactSecrets(entry));
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).map(([key, entry]) => [
+      key,
+      /authorization|api[-_]?key|token|secret|password/i.test(key) ? "[redacted]" : redactSecrets(entry),
+    ]),
+  );
+}
+
 async function readJson(req: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
   for await (const chunk of req) {
@@ -270,6 +281,15 @@ export async function startHttpBridgeServer(
           reqUrl.searchParams.get("settingSources"),
         );
         sendJson(res, 200, { tools: options.adapter.listTools({ settingSources }) });
+        return;
+      }
+
+      if (req.method === "GET" && reqUrl.pathname === "/mcp-servers") {
+        const settingSources = parseSettingSources(
+          reqUrl.searchParams.get("settingSources"),
+        );
+        const servers = await options.adapter.listMcpServers({ settingSources });
+        sendJson(res, 200, { servers: redactSecrets(servers) });
         return;
       }
 

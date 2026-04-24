@@ -29,6 +29,16 @@ const runtimeCwd = process.env.ADAPTER_RUNTIME_CWD || defaultRuntimeCwd;
 const stateDir = process.env.ADAPTER_STATE_DIR || defaultStateDir;
 const port = process.env.ADAPTER_PORT || DEFAULT_PORT;
 const uid = String(process.getuid?.() ?? 0);
+const daemonPath = [
+  resolve(homeDir, ".local", "bin"),
+  resolve(homeDir, ".cargo", "bin"),
+  "/opt/homebrew/bin",
+  "/usr/local/bin",
+  "/usr/bin",
+  "/bin",
+  "/usr/sbin",
+  "/sbin",
+].join(":");
 
 function run(cmd: string, args: string[], opts?: { allowFailure?: boolean; silent?: boolean }): string {
   const result = spawnSync(cmd, args, {
@@ -77,7 +87,7 @@ function buildPlistXml(): string {
     <key>HOME</key>
     <string>${escapeXml(homeDir)}</string>
     <key>PATH</key>
-    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <string>${escapeXml(daemonPath)}</string>
     <key>ADAPTER_HOST</key>
     <string>127.0.0.1</string>
     <key>ADAPTER_PORT</key>

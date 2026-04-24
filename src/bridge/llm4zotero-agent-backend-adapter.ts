@@ -233,6 +233,14 @@ export class Llm4ZoteroAgentBackendAdapter {
     return Array.from(unique);
   }
 
+  async listMcpServers(
+    options?: {
+      settingSources?: Array<"user" | "project" | "local">;
+    },
+  ) {
+    return this.adapter.listRuntimeMcpServers(options);
+  }
+
   async getSessionInfo(params: {
     conversationKey: string | number;
     scopeType?: ScopeType;

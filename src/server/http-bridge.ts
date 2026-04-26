@@ -385,6 +385,12 @@ export async function startHttpBridgeServer(
         return;
       }
 
+      if (req.method === "POST" && req.url === "/invalidate-all-hot-runtimes") {
+        const outcome = await options.adapter.invalidateAllHotRuntimes();
+        sendJson(res, 200, outcome);
+        return;
+      }
+
       if (req.method === "POST" && req.url === "/run-turn") {
         let payload: Llm4ZoteroRunTurnRequest;
         try {

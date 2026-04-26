@@ -375,6 +375,11 @@ export class Llm4ZoteroAgentBackendAdapter {
     };
   }
 
+  async invalidateAllHotRuntimes(): Promise<{ invalidated: boolean }> {
+    await this.adapter.invalidateAllHotRuntimes?.();
+    return { invalidated: true };
+  }
+
   async runTurn(params: Llm4ZoteroRunTurnParams): Promise<Llm4ZoteroRunTurnOutcome> {
     let lastFallbackReason = "";
     let finalText = "";

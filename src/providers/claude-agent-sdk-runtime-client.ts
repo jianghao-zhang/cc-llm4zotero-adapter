@@ -377,13 +377,9 @@ function shouldAutoCompact(
   const rawThreshold = Number(metadata.claudeAutoCompactThresholdPercent);
   if (!Number.isFinite(rawThreshold)) return false;
   const threshold = Math.max(0, Math.min(99, Math.round(rawThreshold)));
-  const estimatedContextTokens = Math.max(0, Number(metadata.claudeEstimatedContextTokens) || 0);
-  const contextTokens = Math.max(
-    estimatedContextTokens,
-    Math.max(0, Number(usageSnapshot?.contextTokens) || 0),
-  );
-  if (threshold === 0) return contextTokens > 0 || estimatedContextTokens > 0;
-  const contextWindow = Math.max(0, Number(usageSnapshot?.contextWindow) || 200_000);
+  const contextTokens = Math.max(0, Number(usageSnapshot?.contextTokens) || 0);
+  if (threshold === 0) return contextTokens > 0;
+  const contextWindow = Math.max(0, Number(usageSnapshot?.contextWindow) || 0);
   if (contextTokens <= 0 || contextWindow <= 0) return false;
   const percentage = Math.round((contextTokens / contextWindow) * 100);
   return percentage >= threshold;
@@ -544,6 +540,13 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     this.usageSnapshots.delete(conversationKey);
   }
 
+  async invalidateAllHotRuntimes(): Promise<void> {
+    const keys = Array.from(this.hotRuntimePool["entries"].keys()) as string[];
+    for (const key of keys) {
+      await this.invalidateHotRuntime(key);
+    }
+  }
+
   private createProfilingEvent(
     conversationKey: string,
     stage: string,
@@ -637,7 +640,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
   private async startHotTurn(
     request: RuntimeTurnRequest,
     entry: HotRuntimeEntry,
-    _options?: CompactTurnOptions,
+    options?: CompactTurnOptions,
   ): Promise<RuntimeTurnStream> {
     const metadata = parseMetadata(request.metadata, this.options);
     const settingSourcesOverride = parseSettingSourcesOverride(metadata);
@@ -697,10 +700,12 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     const turn = createHotRuntimeTurn(runId);
     entry.currentTurn = turn;
     const providerSessionId = entry.providerSessionId || request.providerSessionId;
-    turn.awaitingAutoCompact = /^\/compact(?:\s|$)/i.test(request.userMessage.trim());
-    turn.compactOnly = turn.awaitingAutoCompact;
+    const shouldInjectCompact = options?.autoCompactNeeded === true;
+    turn.awaitingAutoCompact = shouldInjectCompact || /^\/compact(?:\s|$)/i.test(request.userMessage.trim());
+    turn.compactOnly = /^\/compact(?:\s|$)/i.test(request.userMessage.trim());
     const message = await this.buildHotUserMessage({
       ...request,
+      userMessage: shouldInjectCompact ? "/compact" : request.userMessage,
       providerSessionId,
     });
     entry.pushMessage(message);
@@ -942,8 +947,13 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
   ): Promise<RuntimeTurnStream> {
     const query = this.options.queryImpl ?? (await this.loadQuery());
     const metadata = options?.metadata ?? parseMetadata(request.metadata, this.options);
-    const queryOptions = await this.buildQueryOptions(request, metadata, request.providerSessionId);
-    const prompt: string | AsyncIterable<SDKUserMessage> = await buildPromptInput(request, metadata);
+    const shouldInjectCompact = options?.autoCompactNeeded === true;
+    const effectiveUserMessage = shouldInjectCompact ? "/compact" : request.userMessage;
+    const effectiveRequest = shouldInjectCompact
+      ? { ...request, userMessage: effectiveUserMessage }
+      : request;
+    const queryOptions = await this.buildQueryOptions(effectiveRequest, metadata, request.providerSessionId);
+    const prompt: string | AsyncIterable<SDKUserMessage> = await buildPromptInput(effectiveRequest, metadata);
     const sdkStream = query({ prompt, options: queryOptions });
     return {
       runId: randomUUID(),
@@ -953,7 +963,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
         request,
         metadata,
         queryOptions,
-        /^\/compact(?:\s|$)/i.test(request.userMessage.trim()),
+        shouldInjectCompact || /^\/compact(?:\s|$)/i.test(request.userMessage.trim()),
       ),
     };
   }
@@ -976,68 +986,72 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
         ? String((queryOptions as Record<string, unknown>).effortFallbackNotice)
         : undefined;
     return (async function* () {
-      yield {
-        type: "provider_event",
-        payload: {
-          providerType: "runtime_config",
-          sessionId: request.providerSessionId,
-          ts: Date.now(),
+      try {
+        yield {
+          type: "provider_event",
           payload: {
-            requestedModel: (queryOptions as Record<string, unknown>).requestedModel ?? null,
-            requestedEffort: (queryOptions as Record<string, unknown>).requestedEffort ?? null,
-            resolvedEffort: queryOptions.effort ?? null,
-            supportedEfforts,
-            effortFallbackNotice: effortFallbackNotice ?? null,
-            resolvedPermissionMode: queryOptions.permissionMode ?? null,
-            settingSources: queryOptions.settingSources ?? null,
-            configSourceMode: metadata.claudeConfigSource ?? null,
-            cwd: queryOptions.cwd ?? null,
+            providerType: "runtime_config",
+            sessionId: request.providerSessionId,
+            ts: Date.now(),
+            payload: {
+              requestedModel: (queryOptions as Record<string, unknown>).requestedModel ?? null,
+              requestedEffort: (queryOptions as Record<string, unknown>).requestedEffort ?? null,
+              resolvedEffort: queryOptions.effort ?? null,
+              supportedEfforts,
+              effortFallbackNotice: effortFallbackNotice ?? null,
+              resolvedPermissionMode: queryOptions.permissionMode ?? null,
+              settingSources: queryOptions.settingSources ?? null,
+              configSourceMode: metadata.claudeConfigSource ?? null,
+              cwd: queryOptions.cwd ?? null,
+            },
           },
-        },
-      };
-      if (effortFallbackNotice) {
-        yield { type: "status", payload: { text: effortFallbackNotice } };
-      }
-      for await (const raw of sdkStream) {
-        const mapped = mapSdkMessageToProviderEvents(raw);
-        for (const event of mapped) {
-          if (event.type === "usage") {
-            const payload = event.payload as Record<string, unknown>;
-            const nextContextTokens = Number(payload.contextTokens);
-            const nextContextWindow = Number(payload.contextWindow);
-            const previous = usageSnapshots.get(request.conversationKey);
-            const merged = {
-              contextTokens:
-                Number.isFinite(nextContextTokens) && nextContextTokens > 0
-                  ? Math.max(0, nextContextTokens)
-                  : previous?.contextTokens ?? 0,
-              contextWindow:
-                Number.isFinite(nextContextWindow) && nextContextWindow > 0
-                  ? nextContextWindow
-                  : previous?.contextWindow,
-            };
-            usageSnapshots.set(request.conversationKey, merged);
-            const liveEntry = hotRuntimePool.get(request.conversationKey);
-            if (liveEntry) {
-              liveEntry.lastUsageSnapshot = merged;
-            }
-          }
-          if (awaitingAutoCompact) {
-            if (event.type === "context_compacted") {
-              yield {
-                type: "context_compacted",
-                payload: { automatic: true },
-              };
-              continue;
-            }
-            if (event.type === "final") {
-              awaitingAutoCompact = false;
-              continue;
-            }
-            continue;
-          }
-          yield event;
+        };
+        if (effortFallbackNotice) {
+          yield { type: "status", payload: { text: effortFallbackNotice } };
         }
+        for await (const raw of sdkStream) {
+          const mapped = mapSdkMessageToProviderEvents(raw);
+          for (const event of mapped) {
+            if (event.type === "usage") {
+              const payload = event.payload as Record<string, unknown>;
+              const nextContextTokens = Number(payload.contextTokens);
+              const nextContextWindow = Number(payload.contextWindow);
+              const previous = usageSnapshots.get(request.conversationKey);
+              const merged = {
+                contextTokens:
+                  Number.isFinite(nextContextTokens) && nextContextTokens > 0
+                    ? Math.max(0, nextContextTokens)
+                    : previous?.contextTokens ?? 0,
+                contextWindow:
+                  Number.isFinite(nextContextWindow) && nextContextWindow > 0
+                    ? nextContextWindow
+                    : previous?.contextWindow,
+              };
+              usageSnapshots.set(request.conversationKey, merged);
+              const liveEntry = hotRuntimePool.get(request.conversationKey);
+              if (liveEntry) {
+                liveEntry.lastUsageSnapshot = merged;
+              }
+            }
+            if (awaitingAutoCompact) {
+              if (event.type === "context_compacted") {
+                yield {
+                  type: "context_compacted",
+                  payload: { automatic: true },
+                };
+                continue;
+              }
+              if (event.type === "final") {
+                awaitingAutoCompact = false;
+                continue;
+              }
+              continue;
+            }
+            yield event;
+          }
+        }
+      } finally {
+        try { sdkStream.close(); } catch {}
       }
     })();
   }
@@ -1102,10 +1116,12 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       }) as QueryWithMcpStatus;
       if (typeof session.mcpServerStatus !== "function") {
         try { await session.return(undefined); } catch {}
+        try { session.close(); } catch {}
         return [];
       }
       const statusesRaw = await session.mcpServerStatus();
       try { await session.return(undefined); } catch {}
+      try { session.close(); } catch {}
       return Array.isArray(statusesRaw) ? statusesRaw.map((entry) => this.normalizeMcpServerStatus(entry)).filter((entry): entry is McpServerStatus => Boolean(entry)) : [];
     } catch {
       return [];
@@ -1360,6 +1376,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       }) as Query;
       const infosRaw = await session.supportedModels();
       try { await session.return(undefined); } catch {}
+      try { session.close(); } catch {}
       const infos = Array.isArray(infosRaw) ? infosRaw : [];
       this.modelInfoCache.set(cacheKey, { infos, expiresAt: Date.now() + this.modelInfoTtlMs });
       setCachedModels(settingSources, infos, providerKey);
@@ -1383,6 +1400,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       }) as Query;
       const commandsRaw = await session.supportedCommands();
       try { await session.return(undefined); } catch {}
+      try { session.close(); } catch {}
       const commands = Array.isArray(commandsRaw) ? commandsRaw : [];
       this.commandInfoCache.set(cacheKey, { commands, expiresAt: Date.now() + this.commandInfoTtlMs });
       return commands;

@@ -57,6 +57,7 @@ export interface ClaudeCodeRuntimeClient {
   warmHotRuntime?(request: RuntimeTurnRequest): Promise<void>;
   releaseHotRuntime?(conversationKey: string, mountId: string): Promise<void>;
   invalidateHotRuntime?(conversationKey: string): Promise<void>;
+  invalidateAllHotRuntimes?(): Promise<void>;
   listCommands?(
     options?: {
       settingSources?: Array<"user" | "project" | "local">;

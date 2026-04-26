@@ -189,6 +189,10 @@ export class ClaudeCodeRuntimeAdapter {
     await this.runtimeClient.releaseHotRuntime?.(conversationKey, mountId);
   }
 
+  async invalidateAllHotRuntimes(): Promise<void> {
+    await this.runtimeClient.invalidateAllHotRuntimes?.();
+  }
+
   private extractProviderIdentity(request: RunTurnRequest): string {
     const metadata =
       request.metadata && typeof request.metadata === "object"
@@ -233,44 +237,7 @@ export class ClaudeCodeRuntimeAdapter {
         },
       });
     }
-    const metadata =
-      request.metadata && typeof request.metadata === "object"
-        ? (request.metadata as Record<string, unknown>)
-        : {};
-    const autoCompactEligible = metadata.claudeAutoCompactEligible === true;
-    const rawThreshold = Number(metadata.claudeAutoCompactThresholdPercent);
-    const estimatedContextTokens = Math.max(0, Number(metadata.claudeEstimatedContextTokens) || 0);
-    const shouldPreCompact =
-      autoCompactEligible &&
-      !/^\/compact(?:\s|$)/i.test(request.userMessage.trim()) &&
-      Number.isFinite(rawThreshold) &&
-      (Math.max(0, Math.min(99, Math.round(rawThreshold))) === 0
-        ? estimatedContextTokens > 0
-        : estimatedContextTokens > 0 && estimatedContextTokens / 200_000 >= rawThreshold / 100);
-
     let providerSessionId = initialSessionId;
-    if (shouldPreCompact) {
-      hooks.onEvent?.({
-        type: "status",
-        ts: Date.now(),
-        payload: {
-          text: "Compacting context…",
-        },
-      });
-      const compactRequest: RunTurnRequest = {
-        ...request,
-        userMessage: "/compact",
-        metadata: {
-          ...metadata,
-          claudeAutoCompactEligible: false,
-        },
-      };
-      const compactOutcome = await this.runTurnOnce(compactRequest, hooks, signal, providerSessionId);
-      providerSessionId = compactOutcome.providerSessionId ?? providerSessionId;
-      if (compactOutcome.status !== "completed") {
-        return compactOutcome;
-      }
-    }
 
     let firstOutcome: RunTurnOutcome;
     try {

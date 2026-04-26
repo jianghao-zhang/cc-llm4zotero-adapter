@@ -315,6 +315,7 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
     const output = extractResultOutput(msg);
     const events: ProviderEvent[] = [providerEvent];
     const usageEvent = normalizeUsagePayload({
+      usage: asRecord(msg.usage),
       modelUsage: asRecord(msg.modelUsage) as Record<string, ModelUsageEntry> | undefined,
       sessionId,
     });

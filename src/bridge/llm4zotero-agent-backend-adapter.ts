@@ -97,10 +97,12 @@ function buildRuntimeCwdRelative(
   originalConversationKey: string,
 ): string | undefined {
   if (!scope) return undefined;
+  const profileSegment = scope.scopeId.match(/^(profile-[a-zA-Z0-9_-]+)(?::|$)/)?.[1];
+  const profilePrefix = profileSegment ? `${toSafePathSegment(profileSegment)}/` : "";
   const scopeType = toSafePathSegment(scope.scopeType);
   const scopeId = toSafePathSegment(scope.scopeId);
   const conversationDir = toSafePathSegment(originalConversationKey);
-  return `scopes/${scopeType}/${scopeId}/conversations/${conversationDir}`;
+  return `${profilePrefix}scopes/${scopeType}/${scopeId}/conversations/${conversationDir}`;
 }
 
 function resolveSessionCwd(

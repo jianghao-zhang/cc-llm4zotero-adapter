@@ -216,7 +216,7 @@ describe("http bridge server", () => {
           conversationKey: "0042",
           userText: "hello",
           scopeType: "paper",
-          scopeId: "1:42",
+          scopeId: "profile-test:1:42",
           scopeLabel: "Paper 42",
         })
       });
@@ -224,7 +224,7 @@ describe("http bridge server", () => {
       await readNdjsonLines(runResponse);
 
       const sessionInfoResponse = await fetch(
-        `http://${server.host}:${server.port}/session-info?conversationKey=0042&scopeType=paper&scopeId=1%3A42&scopeLabel=Paper%2042`
+        `http://${server.host}:${server.port}/session-info?conversationKey=0042&scopeType=paper&scopeId=profile-test%3A1%3A42&scopeLabel=Paper%2042`
       );
       expect(sessionInfoResponse.ok).toBe(true);
       const payload = await sessionInfoResponse.json() as {
@@ -236,16 +236,16 @@ describe("http bridge server", () => {
           cwd?: string;
         };
       };
-      expect(seenKeys).toEqual(["0042::paper:1:42"]);
+      expect(seenKeys).toEqual(["0042::paper:profile-test:1:42"]);
       expect(payload.session).toEqual({
         originalConversationKey: "0042",
-        scopedConversationKey: "0042::paper:1:42",
+        scopedConversationKey: "0042::paper:profile-test:1:42",
         providerSessionId: "sess-http-string-key",
         scopeType: "paper",
-        scopeId: "1:42",
+        scopeId: "profile-test:1:42",
         scopeLabel: "Paper 42",
-        runtimeCwdRelative: "scopes/paper/1:42/conversations/0042",
-        cwd: "/tmp/adapter-runtime/scopes/paper/1:42/conversations/0042",
+        runtimeCwdRelative: "profile-test/scopes/paper/profile-test:1:42/conversations/0042",
+        cwd: "/tmp/adapter-runtime/profile-test/scopes/paper/profile-test:1:42/conversations/0042",
       });
     } finally {
       await server.close();

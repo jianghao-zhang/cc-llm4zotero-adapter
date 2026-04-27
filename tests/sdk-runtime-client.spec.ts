@@ -178,6 +178,33 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
     expect(remainingTypes).toContain("final");
   });
 
+  it("omits host permission callback in yolo/bypass mode", async () => {
+    let seenOptions: Record<string, unknown> = {};
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      queryImpl(args) {
+        seenOptions = args.options;
+        return makeStream([
+          { type: "result", session_id: "session-yolo", result: "ok", is_error: false }
+        ]);
+      },
+    });
+
+    const stream = await runtime.startTurn({
+      conversationKey: "conv-yolo-permission",
+      userMessage: "edit a file",
+      metadata: {
+        permissionMode: "yolo",
+      },
+    });
+    for await (const _event of stream.events) {
+      void _event;
+    }
+
+    expect(seenOptions.permissionMode).toBe("bypassPermissions");
+    expect(seenOptions.canUseTool).toBeUndefined();
+    expect(globalPermissionStore.pendingCount()).toBe(0);
+  });
+
   it("ignores frontend model metadata by default", async () => {
     let seenOptions: Record<string, unknown> = {};
 

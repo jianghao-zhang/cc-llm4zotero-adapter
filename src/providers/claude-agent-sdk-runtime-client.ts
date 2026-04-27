@@ -1722,36 +1722,40 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       capabilityInfo,
       effortSuccessKey,
     });
-    const canUseTool = async (
-      toolName: string,
-      input: Record<string, unknown>,
-      sdkOptions: { signal: AbortSignal; title?: string; description?: string; displayName?: string; toolUseID: string; blockedPath?: string; decisionReason?: string },
-    ): Promise<PermissionResult> => {
-      const { requestId, promise } = globalPermissionStore.create(sdkOptions.toolUseID, toolName, input, {
-        title: sdkOptions.title,
-        description: sdkOptions.description,
-        displayName: sdkOptions.displayName,
-        blockedPath: sdkOptions.blockedPath,
-        decisionReason: sdkOptions.decisionReason,
-      });
-      onPermissionRequired?.({
-        type: "confirmation_required",
-        payload: {
-          requestId,
-          action: buildPermissionAction({
-            toolName,
-            title: sdkOptions.title,
-            description: sdkOptions.description,
-            displayName: sdkOptions.displayName,
-            blockedPath: sdkOptions.blockedPath,
-            decisionReason: sdkOptions.decisionReason,
-            toolInput: input,
-          }),
-          sessionId: providerSessionId,
-        },
-      });
-      return promise;
-    };
+    const effectivePermissionMode = permissionModeOverride ?? this.options.permissionMode;
+    const canUseTool =
+      effectivePermissionMode === "bypassPermissions"
+        ? undefined
+        : async (
+            toolName: string,
+            input: Record<string, unknown>,
+            sdkOptions: { signal: AbortSignal; title?: string; description?: string; displayName?: string; toolUseID: string; blockedPath?: string; decisionReason?: string },
+          ): Promise<PermissionResult> => {
+            const { requestId, promise } = globalPermissionStore.create(sdkOptions.toolUseID, toolName, input, {
+              title: sdkOptions.title,
+              description: sdkOptions.description,
+              displayName: sdkOptions.displayName,
+              blockedPath: sdkOptions.blockedPath,
+              decisionReason: sdkOptions.decisionReason,
+            });
+            onPermissionRequired?.({
+              type: "confirmation_required",
+              payload: {
+                requestId,
+                action: buildPermissionAction({
+                  toolName,
+                  title: sdkOptions.title,
+                  description: sdkOptions.description,
+                  displayName: sdkOptions.displayName,
+                  blockedPath: sdkOptions.blockedPath,
+                  decisionReason: sdkOptions.decisionReason,
+                  toolInput: input,
+                }),
+                sessionId: providerSessionId,
+              },
+            });
+            return promise;
+          };
     return Object.fromEntries(
       Object.entries({
         ...metadata,
@@ -1768,7 +1772,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
         additionalDirectories: this.options.additionalDirectories,
         allowedTools: mergeAllowedTools(request.allowedTools, this.options.defaultAllowedTools),
         settingSources: effectiveSettingSources,
-        permissionMode: permissionModeOverride ?? this.options.permissionMode,
+        permissionMode: effectivePermissionMode,
         includePartialMessages: this.options.includePartialMessages,
         maxTurns: this.options.maxTurns,
         continue: this.options.continue,

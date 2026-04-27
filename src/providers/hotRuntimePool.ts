@@ -34,6 +34,9 @@ export type HotRuntimeEntry = {
   providerIdentity?: string;
   lastUsageSnapshot?: { contextTokens: number; contextWindow?: number };
   currentTurn: HotRuntimeTurn | null;
+  currentTurnMessage?: SDKUserMessage;
+  pendingEarlyRuntimeError?: Error;
+  pendingEarlyRuntimeQueryOptions?: Record<string, unknown>;
 };
 
 function createMessageChannel(): {
@@ -172,6 +175,9 @@ export function createHotRuntimeEntry(conversationKey: string): HotRuntimeEntry 
     providerIdentity: undefined,
     lastUsageSnapshot: undefined,
     currentTurn: null,
+    currentTurnMessage: undefined,
+    pendingEarlyRuntimeError: undefined,
+    pendingEarlyRuntimeQueryOptions: undefined,
   };
 }
 

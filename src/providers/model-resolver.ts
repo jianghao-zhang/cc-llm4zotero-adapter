@@ -10,6 +10,15 @@ export interface ModelInfo {
   supportedEffortLevels?: string[];
 }
 
+export function normalizeProviderModelName(value: unknown): string {
+  if (typeof value !== "string") return "";
+  return value
+    .replace(/\u001b\[[0-9;]*m/g, "")
+    .replace(/\[[0-9]+[km]\]$/i, "")
+    .trim()
+    .toLowerCase();
+}
+
 /**
  * Cache key includes settingSources to support profile hot-swapping.
  * When user switches profiles, settingSources changes → cache miss → fresh model fetch.
@@ -64,7 +73,7 @@ export function resolveModelAlias(
   alias: string,
   availableModels: ModelInfo[]
 ): string | undefined {
-  const normalizedAlias = alias.toLowerCase().trim();
+  const normalizedAlias = normalizeProviderModelName(alias);
 
   // If already a full model name (contains hyphen and is long), return as-is
   if (normalizedAlias.includes("-") && normalizedAlias.length > 8) {
@@ -73,7 +82,7 @@ export function resolveModelAlias(
 
   // Extract model names from available models
   const modelNames = availableModels
-    .map((m) => m.value?.toLowerCase() || "")
+    .map((m) => normalizeProviderModelName(m.value))
     .filter(Boolean);
 
   if (modelNames.length === 0) {
@@ -126,7 +135,7 @@ export function resolveModelAlias(
  * Checks ANTHROPIC_DEFAULT_*_MODEL env vars for fallback.
  */
 function resolveModelFromEnv(alias: string): string | undefined {
-  const normalizedAlias = alias.toLowerCase().trim();
+  const normalizedAlias = normalizeProviderModelName(alias);
 
   // Map aliases to env var names
   const envVarMap: Record<string, string> = {
@@ -138,12 +147,12 @@ function resolveModelFromEnv(alias: string): string | undefined {
   const envVarName = envVarMap[normalizedAlias];
   if (envVarName) {
     const envValue = process.env[envVarName]?.trim();
-    if (envValue) return envValue.toLowerCase();
+    if (envValue) return normalizeProviderModelName(envValue);
   }
 
   // Also check ANTHROPIC_MODEL as generic fallback
   const genericModel = process.env.ANTHROPIC_MODEL?.trim();
-  if (genericModel) return genericModel.toLowerCase();
+  if (genericModel) return normalizeProviderModelName(genericModel);
 
   return undefined;
 }
@@ -157,7 +166,7 @@ export function resolveModelWithCache(
   settingSources: string[],
   providerKey?: string,
 ): { model: string | undefined; cacheHit: boolean } {
-  const normalizedAlias = alias.toLowerCase().trim();
+  const normalizedAlias = normalizeProviderModelName(alias);
 
   // If already full model name, no resolution needed
   if (normalizedAlias.includes("-") && normalizedAlias.length > 8) {

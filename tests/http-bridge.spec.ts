@@ -103,10 +103,13 @@ describe("http bridge server", () => {
   });
 
   it("streams a single start line with the runtime runId", async () => {
+    const seenResumes: Array<string | undefined> = [];
     const runtimeClient: ClaudeCodeRuntimeClient = {
-      async startTurn() {
+      async startTurn(request) {
+        seenResumes.push(request.providerSessionId);
         return {
           runId: "run-http-1",
+          providerSessionId: request.providerSessionId,
           events: providerEvents([
             { type: "message_delta", payload: { delta: "hello" } },
             { type: "final", payload: { output: "hello" } }
@@ -128,12 +131,14 @@ describe("http bridge server", () => {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           conversationKey: "conv-1",
-          userText: "hello"
+          userText: "hello",
+          providerSessionId: "sess-http-resume",
         })
       });
 
       expect(response.ok).toBe(true);
       const lines = await readNdjsonLines(response);
+      expect(seenResumes).toEqual(["sess-http-resume"]);
       const starts = lines.filter((line) => line.type === "start");
       expect(starts).toEqual([{ type: "start", runId: "run-http-1" }]);
       expect(lines.at(-1)).toEqual({

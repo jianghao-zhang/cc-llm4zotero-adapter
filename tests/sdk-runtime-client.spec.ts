@@ -14,6 +14,27 @@ function makeStream(items: unknown[]): any {
   };
 }
 
+function makeFailingStream(error: Error): any {
+  return {
+    async *[Symbol.asyncIterator]() {
+      throw error;
+    },
+    close() {},
+  };
+}
+
+function makeModelProbe(models: unknown[] = []): any {
+  return {
+    async supportedModels() {
+      return models;
+    },
+    close() {},
+    async return() {
+      return undefined;
+    },
+  };
+}
+
 describe("ClaudeAgentSdkRuntimeClient", () => {
   const originalHome = process.env.HOME;
   const originalUserProfile = process.env.USERPROFILE;
@@ -120,6 +141,124 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
     expect(seenOptions.model).toBe("gemini-3.1-pro-preview");
   });
 
+  it("falls back unsupported xhigh effort when SDK capabilities are explicit", async () => {
+    let seenOptions: Record<string, unknown> = {};
+
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      forwardFrontendModel: true,
+      queryImpl(args) {
+        if (args.prompt === "") {
+          return makeModelProbe([
+            {
+              value: "haiku",
+              supportsEffort: true,
+              supportedEffortLevels: ["low", "medium", "high"],
+            },
+          ]);
+        }
+        seenOptions = args.options;
+        return makeStream([
+          { type: "result", session_id: "session-new", result: "ok", is_error: false }
+        ]);
+      }
+    });
+
+    await runtime.startTurn({
+      conversationKey: "conv-effort",
+      userMessage: "hello",
+      metadata: { model: "haiku", effort: "xhigh" }
+    });
+
+    expect(seenOptions.effort).toBe("high");
+    expect(String(seenOptions.effortFallbackNotice)).toBe("XHigh is unavailable for this model. Using High.");
+  });
+
+  it("retries unknown xhigh effort with high when SDK init fails early", async () => {
+    process.env.HOME = "/tmp/cc-l4z-effort-retry";
+    const seenEfforts: unknown[] = [];
+    const seenStatus: string[] = [];
+
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      forwardFrontendModel: true,
+      queryImpl(args) {
+        if (args.prompt === "") return makeModelProbe([]);
+        seenEfforts.push(args.options.effort);
+        if (args.options.effort === "xhigh") {
+          return makeFailingStream(new Error("unsupported effort"));
+        }
+        return makeStream([
+          { type: "system", session_id: "session-new", subtype: "init" },
+          { type: "result", session_id: "session-new", result: "ok", is_error: false }
+        ]);
+      }
+    });
+
+    const stream = await runtime.startTurn({
+      conversationKey: "conv-effort-retry",
+      userMessage: "hello",
+      metadata: { model: "haiku", effort: "xhigh" }
+    });
+
+    const events = [];
+    for await (const event of stream.events) {
+      events.push(event.type);
+      if (event.type === "status" && typeof event.payload.text === "string") {
+        seenStatus.push(event.payload.text);
+      }
+    }
+
+    expect(seenEfforts).toEqual(["xhigh", "high"]);
+    expect(events).toContain("final");
+    expect(seenStatus.some((text) => text.includes("Retrying with High"))).toBe(true);
+  });
+
+  it("remembers the last good effort after an early retry", async () => {
+    process.env.HOME = "/tmp/cc-l4z-effort-cache";
+    const seenEfforts: unknown[] = [];
+
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      forwardFrontendModel: true,
+      queryImpl(args) {
+        if (args.prompt === "") return makeModelProbe([]);
+        seenEfforts.push(args.options.effort);
+        if (seenEfforts.length === 1 && args.options.effort === "xhigh") {
+          return makeFailingStream(new Error("unsupported effort"));
+        }
+        return makeStream([
+          { type: "system", session_id: `session-${seenEfforts.length}`, subtype: "init" },
+          { type: "result", session_id: `session-${seenEfforts.length}`, result: "ok", is_error: false }
+        ]);
+      }
+    });
+
+    for (const conversationKey of ["conv-effort-cache-a", "conv-effort-cache-b"]) {
+      const stream = await runtime.startTurn({
+        conversationKey,
+        userMessage: "hello",
+        metadata: { model: "haiku", effort: "xhigh" }
+      });
+      for await (const _event of stream.events) {
+        void _event;
+      }
+    }
+
+    const cache = (runtime as any).effortSuccessCache as Map<string, { updatedAt: number }>;
+    for (const record of cache.values()) {
+      record.updatedAt = Date.now() - 10 * 60_000;
+    }
+
+    const stream = await runtime.startTurn({
+      conversationKey: "conv-effort-cache-c",
+      userMessage: "hello",
+      metadata: { model: "haiku", effort: "xhigh" }
+    });
+    for await (const _event of stream.events) {
+      void _event;
+    }
+
+    expect(seenEfforts).toEqual(["xhigh", "high", "high", "xhigh"]);
+  });
+
   it("forwards appendSystemPrompt option to sdk query options", async () => {
     let seenOptions: Record<string, unknown> = {};
 
@@ -135,7 +274,7 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
 
     await runtime.startTurn({
       conversationKey: "conv-1",
-      userMessage: "hello"
+      userMessage: "hello",
     });
 
     expect(seenOptions.appendSystemPrompt).toBe("Use evidence-first reading style.");
@@ -202,6 +341,55 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
     expect(String(seenPrompt)).toContain("Title: Note");
   });
 
+  it("injects local Zotero history only for resume fallback turns", async () => {
+    let fallbackPrompt: unknown;
+    let normalPrompt: unknown;
+
+    const fallbackRuntime = new ClaudeAgentSdkRuntimeClient({
+      queryImpl(args) {
+        fallbackPrompt = args.prompt;
+        return makeStream([
+          { type: "result", session_id: "session-fallback", result: "ok", is_error: false }
+        ]);
+      }
+    });
+    await fallbackRuntime.startTurn({
+      conversationKey: "conv-fallback-history",
+      userMessage: "continue",
+      metadata: { claudeResumeFallbackHistory: true },
+      runtimeRequest: {
+        history: [
+          { role: "user", content: "old question" },
+          { role: "assistant", content: "old answer" },
+        ],
+      } as Record<string, unknown>,
+    });
+
+    const normalRuntime = new ClaudeAgentSdkRuntimeClient({
+      queryImpl(args) {
+        normalPrompt = args.prompt;
+        return makeStream([
+          { type: "result", session_id: "session-normal", result: "ok", is_error: false }
+        ]);
+      }
+    });
+    await normalRuntime.startTurn({
+      conversationKey: "conv-normal-history",
+      userMessage: "continue",
+      runtimeRequest: {
+        history: [
+          { role: "user", content: "old question" },
+          { role: "assistant", content: "old answer" },
+        ],
+      } as Record<string, unknown>,
+    });
+
+    expect(String(fallbackPrompt)).toContain("Local Zotero conversation history");
+    expect(String(fallbackPrompt)).toContain("old answer");
+    expect(String(normalPrompt)).not.toContain("Local Zotero conversation history");
+    expect(String(normalPrompt)).not.toContain("old answer");
+  });
+
   it("adapter updates session mapper from streamed sessionId", async () => {
     const runtime = new ClaudeAgentSdkRuntimeClient({
       queryImpl() {
@@ -237,13 +425,15 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
       forwardFrontendModel: true,
       settingSources: ["user", "project"],
       queryImpl(args) {
-        queryCount += 1;
         const options = args.options as Record<string, unknown>;
-        seenResumes.push(options.resume);
-        const prompt = args.prompt as AsyncIterable<unknown>;
+        const prompt = args.prompt;
+        if (typeof prompt !== "string") {
+          queryCount += 1;
+          seenResumes.push(options.resume);
+        }
         return {
           async *[Symbol.asyncIterator]() {
-            for await (const _message of prompt) {
+            for await (const _message of prompt as AsyncIterable<unknown>) {
               turnIndex += 1;
               yield { type: "system", session_id: "sess-hot", subtype: "init" };
               yield { type: "result", session_id: "sess-hot", result: `ok-${turnIndex}`, is_error: false };
@@ -283,6 +473,103 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
 
     expect(queryCount).toBe(1);
     expect(seenResumes).toEqual([undefined]);
+  });
+
+  it("rebuilds retained hot runtime on option changes while resuming the same session", async () => {
+    let queryCount = 0;
+    const seenResumes: Array<unknown> = [];
+    let turnIndex = 0;
+
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      forwardFrontendModel: true,
+      queryImpl(args) {
+        const options = args.options as Record<string, unknown>;
+        const prompt = args.prompt;
+        if (typeof prompt !== "string") {
+          queryCount += 1;
+          seenResumes.push(options.resume);
+        }
+        return {
+          async *[Symbol.asyncIterator]() {
+            for await (const _message of prompt as AsyncIterable<unknown>) {
+              turnIndex += 1;
+              yield { type: "system", session_id: "sess-hot-rebuild", subtype: "init" };
+              yield { type: "result", session_id: "sess-hot-rebuild", result: `ok-${turnIndex}`, is_error: false };
+            }
+          },
+          close() {},
+        } as any;
+      }
+    });
+
+    await runtime.retainHotRuntime({ conversationKey: "conv-hot-rebuild", userMessage: "" }, "mount-1");
+    const first = await runtime.startTurn({
+      conversationKey: "conv-hot-rebuild",
+      userMessage: "hello",
+      metadata: { model: "sonnet" }
+    });
+    for await (const _event of first.events) {
+      void _event;
+    }
+
+    const second = await runtime.startTurn({
+      conversationKey: "conv-hot-rebuild",
+      userMessage: "again",
+      metadata: { model: "opus" }
+    });
+    for await (const _event of second.events) {
+      void _event;
+    }
+
+    expect(queryCount).toBe(2);
+    expect(seenResumes).toEqual([undefined, "sess-hot-rebuild"]);
+  });
+
+  it("retries retained hot runtime with high when unknown xhigh effort fails before init", async () => {
+    process.env.HOME = "/tmp/cc-l4z-hot-effort-retry";
+    const seenEfforts: Array<unknown> = [];
+    const seenStatus: string[] = [];
+
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      forwardFrontendModel: true,
+      queryImpl(args) {
+        if (args.prompt === "") return makeModelProbe([]);
+        const options = args.options as Record<string, unknown>;
+        seenEfforts.push(options.effort);
+        const prompt = args.prompt as AsyncIterable<unknown>;
+        return {
+          async *[Symbol.asyncIterator]() {
+            if (options.effort === "xhigh") {
+              throw new Error("unsupported effort");
+            }
+            for await (const _message of prompt) {
+              yield { type: "system", session_id: "sess-hot-effort", subtype: "init" };
+              yield { type: "result", session_id: "sess-hot-effort", result: "ok", is_error: false };
+            }
+          },
+          close() {},
+        } as any;
+      }
+    });
+
+    await runtime.retainHotRuntime({ conversationKey: "conv-hot-effort", userMessage: "" }, "mount-1");
+    const stream = await runtime.startTurn({
+      conversationKey: "conv-hot-effort",
+      userMessage: "hello",
+      metadata: { model: "haiku", effort: "xhigh" }
+    });
+
+    const seenEvents = [];
+    for await (const event of stream.events) {
+      seenEvents.push(event.type);
+      if (event.type === "status" && typeof event.payload.text === "string") {
+        seenStatus.push(event.payload.text);
+      }
+    }
+
+    expect(seenEfforts).toEqual(["xhigh", "high"]);
+    expect(seenEvents).toContain("final");
+    expect(seenStatus.some((text) => text.includes("Retrying with High"))).toBe(true);
   });
 
   it("bypasses retained hot runtime when forceFreshSession is requested", async () => {

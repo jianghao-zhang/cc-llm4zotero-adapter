@@ -340,6 +340,7 @@ export class Llm4ZoteroAgentBackendAdapter {
             runtimeCwdRelative: buildRuntimeCwdRelative(scope, originalConversationKey),
             retentionProbeId: params.probeId,
           },
+          providerSessionId: params.providerSessionId,
         },
         params.mountId,
       );
@@ -406,6 +407,7 @@ export class Llm4ZoteroAgentBackendAdapter {
       {
         conversationKey: scopedConversationKey,
         userMessage: params.request.userText,
+        providerSessionId: params.request.providerSessionId,
         allowedTools: params.request.allowedTools,
         runtimeRequest: params.request.runtimeRequest,
         metadata: mergedMetadata,

@@ -46,6 +46,7 @@ describe("Llm4ZoteroAgentBackendAdapter", () => {
         userText: "test"
       },
       onEvent(event) {
+        if (event.type === "provider_event" && (event as any).providerType === "profiling") return;
         seen.push({ type: event.type, payload: event });
       }
     });
@@ -125,6 +126,7 @@ describe("Llm4ZoteroAgentBackendAdapter", () => {
     const outcome = await compat.runTurn({
       request: { conversationKey: "conv-noise", userText: "x" },
       onEvent(event) {
+        if (event.type === "provider_event" && (event as any).providerType === "profiling") return;
         seen.push(event.type);
       }
     });

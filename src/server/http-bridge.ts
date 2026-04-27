@@ -125,6 +125,10 @@ function toRequestPayload(body: unknown): Llm4ZoteroRunTurnRequest {
   return {
     conversationKey,
     userText,
+    providerSessionId:
+      typeof record.providerSessionId === "string" && record.providerSessionId.trim().length > 0
+        ? record.providerSessionId.trim()
+        : undefined,
     allowedTools: Array.isArray(record.allowedTools)
       ? record.allowedTools.filter((x): x is string => typeof x === "string")
       : undefined,
@@ -219,6 +223,10 @@ function toRetentionPayload(body: unknown): Llm4ZoteroRuntimeRetentionRequest {
   }
   return {
     conversationKey,
+    providerSessionId:
+      typeof record.providerSessionId === "string" && record.providerSessionId.trim().length > 0
+        ? record.providerSessionId.trim()
+        : undefined,
     scopeType: parseScopeType(record.scopeType),
     scopeId:
       typeof record.scopeId === "string" && record.scopeId.trim().length > 0

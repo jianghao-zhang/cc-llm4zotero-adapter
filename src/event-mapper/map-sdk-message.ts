@@ -36,6 +36,28 @@ function asFiniteNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+function formatApiRetryStatus(msg: Record<string, unknown>): string {
+  const status = asFiniteNumber(msg.error_status);
+  const error = typeof msg.error === "string" && msg.error.trim() ? msg.error.trim() : undefined;
+  const attempt = asFiniteNumber(msg.attempt);
+  const maxRetries = asFiniteNumber(msg.max_retries);
+  const retrySuffix =
+    attempt !== undefined && maxRetries !== undefined
+      ? ` (attempt ${attempt}/${maxRetries})`
+      : attempt !== undefined
+        ? ` (attempt ${attempt})`
+        : "";
+
+  if (status === 429 || error === "rate_limit") {
+    return `Claude API rate limited. Retrying request${retrySuffix}.`;
+  }
+  if (status !== undefined || error) {
+    const detail = [status !== undefined ? `HTTP ${status}` : undefined, error].filter(Boolean).join(", ");
+    return `Claude API request failed (${detail}). Retrying${retrySuffix}.`;
+  }
+  return `Claude API request failed. Retrying${retrySuffix}.`;
+}
+
 function normalizeUsagePayload(args: {
   usage?: Record<string, unknown> | undefined;
   modelUsage?: Record<string, ModelUsageEntry> | undefined;
@@ -360,7 +382,7 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
           : subtype === "init"
             ? "Initializing Claude session"
             : subtype === "api_retry"
-              ? "Rebuilding Claude session after runtime change"
+              ? formatApiRetryStatus(msg)
               : subtype
                 ? `System event: ${subtype}`
                 : "System event";

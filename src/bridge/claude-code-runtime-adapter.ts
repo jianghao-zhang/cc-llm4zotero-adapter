@@ -10,6 +10,8 @@ export interface ClaudeCodeRuntimeAdapterOptions {
   traceStore?: TraceStore;
 }
 
+type ResumeSource = "map" | "legacy_provider_map" | "request_hint" | "none" | "force_fresh";
+
 export class ClaudeCodeRuntimeAdapter {
   private readonly runtimeClient: ClaudeCodeRuntimeClient;
   private readonly sessionMapper: SessionMapper;
@@ -116,6 +118,17 @@ export class ClaudeCodeRuntimeAdapter {
     if (typeof requestOrConversationKey === "string") {
       return requestOrConversationKey;
     }
+    return requestOrConversationKey.conversationKey;
+  }
+
+  private buildLegacyProviderSessionMapKey(
+    requestOrConversationKey:
+      | RunTurnRequest
+      | {
+          conversationKey: string;
+          metadata?: Record<string, unknown>;
+        },
+  ): string | undefined {
     const metadata =
       requestOrConversationKey.metadata && typeof requestOrConversationKey.metadata === "object"
         ? (requestOrConversationKey.metadata as Record<string, unknown>)
@@ -124,13 +137,53 @@ export class ClaudeCodeRuntimeAdapter {
       typeof metadata.providerIdentity === "string" && metadata.providerIdentity.trim()
         ? metadata.providerIdentity.trim()
         : "";
-    return providerIdentity
-      ? `${requestOrConversationKey.conversationKey}::provider:${providerIdentity}`
-      : requestOrConversationKey.conversationKey;
+    return providerIdentity ? `${requestOrConversationKey.conversationKey}::provider:${providerIdentity}` : undefined;
+  }
+
+  private normalizeProviderSessionId(value: unknown): string | undefined {
+    return typeof value === "string" && value.trim() ? value.trim() : undefined;
+  }
+
+  private async resolveProviderSessionId(
+    requestOrConversationKey: RunTurnRequest | string,
+  ): Promise<{ providerSessionId?: string; source: ResumeSource }> {
+    const sessionMapKey = this.buildSessionMapKey(requestOrConversationKey);
+    const mapped = await this.sessionMapper.get(sessionMapKey);
+    if (mapped) {
+      return { providerSessionId: mapped, source: "map" };
+    }
+
+    if (typeof requestOrConversationKey !== "string") {
+      const legacyMapKey = this.buildLegacyProviderSessionMapKey(requestOrConversationKey);
+      if (legacyMapKey) {
+        const legacyMapped = await this.sessionMapper.get(legacyMapKey);
+        if (legacyMapped) {
+          await this.sessionMapper.set(sessionMapKey, legacyMapped);
+          return { providerSessionId: legacyMapped, source: "legacy_provider_map" };
+        }
+      }
+    }
+
+    const legacyByPrefix = await this.sessionMapper.getByPrefix(`${sessionMapKey}::provider:`);
+    if (legacyByPrefix) {
+      await this.sessionMapper.set(sessionMapKey, legacyByPrefix);
+      return { providerSessionId: legacyByPrefix, source: "legacy_provider_map" };
+    }
+
+    if (typeof requestOrConversationKey !== "string") {
+      const hinted = this.normalizeProviderSessionId(requestOrConversationKey.providerSessionId);
+      if (hinted) {
+        await this.sessionMapper.set(sessionMapKey, hinted);
+        return { providerSessionId: hinted, source: "request_hint" };
+      }
+    }
+
+    return { source: "none" };
   }
 
   async getMappedProviderSessionId(conversationKey: string): Promise<string | undefined> {
-    return this.sessionMapper.get(conversationKey);
+    const { providerSessionId } = await this.resolveProviderSessionId(conversationKey);
+    return providerSessionId;
   }
 
   async invalidateConversationSession(
@@ -146,19 +199,8 @@ export class ClaudeCodeRuntimeAdapter {
       typeof requestOrConversationKey === "string"
         ? requestOrConversationKey
         : requestOrConversationKey.conversationKey;
-    const explicitMapKey =
-      typeof requestOrConversationKey === "string"
-        ? requestOrConversationKey
-        : this.buildSessionMapKey({
-            conversationKey: requestOrConversationKey.conversationKey,
-            userMessage: "",
-            metadata: requestOrConversationKey.metadata,
-          });
     await this.sessionMapper.delete(baseConversationKey);
     await this.sessionMapper.deleteByPrefix(`${baseConversationKey}::provider:`);
-    if (explicitMapKey !== baseConversationKey) {
-      await this.sessionMapper.delete(explicitMapKey);
-    }
     await this.runtimeClient.invalidateHotRuntime?.(baseConversationKey);
   }
 
@@ -167,8 +209,7 @@ export class ClaudeCodeRuntimeAdapter {
     const metadata = request.metadata && typeof request.metadata === "object"
       ? (request.metadata as Record<string, unknown>)
       : {};
-    const sessionMapKey = this.buildSessionMapKey(request);
-    const providerSessionId = await this.sessionMapper.get(sessionMapKey);
+    const { providerSessionId } = await this.resolveProviderSessionId(request);
     await this.runtimeClient.warmHotRuntime?.({
       conversationKey: request.conversationKey,
       userMessage: "",
@@ -193,14 +234,6 @@ export class ClaudeCodeRuntimeAdapter {
     await this.runtimeClient.invalidateAllHotRuntimes?.();
   }
 
-  private extractProviderIdentity(request: RunTurnRequest): string {
-    const metadata =
-      request.metadata && typeof request.metadata === "object"
-        ? (request.metadata as Record<string, unknown>)
-        : {};
-    return typeof metadata.providerIdentity === "string" ? metadata.providerIdentity.trim() : "";
-  }
-
   async runTurn(request: RunTurnRequest, hooks: RunTurnHooks = {}): Promise<RunTurnOutcome> {
     const signal = hooks.signal ?? request.signal;
     if (hooks.onEvent) {
@@ -222,9 +255,10 @@ export class ClaudeCodeRuntimeAdapter {
     if (forceFreshSession) {
       await this.invalidateConversationSession(request);
     }
-    const initialSessionId = forceFreshSession
-      ? undefined
-      : await this.sessionMapper.get(sessionMapKey);
+    const resolvedResume = forceFreshSession
+      ? { providerSessionId: undefined, source: "force_fresh" as ResumeSource }
+      : await this.resolveProviderSessionId(request);
+    const initialSessionId = resolvedResume.providerSessionId;
     if (hooks.onEvent) {
       await hooks.onEvent({
         type: "provider_event",
@@ -234,6 +268,7 @@ export class ClaudeCodeRuntimeAdapter {
           stage: "adapter.session_lookup.ready",
           forceFreshSession,
           hasInitialSessionId: Boolean(initialSessionId),
+          resumeSource: resolvedResume.source,
         },
       });
     }
@@ -250,10 +285,10 @@ export class ClaudeCodeRuntimeAdapter {
           type: "status",
           ts: Date.now(),
           payload: {
-            text: "Session signature mismatch detected. Retrying with a fresh Claude session.",
+            text: "Claude session resume failed. Retrying with a fresh Claude session and local Zotero history.",
           },
         });
-        return this.runTurnOnce(request, hooks, signal, undefined);
+        return this.runTurnOnce(this.withResumeFallbackHistory(request), hooks, signal, undefined);
       }
       throw err;
     }
@@ -263,28 +298,23 @@ export class ClaudeCodeRuntimeAdapter {
         type: "status",
         ts: Date.now(),
         payload: {
-          text: "Session signature mismatch detected. Retrying with a fresh Claude session.",
+          text: "Claude session resume failed. Retrying with a fresh Claude session and local Zotero history.",
         },
       });
-      firstOutcome = await this.runTurnOnce(request, hooks, signal, undefined);
-    }
-    if (
-      providerSessionId &&
-      firstOutcome.providerSessionId &&
-      firstOutcome.providerSessionId !== providerSessionId &&
-      this.extractProviderIdentity(request)
-    ) {
-      await this.sessionMapper.delete(sessionMapKey);
-      hooks.onEvent?.({
-        type: "status",
-        ts: Date.now(),
-        payload: {
-          text: "Claude runtime changed. Rebuilding this conversation on the new runtime while keeping local context.",
-        },
-      });
-      return this.runTurnOnce(request, hooks, signal, undefined);
+      firstOutcome = await this.runTurnOnce(this.withResumeFallbackHistory(request), hooks, signal, undefined);
     }
     return firstOutcome;
+  }
+
+  private withResumeFallbackHistory(request: RunTurnRequest): RunTurnRequest {
+    return {
+      ...request,
+      providerSessionId: undefined,
+      metadata: {
+        ...(request.metadata || {}),
+        claudeResumeFallbackHistory: true,
+      },
+    };
   }
 
   private async runTurnOnce(

@@ -48,6 +48,7 @@ export type Llm4ZoteroAgentEvent =
 export interface Llm4ZoteroRunTurnRequest {
   conversationKey: string | number;
   userText: string;
+  providerSessionId?: string;
   allowedTools?: string[];
   scopeType?: "paper" | "open" | "folder" | "tag" | "tagset" | "custom";
   scopeId?: string;
@@ -58,6 +59,7 @@ export interface Llm4ZoteroRunTurnRequest {
 
 export interface Llm4ZoteroRuntimeRetentionRequest {
   conversationKey: string | number;
+  providerSessionId?: string;
   scopeType?: "paper" | "open" | "folder" | "tag" | "tagset" | "custom";
   scopeId?: string;
   scopeLabel?: string;

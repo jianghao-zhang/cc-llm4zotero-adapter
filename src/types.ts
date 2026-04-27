@@ -25,6 +25,7 @@ export interface AgentEvent<TPayload = JsonObject> {
 export interface RunTurnRequest {
   conversationKey: string;
   userMessage: string;
+  providerSessionId?: string;
   allowedTools?: string[];
   runtimeRequest?: JsonObject;
   metadata?: JsonObject;

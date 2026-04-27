@@ -7,8 +7,8 @@ import type { ClaudeCodeRuntimeClient, McpServerStatus, ProviderEvent, RuntimeTu
 import { mapSdkMessageToProviderEvents } from "../event-mapper/map-sdk-message.js";
 import { globalPermissionStore } from "../permissions/permission-store.js";
 import type { PermissionResult } from "../permissions/permission-store.js";
-import { getCachedModels, resolveModelAlias, resolveModelWithCache, setCachedModels } from "./model-resolver.js";
-import { createHotRuntimeTurn, HotRuntimePool, type HotRuntimeEntry } from "./hotRuntimePool.js";
+import { getCachedModels, normalizeProviderModelName, resolveModelAlias, resolveModelWithCache, setCachedModels } from "./model-resolver.js";
+import { createHotRuntimeTurn, HotRuntimePool, type HotRuntimeEntry, type HotRuntimeTurn } from "./hotRuntimePool.js";
 
 type QueryFunction = (args: {
   prompt: string | AsyncIterable<SDKUserMessage>;
@@ -32,6 +32,17 @@ type QueryWithMcpStatus = Query & {
 };
 
 type RuntimeEffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
+type EffortCapabilitySource = "sdk_explicit" | "heuristic" | "unknown";
+
+type EffortCapabilityInfo = {
+  efforts: string[];
+  source: EffortCapabilitySource;
+};
+
+type EffortSuccessRecord = {
+  effort: RuntimeEffortLevel;
+  updatedAt: number;
+};
 
 type ClaudeSettingsShape = {
   model?: unknown;
@@ -65,6 +76,7 @@ type CompactTurnOptions = {
 };
 
 const RUNTIME_EFFORT_DESCENDING: RuntimeEffortLevel[] = ["max", "xhigh", "high", "medium", "low"];
+const RUNTIME_EFFORT_ASCENDING: RuntimeEffortLevel[] = ["low", "medium", "high", "xhigh", "max"];
 const DEFAULT_BLOCKED_METADATA_KEYS = new Set<string>([
   "allowedTools",
   "abortController",
@@ -243,12 +255,40 @@ function formatPaperPathLines(entries: RuntimePaperPathEntry[]): string[] {
     return `- ${entry.title}${pathHints.length ? ` [${pathHints.join(" | ")}]` : ""}`;
   });
 }
-function buildPromptText(userMessage: string, runtimeRequest: RuntimeRequestShape | undefined): string {
+function formatFallbackHistory(runtimeRequest: RuntimeRequestShape | undefined): string[] {
+  if (!runtimeRequest || !Array.isArray(runtimeRequest.history)) return [];
+  const entries = runtimeRequest.history
+    .map((entry) => {
+      const record = asRecord(entry);
+      if (!record) return null;
+      const roleRaw = typeof record.role === "string" ? record.role.trim().toLowerCase() : "";
+      const role = roleRaw === "assistant" ? "assistant" : roleRaw === "user" ? "user" : "";
+      const content = typeof record.content === "string" ? record.content.trim() : "";
+      if (!role || !content) return null;
+      return { role, content: content.length > 2000 ? `${content.slice(0, 1999).trimEnd()}...` : content };
+    })
+    .filter((entry): entry is { role: "assistant" | "user"; content: string } => Boolean(entry))
+    .slice(-24);
+  if (!entries.length) return [];
+  return [
+    "Local Zotero conversation history for continuity because the prior Claude session could not be resumed:",
+    ...entries.map((entry, index) => `${index + 1}. ${entry.role}: ${entry.content}`),
+    "Use this transcript only to restore conversation context for the current answer.",
+  ];
+}
+function buildPromptText(
+  userMessage: string,
+  runtimeRequest: RuntimeRequestShape | undefined,
+  metadata?: Record<string, unknown>,
+): string {
   const trimmedUserMessage = userMessage.trim();
   if (/^\/compact(?:\s|$)/i.test(trimmedUserMessage)) return "/compact";
   if (trimmedUserMessage.startsWith("/")) return trimmedUserMessage;
   const lines: string[] = [trimmedUserMessage];
   if (!runtimeRequest) return lines.join("\n\n");
+  if (metadata?.claudeResumeFallbackHistory === true) {
+    lines.push(...formatFallbackHistory(runtimeRequest));
+  }
   const selectedTexts = Array.isArray(runtimeRequest.selectedTexts)
     ? runtimeRequest.selectedTexts.map((entry) => (typeof entry === "string" ? entry.trim() : "")).filter(Boolean)
     : [];
@@ -283,7 +323,7 @@ function buildPromptText(userMessage: string, runtimeRequest: RuntimeRequestShap
 }
 async function buildPromptInput(request: RuntimeTurnRequest, metadata: Record<string, unknown>): Promise<string | AsyncIterable<SDKUserMessage>> {
   const runtimeRequest = toRuntimeRequest(request, metadata);
-  const promptText = buildPromptText(request.userMessage, runtimeRequest);
+  const promptText = buildPromptText(request.userMessage, runtimeRequest, metadata);
   const screenshotPayloads = Array.isArray(runtimeRequest?.screenshots)
     ? runtimeRequest!.screenshots.map((entry) => parseImageDataUrl(entry)).filter((entry): entry is NonNullable<typeof entry> => Boolean(entry)).slice(0, 8)
     : [];
@@ -359,6 +399,55 @@ function mergeAllowedTools(requestAllowedTools: string[] | undefined, defaultAll
     if (normalized && !BLOCKED_ALLOWED_TOOLS.has(normalized)) merged.add(normalized);
   }
   return merged.size > 0 ? Array.from(merged) : undefined;
+}
+function isRuntimeEffortLevel(value: unknown): value is RuntimeEffortLevel {
+  return value === "low" || value === "medium" || value === "high" || value === "xhigh" || value === "max";
+}
+function effortRank(effort: RuntimeEffortLevel): number {
+  return RUNTIME_EFFORT_ASCENDING.indexOf(effort);
+}
+function isHigherEffort(left: RuntimeEffortLevel, right: RuntimeEffortLevel): boolean {
+  return effortRank(left) > effortRank(right);
+}
+function normalizeSupportedEfforts(efforts: string[]): string[] {
+  return Array.from(new Set(efforts.map((entry) => entry.trim().toLowerCase()).filter((entry) => entry === "default" || isRuntimeEffortLevel(entry))));
+}
+function nearestSupportedEffort(
+  requestedEffort: RuntimeEffortLevel,
+  supportedEfforts: string[],
+): RuntimeEffortLevel | undefined {
+  const supportedEffortSet = new Set(supportedEfforts.map((entry) => entry.trim().toLowerCase()).filter(Boolean));
+  if (supportedEffortSet.has(requestedEffort)) return requestedEffort;
+  const requestedIndex = RUNTIME_EFFORT_DESCENDING.indexOf(requestedEffort);
+  if (requestedIndex === -1) return undefined;
+  for (let i = requestedIndex + 1; i < RUNTIME_EFFORT_DESCENDING.length; i += 1) {
+    const candidate = RUNTIME_EFFORT_DESCENDING[i];
+    if (supportedEffortSet.has(candidate)) return candidate;
+  }
+  return undefined;
+}
+function fallbackEffortAfterFailedInit(
+  failedEffort: RuntimeEffortLevel,
+  supportedEfforts: string[],
+): RuntimeEffortLevel | undefined {
+  if (failedEffort !== "xhigh" && failedEffort !== "max") return undefined;
+  const supportedEffortSet = new Set(supportedEfforts.map((entry) => entry.trim().toLowerCase()).filter(Boolean));
+  for (const candidate of ["high", "medium", "low"] as RuntimeEffortLevel[]) {
+    if (supportedEffortSet.has(candidate)) return candidate;
+  }
+  return undefined;
+}
+function makeEffortSuccessKey(providerKey: string, modelName: string | undefined): string {
+  const normalizedModel = normalizeProviderModelName(modelName || "default") || "default";
+  return `${providerKey || "default"}::${normalizedModel}`;
+}
+function formatEffortLabel(effort: RuntimeEffortLevel | "default"): string {
+  if (effort === "xhigh") return "XHigh";
+  if (effort === "max") return "Max";
+  if (effort === "high") return "High";
+  if (effort === "medium") return "Medium";
+  if (effort === "low") return "Low";
+  return "Default";
 }
 function toStableStringList(value: unknown, sort = false): string[] | null {
   if (!Array.isArray(value)) return null;
@@ -457,8 +546,10 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
   private readonly options: ClaudeAgentSdkRuntimeClientOptions;
   private modelInfoCache = new Map<string, { expiresAt: number; infos: ClaudeModelInfo[] }>();
   private commandInfoCache = new Map<string, { expiresAt: number; commands: ClaudeSlashCommandInfo[] }>();
+  private effortSuccessCache = new Map<string, EffortSuccessRecord>();
   private readonly modelInfoTtlMs = 60_000;
   private readonly commandInfoTtlMs = 5 * 60_000;
+  private readonly effortSuccessTtlMs = 5 * 60_000;
   private readonly hotRuntimePool = new HotRuntimePool({ graceMs: 5 * 60_000 });
   private readonly usageSnapshots = new Map<string, { contextTokens: number; contextWindow?: number }>();
   private readonly runtimeClientInstanceId = `runtime-client-${Math.random().toString(36).slice(2, 10)}`;
@@ -643,6 +734,9 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     options?: CompactTurnOptions,
   ): Promise<RuntimeTurnStream> {
     const metadata = parseMetadata(request.metadata, this.options);
+    if (entry.bootstrapPromise) {
+      await entry.bootstrapPromise;
+    }
     const settingSourcesOverride = parseSettingSourcesOverride(metadata);
     const effectiveSettingSources = settingSourcesOverride ?? this.options.settingSources ?? ["user", "project", "local"];
     const effectiveCwd = this.resolveScopedCwd(request.metadata);
@@ -651,23 +745,27 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       this.resolveSettingsPathBySource.bind(this),
       effectiveCwd,
     );
-    const shouldReuseProviderSession =
-      !providerIdentity || !entry.providerIdentity || entry.providerIdentity === providerIdentity;
+    const resumeSessionId = request.providerSessionId || entry.providerSessionId;
 
     let queryOptions = await this.buildQueryOptions(
       request,
       metadata,
-      shouldReuseProviderSession ? entry.providerSessionId || request.providerSessionId : undefined,
+      resumeSessionId,
     );
     let signature = buildHotRuntimeSignature(queryOptions, metadata);
     const shouldRestartForConfigChange =
       Boolean(entry.query || entry.configSignature) && entry.configSignature !== signature;
-    const shouldForceFreshSession = !shouldReuseProviderSession || shouldRestartForConfigChange;
-
-    if (shouldForceFreshSession) {
-      queryOptions = await this.buildQueryOptions(request, metadata, undefined);
-      signature = buildHotRuntimeSignature(queryOptions, metadata);
-    }
+    const shouldRestartForProviderChange =
+      Boolean(providerIdentity && entry.providerIdentity && entry.providerIdentity !== providerIdentity);
+    const shouldRestartForResumeChange =
+      Boolean(entry.query && request.providerSessionId && entry.providerSessionId !== request.providerSessionId);
+    const shouldRestartRuntime =
+      shouldRestartForConfigChange || shouldRestartForProviderChange || shouldRestartForResumeChange;
+    const restartReasons = [
+      shouldRestartForConfigChange ? "config_signature" : "",
+      shouldRestartForProviderChange ? "provider_identity" : "",
+      shouldRestartForResumeChange ? "resume_session" : "",
+    ].filter(Boolean);
 
     const hotDecisionEvent = this.createProfilingEvent(request.conversationKey,"runtime.start_hot_turn.decision", {
       mountCount: entry.mounts.size,
@@ -675,31 +773,47 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       hasExistingProviderSessionId: Boolean(entry.providerSessionId),
       hasExistingConfigSignature: Boolean(entry.configSignature),
       hasExistingProviderIdentity: Boolean(entry.providerIdentity),
-      shouldReuseProviderSession,
       shouldRestartForConfigChange,
-      shouldForceFreshSession,
+      shouldRestartForProviderChange,
+      shouldRestartForResumeChange,
+      shouldRestartRuntime,
+      restartReason: restartReasons.join(",") || null,
+      droppedSession: false,
+      resumeSessionId: resumeSessionId || null,
       configSignatureMatched: entry.configSignature === signature,
       providerIdentityMatched:
         !providerIdentity || !entry.providerIdentity || entry.providerIdentity === providerIdentity,
     });
 
-    if (entry.bootstrapPromise) {
-      await entry.bootstrapPromise;
-    }
-
-    if (!entry.query || entry.configSignature !== signature || shouldForceFreshSession) {
-      entry = await this.bootstrapHotRuntime(request, entry, {
-        metadata,
-        queryOptions,
-        signature,
-        providerIdentity,
-        shouldForceFreshSession,
-      });
+    if (!entry.query || entry.configSignature !== signature || shouldRestartRuntime) {
+      try {
+        entry = await this.bootstrapHotRuntime(request, entry, {
+          metadata,
+          queryOptions,
+          signature,
+          providerIdentity,
+          shouldRestartRuntime,
+          shouldDropSession: false,
+        });
+      } catch (error) {
+        const retryOptions = this.buildFailedInitEffortRetryOptions(queryOptions);
+        if (!retryOptions) throw error;
+        queryOptions = retryOptions;
+        signature = buildHotRuntimeSignature(queryOptions, metadata);
+        entry = await this.bootstrapHotRuntime(request, entry, {
+          metadata,
+          queryOptions,
+          signature,
+          providerIdentity,
+          shouldRestartRuntime: true,
+          shouldDropSession: false,
+        });
+      }
     }
     const runId = randomUUID();
     const turn = createHotRuntimeTurn(runId);
     entry.currentTurn = turn;
-    const providerSessionId = entry.providerSessionId || request.providerSessionId;
+    const providerSessionId = request.providerSessionId || entry.providerSessionId;
     const shouldInjectCompact = options?.autoCompactNeeded === true;
     turn.awaitingAutoCompact = shouldInjectCompact || /^\/compact(?:\s|$)/i.test(request.userMessage.trim());
     turn.compactOnly = /^\/compact(?:\s|$)/i.test(request.userMessage.trim());
@@ -708,9 +822,40 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       userMessage: shouldInjectCompact ? "/compact" : request.userMessage,
       providerSessionId,
     });
-    entry.pushMessage(message);
+    entry.currentTurnMessage = message;
+    const pendingEarlyRuntimeError = entry.pendingEarlyRuntimeError;
+    const pendingEarlyRuntimeQueryOptions = entry.pendingEarlyRuntimeQueryOptions;
+    entry.pendingEarlyRuntimeError = undefined;
+    entry.pendingEarlyRuntimeQueryOptions = undefined;
+    if (pendingEarlyRuntimeError) {
+      const retryOptions = this.buildFailedInitEffortRetryOptions(pendingEarlyRuntimeQueryOptions ?? queryOptions);
+      if (retryOptions) {
+        const retryNotice =
+          typeof retryOptions.effortFallbackNotice === "string"
+            ? retryOptions.effortFallbackNotice
+            : "Claude effort failed before session initialization. Retrying with a lower effort.";
+        turn.queueEvent({ type: "status", payload: { text: retryNotice } });
+        try {
+          entry = await this.restartHotRuntimeForEffortRetry(entry, metadata, retryOptions, turn, message);
+        } catch (retryError) {
+          turn.fail(retryError instanceof Error ? retryError : new Error(String(retryError)));
+        }
+      } else {
+        turn.fail(pendingEarlyRuntimeError);
+      }
+    } else {
+      entry.pushMessage(message);
+    }
     async function* withHotDecision() {
       yield hotDecisionEvent;
+      if (shouldRestartRuntime && providerSessionId) {
+        yield {
+          type: "status" as const,
+          payload: {
+            text: "Claude runtime changed. Rebuilding runtime and resuming the existing Claude session.",
+          },
+        };
+      }
       for await (const event of turn.events) {
         yield event;
       }
@@ -730,7 +875,8 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       queryOptions?: Record<string, unknown>;
       signature?: string;
       providerIdentity?: string | null;
-      shouldForceFreshSession?: boolean;
+      shouldRestartRuntime?: boolean;
+      shouldDropSession?: boolean;
     },
   ): Promise<HotRuntimeEntry> {
     const metadata = seed?.metadata ?? parseMetadata(request.metadata, this.options);
@@ -742,33 +888,46 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       this.resolveSettingsPathBySource.bind(this),
       effectiveCwd,
     );
-    const shouldReuseProviderSession =
-      !providerIdentity || !entry.providerIdentity || entry.providerIdentity === providerIdentity;
+    const resumeSessionId = request.providerSessionId || entry.providerSessionId;
     let queryOptions = seed?.queryOptions ?? await this.buildQueryOptions(
       request,
       metadata,
-      shouldReuseProviderSession ? entry.providerSessionId || request.providerSessionId : undefined,
+      resumeSessionId,
     );
     let signature = seed?.signature ?? buildHotRuntimeSignature(queryOptions, metadata);
     const shouldRestartForConfigChange =
       Boolean(entry.query || entry.configSignature) && entry.configSignature !== signature;
-    const shouldForceFreshSession = seed?.shouldForceFreshSession ?? (!shouldReuseProviderSession || shouldRestartForConfigChange);
+    const shouldRestartForProviderChange =
+      Boolean(providerIdentity && entry.providerIdentity && entry.providerIdentity !== providerIdentity);
+    const shouldRestartForResumeChange =
+      Boolean(entry.query && request.providerSessionId && entry.providerSessionId !== request.providerSessionId);
+    const shouldDropSession = seed?.shouldDropSession === true;
+    const shouldRestartRuntime = seed?.shouldRestartRuntime ?? (
+      shouldDropSession ||
+      shouldRestartForConfigChange ||
+      shouldRestartForProviderChange ||
+      shouldRestartForResumeChange
+    );
 
-    if (shouldForceFreshSession) {
+    if (shouldDropSession) {
       queryOptions = await this.buildQueryOptions(request, metadata, undefined);
       signature = buildHotRuntimeSignature(queryOptions, metadata);
     }
 
-    if (entry.query || entry.configSignature || entry.providerSessionId) {
+    if (entry.query || entry.configSignature || entry.providerSessionId || shouldRestartRuntime) {
       const preservedMounts = Array.from(entry.mounts);
-      const preservedSessionId = shouldForceFreshSession ? undefined : entry.providerSessionId;
+      const preservedSessionId = shouldDropSession
+        ? undefined
+        : shouldRestartForResumeChange
+          ? request.providerSessionId
+          : entry.providerSessionId;
       await this.closeHotRuntime(entry);
       this.hotRuntimePool.delete(request.conversationKey);
       entry = this.hotRuntimePool.ensure(request.conversationKey);
       for (const mountId of preservedMounts) {
         entry.mounts.add(mountId);
       }
-      entry.providerSessionId = preservedSessionId ?? request.providerSessionId;
+      entry.providerSessionId = shouldDropSession ? undefined : preservedSessionId ?? request.providerSessionId;
     } else if (request.providerSessionId && !entry.providerSessionId) {
       entry.providerSessionId = request.providerSessionId;
     }
@@ -780,6 +939,38 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     entry.providerIdentity = providerIdentity || undefined;
     void this.consumeHotRuntime(entry, metadata, queryOptions);
     return entry;
+  }
+
+  private async restartHotRuntimeForEffortRetry(
+    entry: HotRuntimeEntry,
+    metadata: Record<string, unknown>,
+    retryOptions: Record<string, unknown>,
+    turn: HotRuntimeTurn,
+    message: SDKUserMessage,
+  ): Promise<HotRuntimeEntry> {
+    const conversationKey = entry.conversationKey;
+    const preservedMounts = Array.from(entry.mounts);
+    const preservedSessionId = entry.providerSessionId;
+    const preservedUsageSnapshot = entry.lastUsageSnapshot;
+    const preservedProviderIdentity = entry.providerIdentity;
+    await this.closeHotRuntime(entry);
+    this.hotRuntimePool.delete(conversationKey);
+    const nextEntry = this.hotRuntimePool.ensure(conversationKey);
+    for (const mountId of preservedMounts) {
+      nextEntry.mounts.add(mountId);
+    }
+    nextEntry.providerSessionId = preservedSessionId;
+    nextEntry.lastUsageSnapshot = preservedUsageSnapshot;
+    nextEntry.currentTurn = turn;
+    nextEntry.currentTurnMessage = message;
+    const retryQuery = this.options.queryImpl ?? (await this.loadQuery());
+    const liveQuery = retryQuery({ prompt: nextEntry.input, options: retryOptions });
+    nextEntry.query = liveQuery;
+    nextEntry.configSignature = buildHotRuntimeSignature(retryOptions, metadata);
+    nextEntry.providerIdentity = preservedProviderIdentity;
+    void this.consumeHotRuntime(nextEntry, metadata, retryOptions);
+    nextEntry.pushMessage(message);
+    return nextEntry;
   }
 
   private async consumeHotRuntime(
@@ -796,6 +987,8 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       typeof (queryOptions as Record<string, unknown>).effortFallbackNotice === "string"
         ? String((queryOptions as Record<string, unknown>).effortFallbackNotice)
         : undefined;
+    let sawSdkInit = false;
+    let sawModelOutput = false;
     try {
       for await (const raw of query) {
         const currentTurn = entry.currentTurn;
@@ -810,6 +1003,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
               continue;
             }
             if (providerType === "system" && nested?.subtype === "init") {
+              sawSdkInit = true;
               const sessionId =
                 (typeof nested.session_id === "string" && nested.session_id) ||
                 (typeof nested.sessionId === "string" && nested.sessionId) ||
@@ -829,6 +1023,9 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
                     requestedEffort: (queryOptions as Record<string, unknown>).requestedEffort ?? null,
                     resolvedEffort: queryOptions.effort ?? null,
                     supportedEfforts,
+                    effortCapabilitySource: queryOptions.effortCapabilitySource ?? null,
+                    effortResolutionSource: queryOptions.effortResolutionSource ?? null,
+                    effortRetryFrom: queryOptions.effortRetryFrom ?? null,
                     effortFallbackNotice: effortFallbackNotice ?? null,
                     resolvedPermissionMode: queryOptions.permissionMode ?? null,
                     settingSources: queryOptions.settingSources ?? null,
@@ -837,6 +1034,9 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
                   },
                 },
               });
+              if (effortFallbackNotice) {
+                currentTurn.queueEvent({ type: "status", payload: { text: effortFallbackNotice } });
+              }
             }
           }
           if (event.type === "usage") {
@@ -867,6 +1067,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
               if (currentTurn.compactOnly) {
                 currentTurn.finish();
                 entry.currentTurn = null;
+                entry.currentTurnMessage = undefined;
                 this.hotRuntimePool.scheduleCloseIfIdle(entry, (expired) => {
                   void this.closeHotRuntime(expired);
                 });
@@ -876,19 +1077,25 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
             continue;
           }
           if (event.type === "message_delta") {
+            sawModelOutput = true;
             const payload = event.payload as Record<string, unknown>;
             if (typeof payload.delta === "string") {
               currentTurn.finalText += payload.delta;
             }
           }
+          if (event.type === "tool_call" || event.type === "final") {
+            sawModelOutput = true;
+          }
           currentTurn.queueEvent(event);
           if (event.type === "final") {
+            this.rememberEffortSuccess(queryOptions);
             const payload = event.payload as Record<string, unknown>;
             if (typeof payload.output === "string" && payload.output) {
               currentTurn.finalText = payload.output;
             }
             currentTurn.finish();
             entry.currentTurn = null;
+            entry.currentTurnMessage = undefined;
             this.hotRuntimePool.scheduleCloseIfIdle(entry, (expired) => {
               void this.closeHotRuntime(expired);
             });
@@ -896,9 +1103,39 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
         }
       }
     } catch (error) {
+      const retryOptions = !sawSdkInit && !sawModelOutput
+        ? this.buildFailedInitEffortRetryOptions(queryOptions)
+        : undefined;
+      if (retryOptions && entry.currentTurn && entry.currentTurnMessage) {
+        const preservedTurn = entry.currentTurn;
+        const preservedMessage = entry.currentTurnMessage;
+        const retryNotice =
+          typeof retryOptions.effortFallbackNotice === "string"
+            ? retryOptions.effortFallbackNotice
+            : "Claude effort failed before session initialization. Retrying with a lower effort.";
+        preservedTurn.queueEvent({ type: "status", payload: { text: retryNotice } });
+        try {
+          await this.restartHotRuntimeForEffortRetry(entry, metadata, retryOptions, preservedTurn, preservedMessage);
+          return;
+        } catch (retryError) {
+          preservedTurn.fail(retryError instanceof Error ? retryError : new Error(String(retryError)));
+          const liveEntry = this.hotRuntimePool.get(entry.conversationKey);
+          if (liveEntry) {
+            liveEntry.currentTurn = null;
+            liveEntry.currentTurnMessage = undefined;
+          }
+          return;
+        }
+      }
+      if (!entry.currentTurn) {
+        entry.pendingEarlyRuntimeError = error instanceof Error ? error : new Error(String(error));
+        entry.pendingEarlyRuntimeQueryOptions = queryOptions;
+        return;
+      }
       if (entry.currentTurn) {
         entry.currentTurn.fail(error instanceof Error ? error : new Error(String(error)));
         entry.currentTurn = null;
+        entry.currentTurnMessage = undefined;
       }
     }
   }
@@ -910,7 +1147,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
   async buildHotUserMessage(request: RuntimeTurnRequest): Promise<SDKUserMessage> {
     const metadata = parseMetadata(request.metadata, this.options);
     const runtimeRequest = toRuntimeRequest(request, metadata);
-    const promptText = buildPromptText(request.userMessage, runtimeRequest);
+    const promptText = buildPromptText(request.userMessage, runtimeRequest, metadata);
     const screenshotPayloads = Array.isArray(runtimeRequest?.screenshots)
       ? runtimeRequest!.screenshots.map((entry) => parseImageDataUrl(entry)).filter((entry): entry is NonNullable<typeof entry> => Boolean(entry)).slice(0, 8)
       : [];
@@ -960,6 +1197,10 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       providerSessionId: request.providerSessionId,
       events: this.createColdProviderEventStream(
         sdkStream,
+        async (nextQueryOptions) => {
+          const nextPrompt = await buildPromptInput(effectiveRequest, metadata);
+          return query({ prompt: nextPrompt, options: nextQueryOptions });
+        },
         request,
         metadata,
         queryOptions,
@@ -970,23 +1211,32 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
 
 
   private createColdProviderEventStream(
-    sdkStream: Query,
+    initialSdkStream: Query,
+    createSdkStream: (queryOptions: Record<string, unknown>) => Promise<Query> | Query,
     request: RuntimeTurnRequest,
     metadata: Record<string, unknown>,
-    queryOptions: Record<string, unknown>,
+    initialQueryOptions: Record<string, unknown>,
     awaitingAutoCompact = false,
   ): AsyncIterable<ProviderEvent> {
     const usageSnapshots = this.usageSnapshots;
     const hotRuntimePool = this.hotRuntimePool;
-    const supportedEfforts = Array.isArray((queryOptions as Record<string, unknown>).supportedEfforts)
-      ? ((queryOptions as Record<string, unknown>).supportedEfforts as string[])
-      : ["default", "low", "medium", "high", "xhigh"];
-    const effortFallbackNotice =
-      typeof (queryOptions as Record<string, unknown>).effortFallbackNotice === "string"
-        ? String((queryOptions as Record<string, unknown>).effortFallbackNotice)
-        : undefined;
+    const rememberEffortSuccess = this.rememberEffortSuccess.bind(this);
+    const buildFailedInitEffortRetryOptions = this.buildFailedInitEffortRetryOptions.bind(this);
     return (async function* () {
-      try {
+      let queryOptions = initialQueryOptions;
+      let nextSdkStream: Query | undefined = initialSdkStream;
+      for (;;) {
+        let sdkStream: Query | undefined = nextSdkStream;
+        nextSdkStream = undefined;
+        let sawSdkInit = false;
+        let sawModelOutput = false;
+        const supportedEfforts = Array.isArray((queryOptions as Record<string, unknown>).supportedEfforts)
+          ? ((queryOptions as Record<string, unknown>).supportedEfforts as string[])
+          : ["default", "low", "medium", "high", "xhigh", "max"];
+        const effortFallbackNotice =
+          typeof (queryOptions as Record<string, unknown>).effortFallbackNotice === "string"
+            ? String((queryOptions as Record<string, unknown>).effortFallbackNotice)
+            : undefined;
         yield {
           type: "provider_event",
           payload: {
@@ -998,6 +1248,9 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
               requestedEffort: (queryOptions as Record<string, unknown>).requestedEffort ?? null,
               resolvedEffort: queryOptions.effort ?? null,
               supportedEfforts,
+              effortCapabilitySource: queryOptions.effortCapabilitySource ?? null,
+              effortResolutionSource: queryOptions.effortResolutionSource ?? null,
+              effortRetryFrom: queryOptions.effortRetryFrom ?? null,
               effortFallbackNotice: effortFallbackNotice ?? null,
               resolvedPermissionMode: queryOptions.permissionMode ?? null,
               settingSources: queryOptions.settingSources ?? null,
@@ -1009,49 +1262,78 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
         if (effortFallbackNotice) {
           yield { type: "status", payload: { text: effortFallbackNotice } };
         }
-        for await (const raw of sdkStream) {
-          const mapped = mapSdkMessageToProviderEvents(raw);
-          for (const event of mapped) {
-            if (event.type === "usage") {
-              const payload = event.payload as Record<string, unknown>;
-              const nextContextTokens = Number(payload.contextTokens);
-              const nextContextWindow = Number(payload.contextWindow);
-              const previous = usageSnapshots.get(request.conversationKey);
-              const merged = {
-                contextTokens:
-                  Number.isFinite(nextContextTokens) && nextContextTokens > 0
-                    ? Math.max(0, nextContextTokens)
-                    : previous?.contextTokens ?? 0,
-                contextWindow:
-                  Number.isFinite(nextContextWindow) && nextContextWindow > 0
-                    ? nextContextWindow
-                    : previous?.contextWindow,
-              };
-              usageSnapshots.set(request.conversationKey, merged);
-              const liveEntry = hotRuntimePool.get(request.conversationKey);
-              if (liveEntry) {
-                liveEntry.lastUsageSnapshot = merged;
+        try {
+          sdkStream = sdkStream ?? await createSdkStream(queryOptions);
+          for await (const raw of sdkStream) {
+            const mapped = mapSdkMessageToProviderEvents(raw);
+            for (const event of mapped) {
+              if (event.type === "provider_event") {
+                const payload = event.payload as Record<string, unknown>;
+                const providerType = payload.providerType;
+                const nested = payload.payload as Record<string, unknown> | undefined;
+                if (providerType === "system" && nested?.subtype === "init") {
+                  sawSdkInit = true;
+                }
               }
-            }
-            if (awaitingAutoCompact) {
-              if (event.type === "context_compacted") {
-                yield {
-                  type: "context_compacted",
-                  payload: { automatic: true },
+              if (event.type === "message_delta" || event.type === "tool_call" || event.type === "final") {
+                sawModelOutput = true;
+              }
+              if (event.type === "usage") {
+                const payload = event.payload as Record<string, unknown>;
+                const nextContextTokens = Number(payload.contextTokens);
+                const nextContextWindow = Number(payload.contextWindow);
+                const previous = usageSnapshots.get(request.conversationKey);
+                const merged = {
+                  contextTokens:
+                    Number.isFinite(nextContextTokens) && nextContextTokens > 0
+                      ? Math.max(0, nextContextTokens)
+                      : previous?.contextTokens ?? 0,
+                  contextWindow:
+                    Number.isFinite(nextContextWindow) && nextContextWindow > 0
+                      ? nextContextWindow
+                      : previous?.contextWindow,
                 };
+                usageSnapshots.set(request.conversationKey, merged);
+                const liveEntry = hotRuntimePool.get(request.conversationKey);
+                if (liveEntry) {
+                  liveEntry.lastUsageSnapshot = merged;
+                }
+              }
+              if (awaitingAutoCompact) {
+                if (event.type === "context_compacted") {
+                  yield {
+                    type: "context_compacted",
+                    payload: { automatic: true },
+                  };
+                  continue;
+                }
+                if (event.type === "final") {
+                  awaitingAutoCompact = false;
+                  rememberEffortSuccess(queryOptions);
+                  continue;
+                }
                 continue;
               }
               if (event.type === "final") {
-                awaitingAutoCompact = false;
-                continue;
+                rememberEffortSuccess(queryOptions);
               }
-              continue;
+              yield event;
             }
-            yield event;
           }
+          return;
+        } catch (error) {
+          const retryOptions = !sawSdkInit && !sawModelOutput
+            ? buildFailedInitEffortRetryOptions(queryOptions)
+            : undefined;
+          if (retryOptions) {
+            try { sdkStream?.close(); } catch {}
+            queryOptions = retryOptions;
+            continue;
+          }
+          throw error;
+        } finally {
+          try { sdkStream?.close(); } catch {}
         }
-      } finally {
-        try { sdkStream.close(); } catch {}
       }
     })();
   }
@@ -1082,23 +1364,97 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
   }
 
   async listEfforts(options?: { model?: string; settingSources?: Array<"user" | "project" | "local">; providerKey?: string }): Promise<string[]> {
+    return (await this.listEffortCapabilities(options)).efforts;
+  }
+
+  private async listEffortCapabilities(options?: { model?: string; settingSources?: Array<"user" | "project" | "local">; providerKey?: string }): Promise<EffortCapabilityInfo> {
     const sdkInfos = await this.readSupportedModelsFromSdk({ settingSources: options?.settingSources, providerKey: options?.providerKey });
-    const model = (options?.model || "").trim().toLowerCase();
+    const model = normalizeProviderModelName(options?.model);
     const base = ["default", "low", "medium", "high"] as string[];
     if (model) {
       const matched = sdkInfos.find((info) => {
-        const value = typeof info.value === "string" ? info.value.trim().toLowerCase() : "";
+        const value = normalizeProviderModelName(info.value);
         return value === model;
       });
       if (matched?.supportsEffort && Array.isArray(matched.supportedEffortLevels)) {
-        const efforts = Array.from(new Set(matched.supportedEffortLevels.map((entry) => entry.trim().toLowerCase()).filter((entry) => entry === "low" || entry === "medium" || entry === "high" || entry === "xhigh" || entry === "max")));
-        return efforts.length > 0 ? ["default", ...efforts] : base;
+        const efforts = normalizeSupportedEfforts(["default", ...matched.supportedEffortLevels]);
+        return { efforts: efforts.length > 0 ? efforts : base, source: "sdk_explicit" };
       }
     }
     if (/(?:^|[._-])max(?:$|[._-])/.test(model) || /opus[\s._-]*4[\s._-]*6/.test(model) || /claude-opus-4-6/.test(model)) {
-      return [...base, "xhigh", "max"];
+      return { efforts: [...base, "xhigh", "max"], source: "heuristic" };
     }
-    return [...base, "xhigh"];
+    return { efforts: [...base, "xhigh", "max"], source: "unknown" };
+  }
+
+  private resolveEffortFromCapabilities(input: {
+    requestedEffort: RuntimeEffortLevel | undefined;
+    capabilityInfo: EffortCapabilityInfo;
+    effortSuccessKey: string;
+  }): {
+    resolvedEffort: RuntimeEffortLevel | undefined;
+    effortFallbackNotice?: string;
+    effortResolutionSource: string;
+  } {
+    const { requestedEffort, capabilityInfo, effortSuccessKey } = input;
+    if (!requestedEffort) {
+      return { resolvedEffort: undefined, effortResolutionSource: "none" };
+    }
+    const remembered = this.effortSuccessCache.get(effortSuccessKey);
+    if (remembered && Date.now() - remembered.updatedAt > this.effortSuccessTtlMs) {
+      this.effortSuccessCache.delete(effortSuccessKey);
+    } else if (remembered && isHigherEffort(requestedEffort, remembered.effort)) {
+      return {
+        resolvedEffort: remembered.effort,
+        effortResolutionSource: "last_good",
+        effortFallbackNotice: `${formatEffortLabel(requestedEffort)} recently failed for this provider/model. Using ${formatEffortLabel(remembered.effort)}.`,
+      };
+    }
+    const resolvedEffort = nearestSupportedEffort(requestedEffort, capabilityInfo.efforts);
+    if (!resolvedEffort) {
+      return {
+        resolvedEffort: undefined,
+        effortResolutionSource: capabilityInfo.source,
+        effortFallbackNotice: `${formatEffortLabel(requestedEffort)} is unavailable for this model. Using Default.`,
+      };
+    }
+    if (requestedEffort !== resolvedEffort) {
+      return {
+        resolvedEffort,
+        effortResolutionSource: capabilityInfo.source,
+        effortFallbackNotice: `${formatEffortLabel(requestedEffort)} is unavailable for this model. Using ${formatEffortLabel(resolvedEffort)}.`,
+      };
+    }
+    return { resolvedEffort, effortResolutionSource: capabilityInfo.source };
+  }
+
+  private buildFailedInitEffortRetryOptions(queryOptions: Record<string, unknown>): Record<string, unknown> | undefined {
+    const currentEffort = queryOptions.effort;
+    if (!isRuntimeEffortLevel(currentEffort)) return undefined;
+    if (queryOptions.effortRetryFrom) return undefined;
+    const supportedEfforts = Array.isArray(queryOptions.supportedEfforts)
+      ? normalizeSupportedEfforts(queryOptions.supportedEfforts as string[])
+      : ["default", "low", "medium", "high", "xhigh", "max"];
+    const retryEffort = fallbackEffortAfterFailedInit(currentEffort, supportedEfforts);
+    if (!retryEffort || retryEffort === currentEffort) return undefined;
+    const requestedEffort = isRuntimeEffortLevel(queryOptions.requestedEffort)
+      ? queryOptions.requestedEffort
+      : currentEffort;
+    return {
+      ...queryOptions,
+      requestedEffort,
+      effort: retryEffort,
+      effortRetryFrom: currentEffort,
+      effortResolutionSource: "failed_init_retry",
+      effortFallbackNotice: `${formatEffortLabel(requestedEffort)} failed before Claude session start. Retrying with ${formatEffortLabel(retryEffort)}.`,
+    };
+  }
+
+  private rememberEffortSuccess(queryOptions: Record<string, unknown>): void {
+    const effort = queryOptions.effort;
+    const effortSuccessKey = typeof queryOptions.effortSuccessKey === "string" ? queryOptions.effortSuccessKey : "";
+    if (!effortSuccessKey || !isRuntimeEffortLevel(effort)) return;
+    this.effortSuccessCache.set(effortSuccessKey, { effort, updatedAt: Date.now() });
   }
 
   async listMcpServers(options?: { settingSources?: Array<"user" | "project" | "local"> }): Promise<McpServerStatus[]> {
@@ -1178,7 +1534,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     const requestedModelRaw = typeof rawRequestMetadata.model === "string" ? rawRequestMetadata.model.trim() : "";
     const requestedModel = shouldForwardFrontendModel && requestedModelRaw && requestedModelRaw.toLowerCase() !== "default" && requestedModelRaw.toLowerCase() !== "auto" ? requestedModelRaw : undefined;
     const requestedEffortRaw = typeof rawRequestMetadata.effort === "string" ? rawRequestMetadata.effort.trim().toLowerCase() : "";
-    const requestedEffort = requestedEffortRaw === "low" || requestedEffortRaw === "medium" || requestedEffortRaw === "high" || requestedEffortRaw === "xhigh" || requestedEffortRaw === "max" ? requestedEffortRaw as RuntimeEffortLevel : undefined;
+    const requestedEffort = isRuntimeEffortLevel(requestedEffortRaw) ? requestedEffortRaw : undefined;
     const settingSourcesOverride = parseSettingSourcesOverride(metadata);
     const permissionModeOverride = parsePermissionModeOverride(metadata);
     const customInstruction = parseCustomInstruction(metadata);
@@ -1201,7 +1557,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
         providerKey,
       );
       if (cachedResolution.model) {
-        resolvedModel = cachedResolution.model.trim().toLowerCase();
+        resolvedModel = normalizeProviderModelName(cachedResolution.model);
       } else {
         const modelInfos = await this.readSupportedModelsFromSdk({
           settingSources: effectiveSettingSources,
@@ -1210,11 +1566,11 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
         const normalizedResolved = resolveModelAlias(
           requestedModelRaw,
           modelInfos,
-        )?.trim().toLowerCase();
+        );
         if (normalizedResolved) {
-          resolvedModel = normalizedResolved;
+          resolvedModel = normalizeProviderModelName(normalizedResolved);
         } else {
-          const rawLower = requestedModelRaw.trim().toLowerCase();
+          const rawLower = normalizeProviderModelName(requestedModelRaw);
           if (rawLower === "opus" || rawLower === "sonnet" || rawLower === "haiku") {
             resolvedModel = rawLower;
           }
@@ -1222,22 +1578,19 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       }
     }
     const modelForSdk = resolvedModel;
-    const supportedEfforts = requestedEffort
-      ? await this.listEfforts({ model: modelForSdk || requestedModel, settingSources: effectiveSettingSources, providerKey })
-      : ["default", "low", "medium", "high", "xhigh"];
-    const supportedEffortSet = new Set(supportedEfforts.map((entry) => entry.trim().toLowerCase()).filter(Boolean));
-    const resolvedEffort = (() => {
-      if (!requestedEffort) return undefined;
-      if (supportedEffortSet.has(requestedEffort)) return requestedEffort;
-      const requestedIndex = RUNTIME_EFFORT_DESCENDING.indexOf(requestedEffort);
-      if (requestedIndex === -1) return undefined;
-      for (let i = requestedIndex + 1; i < RUNTIME_EFFORT_DESCENDING.length; i += 1) {
-        const candidate = RUNTIME_EFFORT_DESCENDING[i];
-        if (supportedEffortSet.has(candidate)) return candidate;
-      }
-      return undefined;
-    })();
-    const effortFallbackNotice = requestedEffort && requestedEffort !== resolvedEffort ? `Requested effort ${requestedEffort} is not supported by the current model. Using ${resolvedEffort || "default"}. Supported effort levels: ${supportedEfforts.join(", ")}.` : undefined;
+    const effortSuccessKey = makeEffortSuccessKey(providerKey, modelForSdk || requestedModel);
+    const capabilityInfo = requestedEffort
+      ? await this.listEffortCapabilities({ model: modelForSdk || requestedModel, settingSources: effectiveSettingSources, providerKey })
+      : { efforts: ["default", "low", "medium", "high", "xhigh", "max"], source: "unknown" as const };
+    const {
+      resolvedEffort,
+      effortFallbackNotice,
+      effortResolutionSource,
+    } = this.resolveEffortFromCapabilities({
+      requestedEffort,
+      capabilityInfo,
+      effortSuccessKey,
+    });
     const canUseTool = async (
       toolName: string,
       input: Record<string, unknown>,
@@ -1258,7 +1611,10 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
         model: modelForSdk,
         requestedModel,
         requestedEffort,
-        supportedEfforts,
+        supportedEfforts: capabilityInfo.efforts,
+        effortCapabilitySource: capabilityInfo.source,
+        effortResolutionSource,
+        effortSuccessKey,
         effortFallbackNotice,
         effort: resolvedEffort,
         cwd: effectiveCwd,
@@ -1429,6 +1785,9 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     entry.query = null;
     entry.bootstrapPromise = null;
     entry.currentTurn = null;
+    entry.currentTurnMessage = undefined;
+    entry.pendingEarlyRuntimeError = undefined;
+    entry.pendingEarlyRuntimeQueryOptions = undefined;
     entry.configSignature = undefined;
     entry.providerIdentity = undefined;
   }

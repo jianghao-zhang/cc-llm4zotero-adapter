@@ -44,6 +44,7 @@ describe("ClaudeCodeRuntimeAdapter", () => {
       },
       {
         onEvent(event) {
+          if (event.type === "provider_event") return;
           seen.push({
             type: event.type,
             delta: event.type === "message_delta" ? event.payload.delta : undefined,
@@ -93,6 +94,7 @@ describe("ClaudeCodeRuntimeAdapter", () => {
       },
       {
         onEvent(event) {
+          if (event.type === "provider_event") return;
           seenTypes.push(event.type);
         }
       }
@@ -106,6 +108,71 @@ describe("ClaudeCodeRuntimeAdapter", () => {
     const traces = await traceStore.list("conv-A");
     expect(traces).toHaveLength(3);
     expect(traces[0]?.runId).toBe("run-1");
+  });
+
+  it("resumes the base conversation session when provider identity changes", async () => {
+    const seenResumes: Array<string | undefined> = [];
+    const runtimeClient: ClaudeCodeRuntimeClient = {
+      async startTurn(request) {
+        seenResumes.push(request.providerSessionId);
+        return {
+          runId: "run-provider-change",
+          providerSessionId: request.providerSessionId,
+          events: providerEvents([
+            { type: "final", payload: { output: "continued" } },
+          ]),
+        };
+      },
+    };
+
+    const sessionMapper = new InMemorySessionMapper();
+    await sessionMapper.set("conv-provider", "stable-session");
+    const adapter = new ClaudeCodeRuntimeAdapter({
+      runtimeClient,
+      sessionMapper,
+    });
+
+    const outcome = await adapter.runTurn({
+      conversationKey: "conv-provider",
+      userMessage: "continue",
+      metadata: { providerIdentity: "provider-b" },
+    });
+
+    expect(outcome.status).toBe("completed");
+    expect(seenResumes).toEqual(["stable-session"]);
+    expect(await sessionMapper.get("conv-provider")).toBe("stable-session");
+  });
+
+  it("migrates legacy provider-scoped session mappings to the base conversation key", async () => {
+    const seenResumes: Array<string | undefined> = [];
+    const runtimeClient: ClaudeCodeRuntimeClient = {
+      async startTurn(request) {
+        seenResumes.push(request.providerSessionId);
+        return {
+          runId: "run-legacy",
+          providerSessionId: request.providerSessionId,
+          events: providerEvents([
+            { type: "final", payload: { output: "continued" } },
+          ]),
+        };
+      },
+    };
+
+    const sessionMapper = new InMemorySessionMapper();
+    await sessionMapper.set("conv-legacy::provider:provider-a", "legacy-session");
+    const adapter = new ClaudeCodeRuntimeAdapter({
+      runtimeClient,
+      sessionMapper,
+    });
+
+    await adapter.runTurn({
+      conversationKey: "conv-legacy",
+      userMessage: "continue",
+      metadata: { providerIdentity: "provider-b" },
+    });
+
+    expect(seenResumes).toEqual(["legacy-session"]);
+    expect(await sessionMapper.get("conv-legacy")).toBe("legacy-session");
   });
 
   it("emits provider_event on unmapped event", async () => {
@@ -132,6 +199,14 @@ describe("ClaudeCodeRuntimeAdapter", () => {
       },
       {
         onEvent(event) {
+          if (
+            event.type === "provider_event" &&
+            event.payload &&
+            typeof event.payload === "object" &&
+            (event.payload as Record<string, unknown>).providerType === "profiling"
+          ) {
+            return;
+          }
           seenTypes.push(event.type);
         }
       }
@@ -142,9 +217,13 @@ describe("ClaudeCodeRuntimeAdapter", () => {
 
   it("retries with fresh session when thinking signature is invalid", async () => {
     let callCount = 0;
+    const seenResumes: Array<string | undefined> = [];
+    const seenFallbackFlags: unknown[] = [];
     const runtimeClient: ClaudeCodeRuntimeClient = {
       async startTurn(request) {
         callCount += 1;
+        seenResumes.push(request.providerSessionId);
+        seenFallbackFlags.push(request.metadata?.claudeResumeFallbackHistory);
         if (callCount === 1) {
           throw new Error("API Error: 400 Invalid signature in thinking block");
         }
@@ -170,7 +249,13 @@ describe("ClaudeCodeRuntimeAdapter", () => {
     const outcome = await adapter.runTurn(
       {
         conversationKey: "conv-retry",
-        userMessage: "retry me"
+        userMessage: "retry me",
+        runtimeRequest: {
+          history: [
+            { role: "user", content: "previous question" },
+            { role: "assistant", content: "previous answer" },
+          ],
+        },
       },
       {
         onEvent(event) {
@@ -182,10 +267,12 @@ describe("ClaudeCodeRuntimeAdapter", () => {
     );
 
     expect(callCount).toBe(2);
+    expect(seenResumes).toEqual(["stale-session", undefined]);
+    expect(seenFallbackFlags).toEqual([undefined, true]);
     expect(outcome.status).toBe("completed");
     expect(outcome.finalText).toBe("ok");
     expect(await sessionMapper.get("conv-retry")).toBe("fresh-session-id");
-    expect(seenStatuses.some((line) => line.includes("Session signature mismatch"))).toBe(true);
+    expect(seenStatuses.some((line) => line.includes("Claude session resume failed"))).toBe(true);
   });
 
   it("clears mapper and hot runtime on explicit invalidation", async () => {
@@ -254,6 +341,7 @@ describe("ClaudeCodeRuntimeAdapter", () => {
 
     expect(outcome.status).toBe("completed");
     expect(seenResumes).toEqual([undefined]);
-    expect(await sessionMapper.get("conv-fresh::provider:provider-a")).toBe("fresh-session");
+    expect(await sessionMapper.get("conv-fresh")).toBe("fresh-session");
+    expect(await sessionMapper.get("conv-fresh::provider:provider-a")).toBeUndefined();
   });
 });

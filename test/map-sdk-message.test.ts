@@ -39,6 +39,10 @@ describe("mapSdkMessageToProviderEvents", () => {
       type: "system",
       session_id: "session-1",
       subtype: "api_retry",
+      attempt: 4,
+      max_retries: 10,
+      error_status: 429,
+      error: "rate_limit",
     });
 
     expect(hookStarted).toContainEqual({
@@ -50,7 +54,7 @@ describe("mapSdkMessageToProviderEvents", () => {
     expect(apiRetry).toContainEqual({
       type: "status",
       payload: expect.objectContaining({
-        text: "Rebuilding Claude session after runtime change",
+        text: "Claude API rate limited. Retrying request (attempt 4/10).",
       }),
     });
   });

@@ -31,6 +31,15 @@ type QueryWithMcpStatus = Query & {
   mcpServerStatus?: () => Promise<unknown>;
 };
 
+type QueryWithContextUsage = Query & {
+  getContextUsage?: () => Promise<unknown>;
+};
+
+type ContextUsageSnapshot = {
+  contextTokens: number;
+  contextWindow?: number;
+};
+
 type RuntimeEffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
 type EffortCapabilitySource = "sdk_explicit" | "heuristic" | "unknown";
 type PermissionEventSink = (event: ProviderEvent) => void;
@@ -39,6 +48,33 @@ type EffortCapabilityInfo = {
   efforts: string[];
   source: EffortCapabilitySource;
 };
+
+function toFiniteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function normalizeSdkContextUsage(value: unknown): ContextUsageSnapshot | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  const totalTokens = toFiniteNumber(record.totalTokens);
+  const maxTokens = toFiniteNumber(record.maxTokens) ?? toFiniteNumber(record.rawMaxTokens);
+  if (
+    !(typeof totalTokens === "number" && totalTokens >= 0) &&
+    !(typeof maxTokens === "number" && maxTokens > 0)
+  ) {
+    return undefined;
+  }
+  return {
+    contextTokens:
+      typeof totalTokens === "number" && Number.isFinite(totalTokens)
+        ? Math.max(0, totalTokens)
+        : 0,
+    contextWindow:
+      typeof maxTokens === "number" && Number.isFinite(maxTokens) && maxTokens > 0
+        ? maxTokens
+        : undefined,
+  };
+}
 
 function createProviderEventQueue(): {
   push: (event: ProviderEvent) => void;
@@ -653,6 +689,61 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     return merged;
   }
 
+  private buildUsageEventPayload(
+    sessionId: string | undefined,
+    snapshot: ContextUsageSnapshot,
+  ): Record<string, unknown> {
+    const percentage =
+      typeof snapshot.contextWindow === "number" && snapshot.contextWindow > 0
+        ? Math.max(0, Math.min(100, Math.round((snapshot.contextTokens / snapshot.contextWindow) * 100)))
+        : undefined;
+    return {
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheCreationInputTokens: 0,
+      cacheReadInputTokens: 0,
+      contextTokens: snapshot.contextTokens,
+      contextWindow: snapshot.contextWindow,
+      contextWindowIsAuthoritative:
+        typeof snapshot.contextWindow === "number" && snapshot.contextWindow > 0,
+      percentage,
+      sessionId,
+      usageSource: "sdk_get_context_usage",
+    };
+  }
+
+  private async getLiveContextUsageSnapshot(query: Query | undefined): Promise<ContextUsageSnapshot | undefined> {
+    const getContextUsage = (query as QueryWithContextUsage | undefined)?.getContextUsage;
+    if (typeof getContextUsage !== "function") return undefined;
+    try {
+      const usagePromise = getContextUsage.call(query)
+        .then((value) => normalizeSdkContextUsage(value))
+        .catch(() => undefined);
+      const timeoutPromise = new Promise<undefined>((resolve) => {
+        setTimeout(() => resolve(undefined), 750);
+      });
+      return await Promise.race([usagePromise, timeoutPromise]);
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async queueLiveContextUsageSnapshot(
+    entry: HotRuntimeEntry,
+    turn: HotRuntimeTurn,
+    query: Query | undefined,
+  ): Promise<boolean> {
+    const snapshot = await this.getLiveContextUsageSnapshot(query);
+    if (!snapshot) return false;
+    const merged = this.mergeUsageSnapshot(entry.conversationKey, snapshot);
+    entry.lastUsageSnapshot = merged;
+    turn.queueEvent({
+      type: "usage",
+      payload: this.buildUsageEventPayload(entry.providerSessionId ?? turn.sessionId, merged),
+    });
+    return true;
+  }
+
   constructor(options: ClaudeAgentSdkRuntimeClientOptions = {}) {
     this.options = options;
   }
@@ -1141,6 +1232,9 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
             });
             entry.lastUsageSnapshot = merged;
           }
+          if (event.type === "context_compacted" || event.type === "final") {
+            await this.queueLiveContextUsageSnapshot(entry, currentTurn, query);
+          }
           if (currentTurn.awaitingAutoCompact) {
             if (event.type === "context_compacted") {
               currentTurn.queueEvent({
@@ -1313,8 +1407,10 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     awaitingAutoCompact = false,
     permissionEvents = createProviderEventQueue(),
   ): AsyncIterable<ProviderEvent> {
-    const usageSnapshots = this.usageSnapshots;
     const hotRuntimePool = this.hotRuntimePool;
+    const getLiveContextUsageSnapshot = this.getLiveContextUsageSnapshot.bind(this);
+    const mergeUsageSnapshot = this.mergeUsageSnapshot.bind(this);
+    const buildUsageEventPayload = this.buildUsageEventPayload.bind(this);
     const rememberEffortSuccess = this.rememberEffortSuccess.bind(this);
     const buildFailedInitEffortRetryOptions = this.buildFailedInitEffortRetryOptions.bind(this);
     return (async function* () {
@@ -1405,21 +1501,33 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
                   const payload = event.payload as Record<string, unknown>;
                   const nextContextTokens = Number(payload.contextTokens);
                   const nextContextWindow = Number(payload.contextWindow);
-                  const previous = usageSnapshots.get(request.conversationKey);
-                  const merged = {
+                  const merged = mergeUsageSnapshot(request.conversationKey, {
                     contextTokens:
                       Number.isFinite(nextContextTokens) && nextContextTokens > 0
                         ? Math.max(0, nextContextTokens)
-                        : previous?.contextTokens ?? 0,
+                        : undefined,
                     contextWindow:
                       Number.isFinite(nextContextWindow) && nextContextWindow > 0
                         ? nextContextWindow
-                        : previous?.contextWindow,
-                  };
-                  usageSnapshots.set(request.conversationKey, merged);
+                        : undefined,
+                  });
                   const liveEntry = hotRuntimePool.get(request.conversationKey);
                   if (liveEntry) {
                     liveEntry.lastUsageSnapshot = merged;
+                  }
+                }
+                if (event.type === "context_compacted" || event.type === "final") {
+                  const liveSnapshot = await getLiveContextUsageSnapshot(sdkStream);
+                  if (liveSnapshot) {
+                    const merged = mergeUsageSnapshot(request.conversationKey, liveSnapshot);
+                    const liveEntry = hotRuntimePool.get(request.conversationKey);
+                    if (liveEntry) {
+                      liveEntry.lastUsageSnapshot = merged;
+                    }
+                    yield {
+                      type: "usage",
+                      payload: buildUsageEventPayload(request.providerSessionId, merged),
+                    };
                   }
                 }
                 if (awaitingAutoCompact) {

@@ -124,4 +124,67 @@ describe("mapSdkMessageToProviderEvents", () => {
       },
     });
   });
+
+  it("maps stream message_delta usage as single-step context usage", () => {
+    const events = mapSdkMessageToProviderEvents({
+      type: "stream_event",
+      session_id: "session-1",
+      event: {
+        type: "message_delta",
+        delta: { stop_reason: "end_turn" },
+        usage: {
+          input_tokens: 100,
+          cache_creation_input_tokens: 20,
+          cache_read_input_tokens: 30,
+          output_tokens: 40,
+        },
+      },
+    });
+
+    expect(events).toContainEqual({
+      type: "usage",
+      payload: expect.objectContaining({
+        inputTokens: 100,
+        cacheCreationInputTokens: 20,
+        cacheReadInputTokens: 30,
+        outputTokens: 40,
+        contextTokens: 190,
+        sessionId: "session-1",
+      }),
+    });
+  });
+
+  it("does not treat cumulative result usage as current context usage", () => {
+    const events = mapSdkMessageToProviderEvents({
+      type: "result",
+      subtype: "success",
+      session_id: "session-1",
+      result: "done",
+      usage: {
+        input_tokens: 1000,
+        cache_read_input_tokens: 500,
+        output_tokens: 100,
+      },
+      modelUsage: {
+        "claude-opus-4-6": {
+          contextWindow: 200000,
+        },
+      },
+    });
+
+    expect(events).toContainEqual({
+      type: "usage",
+      payload: expect.objectContaining({
+        contextTokens: 0,
+        contextWindow: 200000,
+        contextWindowIsAuthoritative: true,
+      }),
+    });
+    expect(events).not.toContainEqual({
+      type: "usage",
+      payload: expect.objectContaining({
+        contextTokens: 1500,
+      }),
+    });
+  });
 });

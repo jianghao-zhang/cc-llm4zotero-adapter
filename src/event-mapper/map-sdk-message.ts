@@ -62,6 +62,7 @@ function normalizeUsagePayload(args: {
   usage?: Record<string, unknown> | undefined;
   modelUsage?: Record<string, ModelUsageEntry> | undefined;
   sessionId?: string;
+  includeOutputTokens?: boolean;
 }): ProviderEvent | null {
   const inputTokens = asFiniteNumber(args.usage?.input_tokens) ?? asFiniteNumber(args.usage?.inputTokens) ?? 0;
   const outputTokens = asFiniteNumber(args.usage?.output_tokens) ?? asFiniteNumber(args.usage?.outputTokens) ?? 0;
@@ -73,7 +74,13 @@ function normalizeUsagePayload(args: {
     asFiniteNumber(args.usage?.cache_read_input_tokens) ??
     asFiniteNumber(args.usage?.cacheReadInputTokens) ??
     0;
-  const contextTokens = Math.max(0, inputTokens + cacheCreationInputTokens + cacheReadInputTokens);
+  const contextTokens = Math.max(
+    0,
+    inputTokens +
+      cacheCreationInputTokens +
+      cacheReadInputTokens +
+      (args.includeOutputTokens === true ? outputTokens : 0),
+  );
 
   let model: string | undefined;
   let contextWindow: number | undefined;
@@ -110,6 +117,33 @@ function normalizeUsagePayload(args: {
       percentage,
       sessionId: args.sessionId,
       model,
+    },
+  };
+}
+
+function normalizeContextWindowPayload(args: {
+  modelUsage?: Record<string, ModelUsageEntry> | undefined;
+  sessionId?: string;
+}): ProviderEvent | null {
+  const modelUsageEntries = args.modelUsage ? Object.entries(args.modelUsage) : [];
+  if (modelUsageEntries.length !== 1) return null;
+  const [modelName, entry] = modelUsageEntries[0]!;
+  const contextWindow = asFiniteNumber(entry?.contextWindow);
+  if (!(typeof contextWindow === "number" && Number.isFinite(contextWindow) && contextWindow > 0)) {
+    return null;
+  }
+  return {
+    type: "usage",
+    payload: {
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheCreationInputTokens: 0,
+      cacheReadInputTokens: 0,
+      contextTokens: 0,
+      contextWindow,
+      contextWindowIsAuthoritative: true,
+      sessionId: args.sessionId,
+      model: modelName || undefined,
     },
   };
 }
@@ -267,6 +301,7 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
         ? normalizeUsagePayload({
             usage: message.usage,
             sessionId,
+            includeOutputTokens: true,
           })
         : null;
     if (usageEvent) {
@@ -336,13 +371,12 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
   if (type === "result") {
     const output = extractResultOutput(msg);
     const events: ProviderEvent[] = [providerEvent];
-    const usageEvent = normalizeUsagePayload({
-      usage: asRecord(msg.usage),
+    const contextWindowEvent = normalizeContextWindowPayload({
       modelUsage: asRecord(msg.modelUsage) as Record<string, ModelUsageEntry> | undefined,
       sessionId,
     });
-    if (usageEvent) {
-      events.push(usageEvent);
+    if (contextWindowEvent) {
+      events.push(contextWindowEvent);
     }
     events.push({
       type: "final",
@@ -416,6 +450,14 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
 
   if (type === "stream_event") {
     const event = asRecord(msg.event);
+    if (event.type === "message_delta") {
+      const usageEvent = normalizeUsagePayload({
+        usage: asRecord(event.usage),
+        sessionId,
+        includeOutputTokens: true,
+      });
+      return usageEvent ? [providerEvent, usageEvent] : [providerEvent];
+    }
     if (event.type === "content_block_start") {
       const contentBlock = asRecord(event.content_block);
       if (contentBlock.type === "tool_use") {

@@ -106,9 +106,22 @@ export class PermissionStore {
     }
 
     if (result.approved) {
+      const data = result.data && typeof result.data === "object" ? result.data as Record<string, unknown> : {};
+      const rawUpdatedInput = typeof data.input === "string" ? data.input.trim() : "";
+      let updatedInput: Record<string, unknown> = {};
+      if (rawUpdatedInput) {
+        try {
+          const parsed = JSON.parse(rawUpdatedInput);
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            updatedInput = parsed as Record<string, unknown>;
+          }
+        } catch {
+          updatedInput = {};
+        }
+      }
       pending.resolve({
         behavior: "allow",
-        updatedInput: {},  // SDK Zod schema requires this field (even if empty)
+        updatedInput,
         toolUseID: pending.toolUseID,
       });
     } else {

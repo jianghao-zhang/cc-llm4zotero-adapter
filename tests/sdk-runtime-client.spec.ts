@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { ClaudeCodeRuntimeAdapter } from "../src/bridge/claude-code-runtime-adapter.js";
 import { ClaudeAgentSdkRuntimeClient } from "../src/providers/claude-agent-sdk-runtime-client.js";
 import { setCachedModels } from "../src/providers/model-resolver.js";
+import { globalPermissionStore } from "../src/permissions/permission-store.js";
 import { InMemorySessionMapper } from "../src/session-link/session-mapper.js";
 
 function makeStream(items: unknown[]): any {
@@ -35,6 +36,18 @@ function makeModelProbe(models: unknown[] = []): any {
   };
 }
 
+async function nextEvent(
+  iterator: AsyncIterator<any>,
+  timeoutMs = 1_000,
+): Promise<IteratorResult<any>> {
+  return Promise.race([
+    iterator.next(),
+    new Promise<IteratorResult<any>>((_, reject) => {
+      setTimeout(() => reject(new Error("Timed out waiting for event")), timeoutMs);
+    }),
+  ]);
+}
+
 describe("ClaudeAgentSdkRuntimeClient", () => {
   const originalHome = process.env.HOME;
   const originalUserProfile = process.env.USERPROFILE;
@@ -50,6 +63,7 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
     } else {
       process.env.USERPROFILE = originalUserProfile;
     }
+    globalPermissionStore.cleanup();
   });
 
   it("passes resume/allowedTools into query options and maps messages", async () => {
@@ -95,6 +109,73 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
       "provider_event",
       "final"
     ]);
+  });
+
+  it("emits SDK canUseTool permission requests on cold streams before resolution", async () => {
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      queryImpl(args) {
+        const canUseTool = args.options.canUseTool as (
+          toolName: string,
+          input: Record<string, unknown>,
+          options: {
+            signal: AbortSignal;
+            title?: string;
+            description?: string;
+            displayName?: string;
+            toolUseID: string;
+          },
+        ) => Promise<{ behavior: string }>;
+        return {
+          async *[Symbol.asyncIterator]() {
+            const result = await canUseTool(
+              "Bash",
+              { command: "mkdir -p .claude/skills/example" },
+              {
+                signal: new AbortController().signal,
+                title: "Allow Bash?",
+                description: "Claude wants to create a skill directory.",
+                displayName: "Bash",
+                toolUseID: "tool-use-cold-permission",
+              },
+            );
+            yield {
+              type: "result",
+              session_id: "session-permission",
+              result: result.behavior,
+              is_error: false,
+            };
+          },
+          close() {},
+        } as any;
+      },
+    });
+
+    const stream = await runtime.startTurn({
+      conversationKey: "conv-permission-cold",
+      userMessage: "install a skill",
+    });
+    const iterator = stream.events[Symbol.asyncIterator]();
+    let confirmation: any;
+    for (let i = 0; i < 5; i += 1) {
+      const next = await nextEvent(iterator);
+      if (next.done) break;
+      if (next.value.type === "confirmation_required") {
+        confirmation = next.value;
+        break;
+      }
+    }
+
+    expect(confirmation?.payload?.requestId).toMatch(/^perm-/);
+    expect(confirmation?.payload?.action?.toolName).toBe("Bash");
+    expect(globalPermissionStore.resolve(confirmation.payload.requestId, { approved: true })).toBe(true);
+
+    const remainingTypes: string[] = [];
+    for (;;) {
+      const next = await nextEvent(iterator);
+      if (next.done) break;
+      remainingTypes.push(next.value.type);
+    }
+    expect(remainingTypes).toContain("final");
   });
 
   it("ignores frontend model metadata by default", async () => {
@@ -709,5 +790,82 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
 
     expect(queryCount).toBe(1);
     expect(seenResumes).toEqual(["sess-existing"]);
+  });
+
+  it("emits SDK canUseTool permission requests from warmed hot runtimes", async () => {
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      queryImpl(args) {
+        const options = args.options as Record<string, unknown>;
+        const prompt = args.prompt as AsyncIterable<unknown>;
+        const canUseTool = options.canUseTool as (
+          toolName: string,
+          input: Record<string, unknown>,
+          options: {
+            signal: AbortSignal;
+            title?: string;
+            description?: string;
+            displayName?: string;
+            toolUseID: string;
+          },
+        ) => Promise<{ behavior: string }>;
+        return {
+          async *[Symbol.asyncIterator]() {
+            for await (const _message of prompt) {
+              const result = await canUseTool(
+                "Bash",
+                { command: "mkdir -p .claude/skills/example" },
+                {
+                  signal: new AbortController().signal,
+                  title: "Allow Bash?",
+                  description: "Claude wants to create a skill directory.",
+                  displayName: "Bash",
+                  toolUseID: "tool-use-hot-permission",
+                },
+              );
+              yield {
+                type: "result",
+                session_id: "sess-hot-permission",
+                result: result.behavior,
+                is_error: false,
+              };
+            }
+          },
+          close() {},
+        } as any;
+      }
+    });
+
+    await runtime.retainHotRuntime({ conversationKey: "conv-hot-permission", userMessage: "" }, "mount-1");
+    await runtime.warmHotRuntime?.({
+      conversationKey: "conv-hot-permission",
+      userMessage: "",
+    });
+
+    const stream = await runtime.startTurn({
+      conversationKey: "conv-hot-permission",
+      userMessage: "install a skill",
+    });
+    const iterator = stream.events[Symbol.asyncIterator]();
+    let confirmation: any;
+    for (let i = 0; i < 6; i += 1) {
+      const next = await nextEvent(iterator);
+      if (next.done) break;
+      if (next.value.type === "confirmation_required") {
+        confirmation = next.value;
+        break;
+      }
+    }
+
+    expect(confirmation?.payload?.requestId).toMatch(/^perm-/);
+    expect(confirmation?.payload?.action?.toolName).toBe("Bash");
+    expect(globalPermissionStore.resolve(confirmation.payload.requestId, { approved: true })).toBe(true);
+
+    const remainingTypes: string[] = [];
+    for (;;) {
+      const next = await nextEvent(iterator);
+      if (next.done) break;
+      remainingTypes.push(next.value.type);
+    }
+    expect(remainingTypes).toContain("final");
   });
 });

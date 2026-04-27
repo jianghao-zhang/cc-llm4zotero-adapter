@@ -33,11 +33,87 @@ type QueryWithMcpStatus = Query & {
 
 type RuntimeEffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
 type EffortCapabilitySource = "sdk_explicit" | "heuristic" | "unknown";
+type PermissionEventSink = (event: ProviderEvent) => void;
 
 type EffortCapabilityInfo = {
   efforts: string[];
   source: EffortCapabilitySource;
 };
+
+function createProviderEventQueue(): {
+  push: (event: ProviderEvent) => void;
+  next: () => Promise<ProviderEvent | null>;
+  close: () => void;
+} {
+  const queue: ProviderEvent[] = [];
+  const waiters: Array<(event: ProviderEvent | null) => void> = [];
+  let closed = false;
+
+  return {
+    push(event) {
+      if (closed) return;
+      const waiter = waiters.shift();
+      if (waiter) {
+        waiter(event);
+        return;
+      }
+      queue.push(event);
+    },
+    next() {
+      if (queue.length > 0) {
+        return Promise.resolve(queue.shift()!);
+      }
+      if (closed) {
+        return Promise.resolve(null);
+      }
+      return new Promise((resolve) => {
+        waiters.push(resolve);
+      });
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      for (const waiter of waiters.splice(0)) {
+        waiter(null);
+      }
+    },
+  };
+}
+
+function buildPermissionAction(input: {
+  toolName: string;
+  title?: string;
+  description?: string;
+  displayName?: string;
+  blockedPath?: string;
+  decisionReason?: string;
+  toolInput: Record<string, unknown>;
+}): Record<string, unknown> {
+  const toolLabel = input.displayName || input.toolName;
+  const details = [
+    input.description,
+    input.decisionReason,
+    input.blockedPath ? `Path: ${input.blockedPath}` : "",
+  ].filter((entry): entry is string => Boolean(entry && entry.trim()));
+  return {
+    toolName: input.toolName,
+    title: input.title || `Approve ${toolLabel}`,
+    mode: "approval",
+    confirmLabel: "Allow",
+    cancelLabel: "Deny",
+    description: details.join("\n") || `Claude wants to use ${toolLabel}.`,
+    fields: [
+      {
+        type: "textarea",
+        id: "input",
+        label: "Tool input",
+        value: JSON.stringify(input.toolInput, null, 2),
+        editorMode: "json",
+        spellcheck: false,
+      },
+    ],
+  };
+}
 
 type EffortSuccessRecord = {
   effort: RuntimeEffortLevel;
@@ -746,11 +822,16 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       effectiveCwd,
     );
     const resumeSessionId = request.providerSessionId || entry.providerSessionId;
+    let activeEntry = entry;
+    const emitHotPermissionRequired: PermissionEventSink = (event) => {
+      activeEntry.currentTurn?.queueEvent(event);
+    };
 
     let queryOptions = await this.buildQueryOptions(
       request,
       metadata,
       resumeSessionId,
+      emitHotPermissionRequired,
     );
     let signature = buildHotRuntimeSignature(queryOptions, metadata);
     const shouldRestartForConfigChange =
@@ -795,6 +876,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
           shouldRestartRuntime,
           shouldDropSession: false,
         });
+        activeEntry = entry;
       } catch (error) {
         const retryOptions = this.buildFailedInitEffortRetryOptions(queryOptions);
         if (!retryOptions) throw error;
@@ -808,6 +890,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
           shouldRestartRuntime: true,
           shouldDropSession: false,
         });
+        activeEntry = entry;
       }
     }
     const runId = randomUUID();
@@ -889,10 +972,14 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       effectiveCwd,
     );
     const resumeSessionId = request.providerSessionId || entry.providerSessionId;
+    const emitHotPermissionRequired: PermissionEventSink = (event) => {
+      entry.currentTurn?.queueEvent(event);
+    };
     let queryOptions = seed?.queryOptions ?? await this.buildQueryOptions(
       request,
       metadata,
       resumeSessionId,
+      emitHotPermissionRequired,
     );
     let signature = seed?.signature ?? buildHotRuntimeSignature(queryOptions, metadata);
     const shouldRestartForConfigChange =
@@ -910,7 +997,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     );
 
     if (shouldDropSession) {
-      queryOptions = await this.buildQueryOptions(request, metadata, undefined);
+      queryOptions = await this.buildQueryOptions(request, metadata, undefined, emitHotPermissionRequired);
       signature = buildHotRuntimeSignature(queryOptions, metadata);
     }
 
@@ -1189,7 +1276,13 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     const effectiveRequest = shouldInjectCompact
       ? { ...request, userMessage: effectiveUserMessage }
       : request;
-    const queryOptions = await this.buildQueryOptions(effectiveRequest, metadata, request.providerSessionId);
+    const permissionEvents = createProviderEventQueue();
+    const queryOptions = await this.buildQueryOptions(
+      effectiveRequest,
+      metadata,
+      request.providerSessionId,
+      permissionEvents.push,
+    );
     const prompt: string | AsyncIterable<SDKUserMessage> = await buildPromptInput(effectiveRequest, metadata);
     const sdkStream = query({ prompt, options: queryOptions });
     return {
@@ -1205,6 +1298,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
         metadata,
         queryOptions,
         shouldInjectCompact || /^\/compact(?:\s|$)/i.test(request.userMessage.trim()),
+        permissionEvents,
       ),
     };
   }
@@ -1217,6 +1311,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     metadata: Record<string, unknown>,
     initialQueryOptions: Record<string, unknown>,
     awaitingAutoCompact = false,
+    permissionEvents = createProviderEventQueue(),
   ): AsyncIterable<ProviderEvent> {
     const usageSnapshots = this.usageSnapshots;
     const hotRuntimePool = this.hotRuntimePool;
@@ -1225,115 +1320,146 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     return (async function* () {
       let queryOptions = initialQueryOptions;
       let nextSdkStream: Query | undefined = initialSdkStream;
-      for (;;) {
-        let sdkStream: Query | undefined = nextSdkStream;
-        nextSdkStream = undefined;
-        let sawSdkInit = false;
-        let sawModelOutput = false;
-        const supportedEfforts = Array.isArray((queryOptions as Record<string, unknown>).supportedEfforts)
-          ? ((queryOptions as Record<string, unknown>).supportedEfforts as string[])
-          : ["default", "low", "medium", "high", "xhigh", "max"];
-        const effortFallbackNotice =
-          typeof (queryOptions as Record<string, unknown>).effortFallbackNotice === "string"
-            ? String((queryOptions as Record<string, unknown>).effortFallbackNotice)
-            : undefined;
-        yield {
-          type: "provider_event",
-          payload: {
-            providerType: "runtime_config",
-            sessionId: request.providerSessionId,
-            ts: Date.now(),
+      try {
+        for (;;) {
+          let sdkStream: Query | undefined = nextSdkStream;
+          nextSdkStream = undefined;
+          let sawSdkInit = false;
+          let sawModelOutput = false;
+          const supportedEfforts = Array.isArray((queryOptions as Record<string, unknown>).supportedEfforts)
+            ? ((queryOptions as Record<string, unknown>).supportedEfforts as string[])
+            : ["default", "low", "medium", "high", "xhigh", "max"];
+          const effortFallbackNotice =
+            typeof (queryOptions as Record<string, unknown>).effortFallbackNotice === "string"
+              ? String((queryOptions as Record<string, unknown>).effortFallbackNotice)
+              : undefined;
+          yield {
+            type: "provider_event",
             payload: {
-              requestedModel: (queryOptions as Record<string, unknown>).requestedModel ?? null,
-              requestedEffort: (queryOptions as Record<string, unknown>).requestedEffort ?? null,
-              resolvedEffort: queryOptions.effort ?? null,
-              supportedEfforts,
-              effortCapabilitySource: queryOptions.effortCapabilitySource ?? null,
-              effortResolutionSource: queryOptions.effortResolutionSource ?? null,
-              effortRetryFrom: queryOptions.effortRetryFrom ?? null,
-              effortFallbackNotice: effortFallbackNotice ?? null,
-              resolvedPermissionMode: queryOptions.permissionMode ?? null,
-              settingSources: queryOptions.settingSources ?? null,
-              configSourceMode: metadata.claudeConfigSource ?? null,
-              cwd: queryOptions.cwd ?? null,
+              providerType: "runtime_config",
+              sessionId: request.providerSessionId,
+              ts: Date.now(),
+              payload: {
+                requestedModel: (queryOptions as Record<string, unknown>).requestedModel ?? null,
+                requestedEffort: (queryOptions as Record<string, unknown>).requestedEffort ?? null,
+                resolvedEffort: queryOptions.effort ?? null,
+                supportedEfforts,
+                effortCapabilitySource: queryOptions.effortCapabilitySource ?? null,
+                effortResolutionSource: queryOptions.effortResolutionSource ?? null,
+                effortRetryFrom: queryOptions.effortRetryFrom ?? null,
+                effortFallbackNotice: effortFallbackNotice ?? null,
+                resolvedPermissionMode: queryOptions.permissionMode ?? null,
+                settingSources: queryOptions.settingSources ?? null,
+                configSourceMode: metadata.claudeConfigSource ?? null,
+                cwd: queryOptions.cwd ?? null,
+              },
             },
-          },
-        };
-        if (effortFallbackNotice) {
-          yield { type: "status", payload: { text: effortFallbackNotice } };
-        }
-        try {
-          sdkStream = sdkStream ?? await createSdkStream(queryOptions);
-          for await (const raw of sdkStream) {
-            const mapped = mapSdkMessageToProviderEvents(raw);
-            for (const event of mapped) {
-              if (event.type === "provider_event") {
-                const payload = event.payload as Record<string, unknown>;
-                const providerType = payload.providerType;
-                const nested = payload.payload as Record<string, unknown> | undefined;
-                if (providerType === "system" && nested?.subtype === "init") {
-                  sawSdkInit = true;
-                }
-              }
-              if (event.type === "message_delta" || event.type === "tool_call" || event.type === "final") {
-                sawModelOutput = true;
-              }
-              if (event.type === "usage") {
-                const payload = event.payload as Record<string, unknown>;
-                const nextContextTokens = Number(payload.contextTokens);
-                const nextContextWindow = Number(payload.contextWindow);
-                const previous = usageSnapshots.get(request.conversationKey);
-                const merged = {
-                  contextTokens:
-                    Number.isFinite(nextContextTokens) && nextContextTokens > 0
-                      ? Math.max(0, nextContextTokens)
-                      : previous?.contextTokens ?? 0,
-                  contextWindow:
-                    Number.isFinite(nextContextWindow) && nextContextWindow > 0
-                      ? nextContextWindow
-                      : previous?.contextWindow,
-                };
-                usageSnapshots.set(request.conversationKey, merged);
-                const liveEntry = hotRuntimePool.get(request.conversationKey);
-                if (liveEntry) {
-                  liveEntry.lastUsageSnapshot = merged;
-                }
-              }
-              if (awaitingAutoCompact) {
-                if (event.type === "context_compacted") {
-                  yield {
-                    type: "context_compacted",
-                    payload: { automatic: true },
-                  };
-                  continue;
-                }
-                if (event.type === "final") {
-                  awaitingAutoCompact = false;
-                  rememberEffortSuccess(queryOptions);
-                  continue;
+          };
+          if (effortFallbackNotice) {
+            yield { type: "status", payload: { text: effortFallbackNotice } };
+          }
+          try {
+            sdkStream = sdkStream ?? await createSdkStream(queryOptions);
+            const sdkIterator = sdkStream[Symbol.asyncIterator]();
+            let sdkNext = sdkIterator.next();
+            let permissionNext = permissionEvents.next();
+            for (;;) {
+              const next = await Promise.race([
+                sdkNext.then(
+                  (result) => ({ source: "sdk" as const, result }),
+                  (error) => ({ source: "sdk_error" as const, error }),
+                ),
+                permissionNext.then((event) => ({
+                  source: "permission" as const,
+                  event,
+                })),
+              ]);
+              if (next.source === "permission") {
+                permissionNext = permissionEvents.next();
+                if (next.event) {
+                  yield next.event;
                 }
                 continue;
               }
-              if (event.type === "final") {
-                rememberEffortSuccess(queryOptions);
+              if (next.source === "sdk_error") {
+                throw next.error;
               }
-              yield event;
+              if (next.result.done) {
+                break;
+              }
+              sdkNext = sdkIterator.next();
+              const mapped = mapSdkMessageToProviderEvents(next.result.value);
+              for (const event of mapped) {
+                if (event.type === "provider_event") {
+                  const payload = event.payload as Record<string, unknown>;
+                  const providerType = payload.providerType;
+                  const nested = payload.payload as Record<string, unknown> | undefined;
+                  if (providerType === "system" && nested?.subtype === "init") {
+                    sawSdkInit = true;
+                  }
+                }
+                if (event.type === "message_delta" || event.type === "tool_call" || event.type === "final") {
+                  sawModelOutput = true;
+                }
+                if (event.type === "usage") {
+                  const payload = event.payload as Record<string, unknown>;
+                  const nextContextTokens = Number(payload.contextTokens);
+                  const nextContextWindow = Number(payload.contextWindow);
+                  const previous = usageSnapshots.get(request.conversationKey);
+                  const merged = {
+                    contextTokens:
+                      Number.isFinite(nextContextTokens) && nextContextTokens > 0
+                        ? Math.max(0, nextContextTokens)
+                        : previous?.contextTokens ?? 0,
+                    contextWindow:
+                      Number.isFinite(nextContextWindow) && nextContextWindow > 0
+                        ? nextContextWindow
+                        : previous?.contextWindow,
+                  };
+                  usageSnapshots.set(request.conversationKey, merged);
+                  const liveEntry = hotRuntimePool.get(request.conversationKey);
+                  if (liveEntry) {
+                    liveEntry.lastUsageSnapshot = merged;
+                  }
+                }
+                if (awaitingAutoCompact) {
+                  if (event.type === "context_compacted") {
+                    yield {
+                      type: "context_compacted",
+                      payload: { automatic: true },
+                    };
+                    continue;
+                  }
+                  if (event.type === "final") {
+                    awaitingAutoCompact = false;
+                    rememberEffortSuccess(queryOptions);
+                    continue;
+                  }
+                  continue;
+                }
+                if (event.type === "final") {
+                  rememberEffortSuccess(queryOptions);
+                }
+                yield event;
+              }
             }
-          }
-          return;
-        } catch (error) {
-          const retryOptions = !sawSdkInit && !sawModelOutput
-            ? buildFailedInitEffortRetryOptions(queryOptions)
-            : undefined;
-          if (retryOptions) {
+            return;
+          } catch (error) {
+            const retryOptions = !sawSdkInit && !sawModelOutput
+              ? buildFailedInitEffortRetryOptions(queryOptions)
+              : undefined;
+            if (retryOptions) {
+              try { sdkStream?.close(); } catch {}
+              queryOptions = retryOptions;
+              continue;
+            }
+            throw error;
+          } finally {
             try { sdkStream?.close(); } catch {}
-            queryOptions = retryOptions;
-            continue;
           }
-          throw error;
-        } finally {
-          try { sdkStream?.close(); } catch {}
         }
+      } finally {
+        permissionEvents.close();
       }
     })();
   }
@@ -1528,7 +1654,12 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     return ["Claude config source for this Zotero conversation:", `- mode: ${configSourceMode || "default"}`, `- active setting sources: ${effectiveSettingSources.join(", ")}`, ...pathLines, "Treat these paths as the active Claude Code config stack for this run."].join("\n");
   }
 
-  private async buildQueryOptions(request: RuntimeTurnRequest, metadata: Record<string, unknown>, providerSessionId: string | undefined): Promise<Record<string, unknown>> {
+  private async buildQueryOptions(
+    request: RuntimeTurnRequest,
+    metadata: Record<string, unknown>,
+    providerSessionId: string | undefined,
+    onPermissionRequired?: PermissionEventSink,
+  ): Promise<Record<string, unknown>> {
     const rawRequestMetadata = asRecord(request.metadata) ?? {};
     const shouldForwardFrontendModel = this.options.forwardFrontendModel === true;
     const requestedModelRaw = typeof rawRequestMetadata.model === "string" ? rawRequestMetadata.model.trim() : "";
@@ -1596,12 +1727,28 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       input: Record<string, unknown>,
       sdkOptions: { signal: AbortSignal; title?: string; description?: string; displayName?: string; toolUseID: string; blockedPath?: string; decisionReason?: string },
     ): Promise<PermissionResult> => {
-      const { promise } = globalPermissionStore.create(sdkOptions.toolUseID, toolName, input, {
+      const { requestId, promise } = globalPermissionStore.create(sdkOptions.toolUseID, toolName, input, {
         title: sdkOptions.title,
         description: sdkOptions.description,
         displayName: sdkOptions.displayName,
         blockedPath: sdkOptions.blockedPath,
         decisionReason: sdkOptions.decisionReason,
+      });
+      onPermissionRequired?.({
+        type: "confirmation_required",
+        payload: {
+          requestId,
+          action: buildPermissionAction({
+            toolName,
+            title: sdkOptions.title,
+            description: sdkOptions.description,
+            displayName: sdkOptions.displayName,
+            blockedPath: sdkOptions.blockedPath,
+            decisionReason: sdkOptions.decisionReason,
+            toolInput: input,
+          }),
+          sessionId: providerSessionId,
+        },
       });
       return promise;
     };

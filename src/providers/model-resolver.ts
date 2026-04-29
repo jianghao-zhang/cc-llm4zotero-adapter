@@ -10,13 +10,29 @@ export interface ModelInfo {
   supportedEffortLevels?: string[];
 }
 
-export function normalizeProviderModelName(value: unknown): string {
+const CONTEXT_SUFFIX_RE = /\[[0-9]+[km]\]$/i;
+const CLAUDE_CONTEXT_ALIAS_RE = /^(opus|sonnet)\[[0-9]+[km]\]$/i;
+
+function cleanModelName(value: unknown): string {
   if (typeof value !== "string") return "";
   return value
     .replace(/\u001b\[[0-9;]*m/g, "")
-    .replace(/\[[0-9]+[km]\]$/i, "")
     .trim()
     .toLowerCase();
+}
+
+function isClaudeContextAlias(value: unknown): boolean {
+  return CLAUDE_CONTEXT_ALIAS_RE.test(cleanModelName(value));
+}
+
+function normalizeModelMatchKey(value: unknown): string {
+  return normalizeProviderModelName(value).replace(CONTEXT_SUFFIX_RE, "");
+}
+
+export function normalizeProviderModelName(value: unknown): string {
+  const clean = cleanModelName(value);
+  if (isClaudeContextAlias(clean)) return clean;
+  return clean.replace(CONTEXT_SUFFIX_RE, "").trim();
 }
 
 /**
@@ -74,6 +90,11 @@ export function resolveModelAlias(
   availableModels: ModelInfo[]
 ): string | undefined {
   const normalizedAlias = normalizeProviderModelName(alias);
+  const aliasMatchKey = normalizeModelMatchKey(alias);
+
+  if (isClaudeContextAlias(normalizedAlias)) {
+    return normalizedAlias;
+  }
 
   // If already a full model name (contains hyphen and is long), return as-is
   if (normalizedAlias.includes("-") && normalizedAlias.length > 8) {
@@ -81,12 +102,21 @@ export function resolveModelAlias(
   }
 
   // Extract model names from available models
-  const modelNames = availableModels
-    .map((m) => normalizeProviderModelName(m.value))
-    .filter(Boolean);
+  const modelEntries = availableModels
+    .map((m) => {
+      const model = normalizeProviderModelName(m.value);
+      return model ? { model, matchKey: normalizeModelMatchKey(m.value) } : undefined;
+    })
+    .filter((entry): entry is { model: string; matchKey: string } => Boolean(entry));
+  const modelNames = modelEntries.map((entry) => entry.model);
 
   if (modelNames.length === 0) {
     return undefined;
+  }
+
+  const exact = modelEntries.find((entry) => entry.model === normalizedAlias);
+  if (exact) {
+    return exact.model;
   }
 
   // Single model provider (e.g., Kimi with only k2p5): all aliases map to same model
@@ -101,28 +131,28 @@ export function resolveModelAlias(
     haiku: [/haiku/i, /flash/i, /mini/i, /fast/i],
   };
 
-  const aliasPatterns = patterns[normalizedAlias];
+  const aliasPatterns = patterns[aliasMatchKey];
   if (aliasPatterns) {
     for (const pattern of aliasPatterns) {
-      for (const name of modelNames) {
-        if (pattern.test(name)) {
-          return name;
+      for (const entry of modelEntries) {
+        if (pattern.test(entry.matchKey)) {
+          return entry.model;
         }
       }
     }
   }
 
   // Substring matching
-  for (const name of modelNames) {
-    if (name.includes(normalizedAlias)) {
-      return name;
+  for (const entry of modelEntries) {
+    if (entry.matchKey.includes(aliasMatchKey)) {
+      return entry.model;
     }
   }
 
   // Reverse: check if alias is substring of any model name
-  for (const name of modelNames) {
-    if (name.split(/[-_.]/).some((part) => part === normalizedAlias)) {
-      return name;
+  for (const entry of modelEntries) {
+    if (entry.matchKey.split(/[-_.]/).some((part) => part === aliasMatchKey)) {
+      return entry.model;
     }
   }
 
@@ -167,6 +197,10 @@ export function resolveModelWithCache(
   providerKey?: string,
 ): { model: string | undefined; cacheHit: boolean } {
   const normalizedAlias = normalizeProviderModelName(alias);
+
+  if (isClaudeContextAlias(normalizedAlias)) {
+    return { model: normalizedAlias, cacheHit: true };
+  }
 
   // If already full model name, no resolution needed
   if (normalizedAlias.includes("-") && normalizedAlias.length > 8) {

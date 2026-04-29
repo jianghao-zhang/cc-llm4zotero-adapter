@@ -523,6 +523,33 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
     expect(await sessionMapper.get("conv-session")).toBe("sess-live");
   });
 
+  it("passes Claude 1m context model aliases through to SDK", async () => {
+    const seenModels: Array<unknown> = [];
+
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      forwardFrontendModel: true,
+      queryImpl(args) {
+        const options = args.options as Record<string, unknown>;
+        seenModels.push(options.model);
+        return makeStream([
+          { type: "system", session_id: "sess-1m", subtype: "init" },
+          { type: "result", session_id: "sess-1m", result: "ok", is_error: false }
+        ]);
+      }
+    });
+
+    const stream = await runtime.startTurn({
+      conversationKey: "conv-1m-model",
+      userMessage: "hello",
+      metadata: { model: "sonnet[1m]" }
+    });
+    for await (const _event of stream.events) {
+      void _event;
+    }
+
+    expect(seenModels).toEqual(["sonnet[1m]"]);
+  });
+
   it("keeps hot runtime when resolved model changes after cache warmup", async () => {
     setCachedModels(["user", "project"], []);
     let queryCount = 0;

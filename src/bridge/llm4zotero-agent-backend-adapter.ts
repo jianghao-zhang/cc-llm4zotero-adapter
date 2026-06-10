@@ -412,6 +412,7 @@ export class Llm4ZoteroAgentBackendAdapter {
         providerSessionId: params.request.providerSessionId,
         allowedTools: params.request.allowedTools,
         runtimeRequest: params.request.runtimeRequest,
+        mcpServers: params.request.mcpServers,
         metadata: mergedMetadata,
         signal: params.signal
       },

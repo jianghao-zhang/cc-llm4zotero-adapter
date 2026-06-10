@@ -45,6 +45,8 @@ export type Llm4ZoteroAgentEvent =
   | { type: "fallback"; reason: string }
   | { type: "final"; text: string };
 
+export type Llm4ZoteroMcpServersConfig = Record<string, Record<string, unknown>>;
+
 export interface Llm4ZoteroRunTurnRequest {
   conversationKey: string | number;
   userText: string;
@@ -54,6 +56,7 @@ export interface Llm4ZoteroRunTurnRequest {
   scopeId?: string;
   scopeLabel?: string;
   runtimeRequest?: Record<string, unknown>;
+  mcpServers?: Llm4ZoteroMcpServersConfig;
   metadata?: Record<string, unknown>;
 }
 

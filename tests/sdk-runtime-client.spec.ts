@@ -83,16 +83,26 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
       }
     });
 
+    const mcpServers = {
+      llm_for_zotero: {
+        type: "http",
+        url: "http://127.0.0.1:23119/llm-for-zotero/mcp",
+        headers: { Authorization: "Bearer token-1" },
+      },
+    };
+
     const stream = await runtime.startTurn({
       conversationKey: "conv-1",
       userMessage: "hello",
       providerSessionId: "session-old",
-      allowedTools: ["Read", "Bash"]
+      allowedTools: ["Read", "Bash"],
+      mcpServers,
     });
 
     expect(seenPrompt).toBe("hello");
     expect(seenOptions.resume).toBe("session-old");
     expect(seenOptions.allowedTools).toEqual(["Read", "Bash"]);
+    expect(seenOptions.mcpServers).toEqual(mcpServers);
 
     const types: string[] = [];
     for await (const event of stream.events) {
@@ -109,6 +119,92 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
       "provider_event",
       "final"
     ]);
+  });
+
+  it("renders selected Zotero collection and tag scopes in the Claude prompt", async () => {
+    let seenPrompt = "";
+
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      queryImpl(args) {
+        seenPrompt = typeof args.prompt === "string" ? args.prompt : "";
+        return makeStream([
+          { type: "system", session_id: "session-scope", subtype: "init" },
+          {
+            type: "assistant",
+            session_id: "session-scope",
+            message: { content: [{ type: "text", text: "ok" }] },
+          },
+          { type: "result", session_id: "session-scope", result: "ok", is_error: false }
+        ]);
+      }
+    });
+
+    const stream = await runtime.startTurn({
+      conversationKey: "conv-scope",
+      userMessage: "can you find the commonality of the papers inside this folder?",
+      runtimeRequest: {
+        selectedCollectionContexts: [
+          {
+            collectionId: 42,
+            name: "Computational_Psychiatry",
+            libraryID: 1,
+          },
+        ],
+        selectedTagContexts: [
+          {
+            name: "Drift",
+            normalizedName: "drift",
+            libraryID: 1,
+          },
+        ],
+      },
+    });
+
+    for await (const _event of stream.events) {
+      // Drain the provider stream so the runtime reaches its final state.
+    }
+
+    expect(seenPrompt).toContain("Selected Zotero collection scope for this turn:");
+    expect(seenPrompt).toContain("Computational_Psychiatry");
+    expect(seenPrompt).toContain("collectionId=42");
+    expect(seenPrompt).toContain("libraryID=1");
+    expect(seenPrompt).toContain("\"this folder\"");
+    expect(seenPrompt).toContain("library_search");
+    expect(seenPrompt).toContain("library_retrieve");
+    expect(seenPrompt).toContain("Selected Zotero tag scope for this turn:");
+    expect(seenPrompt).toContain("Drift");
+    expect(seenPrompt).toContain("normalizedName=drift");
+  });
+
+  it("does not request live context usage after normal final results", async () => {
+    let contextUsageCalls = 0;
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      queryImpl() {
+        return {
+          async *[Symbol.asyncIterator]() {
+            yield { type: "system", session_id: "session-final", subtype: "init" };
+            yield { type: "result", session_id: "session-final", result: "done", is_error: false };
+          },
+          async getContextUsage() {
+            contextUsageCalls += 1;
+            throw new Error("getContextUsage should not be called after final");
+          },
+          close() {},
+        } as any;
+      },
+    });
+
+    const stream = await runtime.startTurn({
+      conversationKey: "conv-final-context",
+      userMessage: "hello",
+    });
+    const types: string[] = [];
+    for await (const event of stream.events) {
+      types.push(event.type);
+    }
+
+    expect(types).toContain("final");
+    expect(contextUsageCalls).toBe(0);
   });
 
   it("emits SDK canUseTool permission requests on cold streams before resolution", async () => {
@@ -658,6 +754,71 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
 
     expect(queryCount).toBe(2);
     expect(seenResumes).toEqual([undefined, "sess-hot-rebuild"]);
+  });
+
+  it("rebuilds retained hot runtime when MCP server config changes", async () => {
+    let queryCount = 0;
+    const seenResumes: Array<unknown> = [];
+    const seenMcpServers: Array<unknown> = [];
+    let turnIndex = 0;
+    const makeMcpServers = (token: string) => ({
+      llm_for_zotero: {
+        type: "http",
+        url: "http://127.0.0.1:23119/llm-for-zotero/mcp",
+        headers: {
+          Authorization: "Bearer static-token",
+          "X-LLM-For-Zotero-Scope": token,
+        },
+      },
+    });
+
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      queryImpl(args) {
+        const options = args.options as Record<string, unknown>;
+        const prompt = args.prompt;
+        if (typeof prompt !== "string") {
+          queryCount += 1;
+          seenResumes.push(options.resume);
+          seenMcpServers.push(options.mcpServers);
+        }
+        return {
+          async *[Symbol.asyncIterator]() {
+            for await (const _message of prompt as AsyncIterable<unknown>) {
+              turnIndex += 1;
+              yield { type: "system", session_id: "sess-hot-mcp", subtype: "init" };
+              yield { type: "result", session_id: "sess-hot-mcp", result: `ok-${turnIndex}`, is_error: false };
+            }
+          },
+          close() {},
+        } as any;
+      }
+    });
+
+    await runtime.retainHotRuntime({ conversationKey: "conv-hot-mcp", userMessage: "" }, "mount-1");
+    const first = await runtime.startTurn({
+      conversationKey: "conv-hot-mcp",
+      userMessage: "hello",
+      mcpServers: makeMcpServers("scope-token-1"),
+    });
+    for await (const _event of first.events) {
+      void _event;
+    }
+
+    const second = await runtime.startTurn({
+      conversationKey: "conv-hot-mcp",
+      userMessage: "again",
+      mcpServers: makeMcpServers("scope-token-2"),
+    });
+    for await (const _event of second.events) {
+      void _event;
+    }
+
+    expect(queryCount).toBe(2);
+    expect(seenResumes).toEqual([undefined, "sess-hot-mcp"]);
+    expect(seenMcpServers).toEqual([
+      makeMcpServers("scope-token-1"),
+      makeMcpServers("scope-token-2"),
+    ]);
   });
 
   it("retries retained hot runtime with high when unknown xhigh effort fails before init", async () => {

@@ -216,6 +216,7 @@ export class ClaudeCodeRuntimeAdapter {
       providerSessionId,
       allowedTools: request.allowedTools,
       runtimeRequest: request.runtimeRequest,
+      mcpServers: request.mcpServers,
       metadata: request.metadata,
     });
     return {
@@ -330,6 +331,7 @@ export class ClaudeCodeRuntimeAdapter {
       providerSessionId,
       allowedTools: request.allowedTools,
       runtimeRequest: request.runtimeRequest,
+      mcpServers: request.mcpServers,
       metadata: request.metadata,
       signal,
     });

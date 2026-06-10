@@ -176,6 +176,8 @@ type RuntimeRequestShape = {
   paperContexts?: unknown;
   fullTextPaperContexts?: unknown;
   pinnedPaperContexts?: unknown;
+  selectedCollectionContexts?: unknown;
+  selectedTagContexts?: unknown;
   attachments?: unknown;
   screenshots?: unknown;
   history?: unknown;
@@ -201,6 +203,7 @@ const DEFAULT_BLOCKED_METADATA_KEYS = new Set<string>([
   "runtimeRequest",
   "runtimeCwdRelative",
   "model",
+  "mcpServers",
   "effort",
 ]);
 const IMAGE_MIME_BY_KIND: Record<string, "image/jpeg" | "image/png" | "image/gif" | "image/webp"> = {
@@ -232,6 +235,18 @@ function trimInline(value: unknown, max = 280): string {
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   return value as Record<string, unknown>;
+}
+function normalizeMcpServers(value: unknown): Record<string, Record<string, unknown>> | undefined {
+  const record = asRecord(value);
+  if (!record) return undefined;
+  const servers: Record<string, Record<string, unknown>> = {};
+  for (const [name, config] of Object.entries(record)) {
+    const normalizedName = name.trim();
+    const configRecord = asRecord(config);
+    if (!normalizedName || !configRecord) continue;
+    servers[normalizedName] = configRecord;
+  }
+  return Object.keys(servers).length > 0 ? servers : undefined;
 }
 function redactMcpConfig(value: unknown): Record<string, unknown> | undefined {
   const record = asRecord(value);
@@ -333,11 +348,29 @@ type RuntimePaperPathEntry = {
   contextFilePath?: string;
   mineruFullMdPath?: string;
 };
+type RuntimeCollectionScopeEntry = {
+  name: string;
+  collectionId?: number;
+  libraryID?: number;
+  path?: string;
+};
+type RuntimeTagScopeEntry = {
+  name: string;
+  libraryID?: number;
+  normalizedName?: string;
+  scope?: "allTagged" | "untagged";
+  includeAutomatic?: boolean;
+};
 function asPath(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const normalized = value.trim();
   if (!normalized || !normalized.startsWith("/")) return undefined;
   return normalized;
+}
+function asPositiveInt(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? Math.floor(value)
+    : undefined;
 }
 function collectPaperPathEntries(entries: unknown, limit: number): RuntimePaperPathEntry[] {
   if (!Array.isArray(entries) || limit <= 0) return [];
@@ -358,6 +391,60 @@ function collectPaperPathEntries(entries: unknown, limit: number): RuntimePaperP
   }
   return collected;
 }
+function collectCollectionScopeEntries(entries: unknown, limit: number): RuntimeCollectionScopeEntry[] {
+  if (!Array.isArray(entries) || limit <= 0) return [];
+  const collected: RuntimeCollectionScopeEntry[] = [];
+  for (const raw of entries) {
+    if (collected.length >= limit) break;
+    const record = asRecord(raw);
+    if (!record) continue;
+    const collectionId = asPositiveInt(record.collectionId ?? record.id);
+    const libraryID = asPositiveInt(record.libraryID);
+    const name =
+      trimInline(record.name, 140) ||
+      (collectionId ? `Collection ${collectionId}` : "");
+    if (!name && !collectionId) continue;
+    const path = trimInline(record.path, 180);
+    collected.push({
+      name: name || "Selected collection",
+      collectionId,
+      libraryID,
+      path: path || undefined,
+    });
+  }
+  return collected;
+}
+function collectTagScopeEntries(entries: unknown, limit: number): RuntimeTagScopeEntry[] {
+  if (!Array.isArray(entries) || limit <= 0) return [];
+  const collected: RuntimeTagScopeEntry[] = [];
+  const seen = new Set<string>();
+  for (const raw of entries) {
+    if (collected.length >= limit) break;
+    const record = asRecord(raw);
+    if (!record) continue;
+    const scope =
+      record.scope === "allTagged" || record.scope === "untagged"
+        ? record.scope
+        : undefined;
+    const name =
+      trimInline(record.name, 140) ||
+      (scope === "allTagged" ? "All Tagged" : scope === "untagged" ? "Untagged" : "");
+    if (!name) continue;
+    const normalizedName = trimInline(record.normalizedName, 140) || undefined;
+    const libraryID = asPositiveInt(record.libraryID);
+    const key = `${libraryID || "any"}:${scope || "tag"}:${(normalizedName || name).toLowerCase()}:${record.includeAutomatic === true ? "auto" : "manual"}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    collected.push({
+      name,
+      libraryID,
+      normalizedName,
+      scope,
+      includeAutomatic: record.includeAutomatic === true || undefined,
+    });
+  }
+  return collected;
+}
 function formatPaperPathLines(entries: RuntimePaperPathEntry[]): string[] {
   return entries.map((entry) => {
     const pathHints = [
@@ -365,6 +452,27 @@ function formatPaperPathLines(entries: RuntimePaperPathEntry[]): string[] {
       typeof entry.contextItemId === "number" ? `contextItemId=${entry.contextItemId}` : "",
     ].filter(Boolean);
     return `- ${entry.title}${pathHints.length ? ` [${pathHints.join(" | ")}]` : ""}`;
+  });
+}
+function formatCollectionScopeLines(entries: RuntimeCollectionScopeEntry[]): string[] {
+  return entries.map((entry) => {
+    const hints = [
+      typeof entry.collectionId === "number" ? `collectionId=${entry.collectionId}` : "",
+      typeof entry.libraryID === "number" ? `libraryID=${entry.libraryID}` : "",
+      entry.path ? `path=${entry.path}` : "",
+    ].filter(Boolean);
+    return `- ${entry.name}${hints.length ? ` [${hints.join(" | ")}]` : ""}`;
+  });
+}
+function formatTagScopeLines(entries: RuntimeTagScopeEntry[]): string[] {
+  return entries.map((entry) => {
+    const hints = [
+      typeof entry.libraryID === "number" ? `libraryID=${entry.libraryID}` : "",
+      entry.normalizedName ? `normalizedName=${entry.normalizedName}` : "",
+      entry.scope ? `scope=${entry.scope}` : "",
+      entry.includeAutomatic ? "includeAutomatic=true" : "",
+    ].filter(Boolean);
+    return `- ${entry.name}${hints.length ? ` [${hints.join(" | ")}]` : ""}`;
   });
 }
 function formatFallbackHistory(runtimeRequest: RuntimeRequestShape | undefined): string[] {
@@ -406,6 +514,26 @@ function buildPromptText(
     : [];
   if (selectedTexts.length) {
     lines.push("Selected snippets:", ...selectedTexts.map((text, index) => `${index + 1}. ${text}`));
+  }
+  const selectedCollections = collectCollectionScopeEntries(runtimeRequest.selectedCollectionContexts, 8);
+  const selectedTags = collectTagScopeEntries(runtimeRequest.selectedTagContexts, 8);
+  if (selectedCollections.length) {
+    lines.push(
+      "Selected Zotero collection scope for this turn:",
+      ...formatCollectionScopeLines(selectedCollections),
+      selectedCollections.length === 1
+        ? "When the user says \"this folder\", \"this collection\", or asks what is inside it, treat that phrase as the selected collection above. Prefer scoped Zotero library_search or library_retrieve calls instead of asking which folder."
+        : "When the user refers to selected folders or collections, use the selected collection scopes above. Ask a clarification only if the requested collection is ambiguous among them.",
+    );
+  }
+  if (selectedTags.length) {
+    lines.push(
+      "Selected Zotero tag scope for this turn:",
+      ...formatTagScopeLines(selectedTags),
+      selectedTags.length === 1
+        ? "When the user says \"this tag\" or asks about tagged papers, treat that phrase as the selected tag above. Prefer scoped Zotero library_search or library_retrieve calls instead of asking which tag."
+        : "When the user refers to selected tags, use the selected tag scopes above. Ask a clarification only if the requested tag is ambiguous among them.",
+    );
   }
   const selectedPaperPathEntries = collectPaperPathEntries(runtimeRequest.selectedPaperContexts ?? runtimeRequest.paperContexts, 8);
   const fullTextPaperPathEntries = collectPaperPathEntries(runtimeRequest.fullTextPaperContexts, 6);
@@ -631,6 +759,7 @@ function buildHotRuntimeSignature(
       typeof queryOptions.appendSystemPrompt === "string" && queryOptions.appendSystemPrompt.trim()
         ? queryOptions.appendSystemPrompt
         : null,
+    mcpServers: normalizeMcpServers(queryOptions.mcpServers) ?? null,
     allowedTools: toStableStringList(queryOptions.allowedTools, true),
     configSourceMode:
       typeof metadata.claudeConfigSource === "string" && metadata.claudeConfigSource.trim()
@@ -1516,7 +1645,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
                     liveEntry.lastUsageSnapshot = merged;
                   }
                 }
-                if (event.type === "context_compacted" || event.type === "final") {
+                if (event.type === "context_compacted") {
                   const liveSnapshot = await getLiveContextUsageSnapshot(sdkStream);
                   if (liveSnapshot) {
                     const merged = mergeUsageSnapshot(request.conversationKey, liveSnapshot);
@@ -1779,6 +1908,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     const customInstruction = parseCustomInstruction(metadata);
     const effectiveCwd = this.resolveScopedCwd(request.metadata);
     const effectiveSettingSources = settingSourcesOverride ?? this.options.settingSources ?? ["user", "project", "local"];
+    const mcpServers = normalizeMcpServers(request.mcpServers ?? rawRequestMetadata.mcpServers);
     const providerKey =
       (await buildSettingsStackIdentity(
         effectiveSettingSources,
@@ -1879,6 +2009,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
         cwd: effectiveCwd,
         additionalDirectories: this.options.additionalDirectories,
         allowedTools: mergeAllowedTools(request.allowedTools, this.options.defaultAllowedTools),
+        mcpServers,
         settingSources: effectiveSettingSources,
         permissionMode: effectivePermissionMode,
         includePartialMessages: this.options.includePartialMessages,

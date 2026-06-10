@@ -1,4 +1,4 @@
-import type { JsonObject } from "./types.js";
+import type { JsonObject, McpServersConfig } from "./types.js";
 
 export type ProviderEventType =
   | "provider_event"
@@ -27,6 +27,7 @@ export interface RuntimeTurnRequest {
   providerSessionId?: string;
   allowedTools?: string[];
   runtimeRequest?: JsonObject;
+  mcpServers?: McpServersConfig;
   metadata?: JsonObject;
   signal?: AbortSignal;
 }

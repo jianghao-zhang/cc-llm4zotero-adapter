@@ -104,9 +104,21 @@ describe("http bridge server", () => {
 
   it("streams a single start line with the runtime runId", async () => {
     const seenResumes: Array<string | undefined> = [];
+    const seenMcpServers: Array<unknown> = [];
+    const seenAllowedTools: Array<unknown> = [];
+    const mcpServers = {
+      llm_for_zotero: {
+        type: "http",
+        url: "http://127.0.0.1:23119/llm-for-zotero/mcp",
+        headers: { Authorization: "Bearer token-1" },
+      },
+    };
+    const allowedTools = ["mcp__llm_for_zotero__library_search"];
     const runtimeClient: ClaudeCodeRuntimeClient = {
       async startTurn(request) {
         seenResumes.push(request.providerSessionId);
+        seenMcpServers.push(request.mcpServers);
+        seenAllowedTools.push(request.allowedTools);
         return {
           runId: "run-http-1",
           providerSessionId: request.providerSessionId,
@@ -133,12 +145,16 @@ describe("http bridge server", () => {
           conversationKey: "conv-1",
           userText: "hello",
           providerSessionId: "sess-http-resume",
+          allowedTools,
+          mcpServers,
         })
       });
 
       expect(response.ok).toBe(true);
       const lines = await readNdjsonLines(response);
       expect(seenResumes).toEqual(["sess-http-resume"]);
+      expect(seenMcpServers).toEqual([mcpServers]);
+      expect(seenAllowedTools).toEqual([allowedTools]);
       const starts = lines.filter((line) => line.type === "start");
       expect(starts).toEqual([{ type: "start", runId: "run-http-1" }]);
       expect(lines.at(-1)).toEqual({

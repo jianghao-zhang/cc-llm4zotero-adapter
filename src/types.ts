@@ -15,6 +15,8 @@ export type AgentEventType =
   | "fallback";
 
 export type JsonObject = Record<string, unknown>;
+export type McpServerConfigValue = Record<string, unknown>;
+export type McpServersConfig = Record<string, McpServerConfigValue>;
 
 export interface AgentEvent<TPayload = JsonObject> {
   type: AgentEventType;
@@ -28,6 +30,7 @@ export interface RunTurnRequest {
   providerSessionId?: string;
   allowedTools?: string[];
   runtimeRequest?: JsonObject;
+  mcpServers?: McpServersConfig;
   metadata?: JsonObject;
   signal?: AbortSignal;
 }

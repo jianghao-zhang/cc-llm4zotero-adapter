@@ -80,6 +80,24 @@ function parseSettingSources(
   return accepted.length > 0 ? accepted : undefined;
 }
 
+function parseMcpServers(
+  value: unknown,
+): Record<string, Record<string, unknown>> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const servers: Record<string, Record<string, unknown>> = {};
+  for (const [name, config] of Object.entries(value as Record<string, unknown>)) {
+    const normalizedName = name.trim();
+    if (
+      !normalizedName ||
+      !config ||
+      typeof config !== "object" ||
+      Array.isArray(config)
+    ) continue;
+    servers[normalizedName] = config as Record<string, unknown>;
+  }
+  return Object.keys(servers).length > 0 ? servers : undefined;
+}
+
 function sendJson(res: ServerResponse, statusCode: number, body: unknown): void {
   res.statusCode = statusCode;
   res.setHeader("Content-Type", "application/json; charset=utf-8");
@@ -145,6 +163,7 @@ function toRequestPayload(body: unknown): Llm4ZoteroRunTurnRequest {
       record.runtimeRequest && typeof record.runtimeRequest === "object"
         ? (record.runtimeRequest as Record<string, unknown>)
         : undefined,
+    mcpServers: parseMcpServers(record.mcpServers),
     metadata:
       record.metadata && typeof record.metadata === "object"
         ? (record.metadata as Record<string, unknown>)

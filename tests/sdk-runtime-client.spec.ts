@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { ClaudeCodeRuntimeAdapter } from "../src/bridge/claude-code-runtime-adapter.js";
 import { ClaudeAgentSdkRuntimeClient } from "../src/providers/claude-agent-sdk-runtime-client.js";
 import { setCachedModels } from "../src/providers/model-resolver.js";
@@ -36,6 +39,22 @@ function makeModelProbe(models: unknown[] = []): any {
   };
 }
 
+const temporaryDirectories = new Set<string>();
+
+async function createPdfFile(name = "paper.pdf", contents = "%PDF-1.4\n% test\n"): Promise<string> {
+  const directory = await mkdtemp(join(tmpdir(), "cc-l4z-pdf-"));
+  temporaryDirectories.add(directory);
+  const path = join(directory, name);
+  await writeFile(path, contents);
+  return path;
+}
+
+function stringifyJson(value: unknown): string {
+  return JSON.stringify(value)
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029");
+}
+
 async function nextEvent(
   iterator: AsyncIterator<any>,
   timeoutMs = 1_000,
@@ -52,7 +71,7 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
   const originalHome = process.env.HOME;
   const originalUserProfile = process.env.USERPROFILE;
 
-  afterEach(() => {
+  afterEach(async () => {
     if (originalHome === undefined) {
       delete process.env.HOME;
     } else {
@@ -64,6 +83,10 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
       process.env.USERPROFILE = originalUserProfile;
     }
     globalPermissionStore.cleanup();
+    await Promise.all(
+      Array.from(temporaryDirectories, (directory) => rm(directory, { recursive: true, force: true })),
+    );
+    temporaryDirectories.clear();
   });
 
   it("passes resume/allowedTools into query options and maps messages", async () => {
@@ -175,6 +198,192 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
     expect(seenPrompt).toContain("Drift");
     expect(seenPrompt).toContain("normalizedName=drift");
   });
+
+  it("passes exact current-turn PDF paths and parent directories to Claude", async () => {
+    const firstPdf = await createPdfFile("paper a.pdf");
+    const secondPdf = await createPdfFile("paper\nβ\u2028.pdf");
+    let seenPrompt = "";
+    let seenOptions: Record<string, unknown> = {};
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      additionalDirectories: ["/legacy-root"],
+      queryImpl(args) {
+        seenPrompt = typeof args.prompt === "string" ? args.prompt : "";
+        seenOptions = args.options;
+        return makeStream([
+          { type: "system", session_id: "session-pdf", subtype: "init" },
+          { type: "result", session_id: "session-pdf", result: "ok", is_error: false },
+        ]);
+      },
+    });
+
+    const stream = await runtime.startTurn({
+      conversationKey: "conv-pdf",
+      userMessage: "compare them",
+      runtimeRequest: {
+        selectedPaperContexts: [{
+          itemId: 10,
+          contextItemId: 20,
+          title: "Legacy duplicate",
+          contentSourceMode: "pdf",
+        }],
+        localDocuments: [
+          {
+            kind: "local_pdf",
+            sourceKey: "zotero-pdf:10:20",
+            itemId: 10,
+            contextItemId: 20,
+            title: "Paper A",
+            name: "paper a.pdf",
+            mimeType: "application/pdf",
+            absolutePath: firstPdf,
+          },
+          {
+            kind: "local_pdf",
+            sourceKey: "zotero-pdf:11:21",
+            itemId: 11,
+            contextItemId: 21,
+            title: "Paper B",
+            name: "paper β.pdf",
+            mimeType: "application/pdf",
+            absolutePath: secondPdf,
+          },
+        ],
+      },
+    });
+    for await (const _event of stream.events) {
+      // Drain.
+    }
+
+    expect(seenPrompt).toContain("zotero-pdf:10:20");
+    expect(seenPrompt).toContain(`"absolutePath":${stringifyJson(firstPdf)}`);
+    expect(seenPrompt).toContain("zotero-pdf:11:21");
+    expect(seenPrompt).toContain(`"absolutePath":${stringifyJson(secondPdf)}`);
+    expect(seenPrompt).not.toContain(`"absolutePath":"${secondPdf}"`);
+    expect(seenPrompt).toContain("\\u2028");
+    expect(seenPrompt).toContain("Do not substitute sibling attachments");
+    expect(seenPrompt.trim()).toMatch(
+      /Raw PDF transport policy[\s\S]*instead of falling back\.$/,
+    );
+    expect(seenOptions.additionalDirectories).toEqual([
+      dirname(firstPdf),
+      dirname(secondPdf),
+    ]);
+    expect(seenOptions.allowedTools).toContain("Read");
+    expect(seenOptions.persistSession).toBe(false);
+    expect(seenOptions.resume).toBeUndefined();
+    expect(seenOptions.continue).toBe(false);
+    expect(stream.providerSessionId).toBeUndefined();
+  });
+
+  it("keeps an explicitly invoked skill on a PDF turn", async () => {
+    const pdfPath = await createPdfFile();
+    let seenPrompt = "";
+    let seenOptions: Record<string, unknown> = {};
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      queryImpl(args) {
+        seenPrompt = typeof args.prompt === "string" ? args.prompt : "";
+        seenOptions = args.options;
+        return makeStream([
+          { type: "result", session_id: "session-skill", result: "ok", is_error: false },
+        ]);
+      },
+    });
+
+    const stream = await runtime.startTurn({
+      conversationKey: "conv-pdf-skill",
+      userMessage: "/my-pdf-skill answer with my format",
+      allowedTools: ["Skill"],
+      runtimeRequest: {
+        localDocuments: [{
+          kind: "local_pdf",
+          sourceKey: "zotero-pdf:10:20",
+          itemId: 10,
+          contextItemId: 20,
+          title: "Paper",
+          name: "paper.pdf",
+          mimeType: "application/pdf",
+          absolutePath: pdfPath,
+        }],
+      },
+    });
+    for await (const _event of stream.events) void _event;
+
+    expect(seenPrompt).toContain("/my-pdf-skill answer with my format");
+    expect(seenPrompt).toContain(pdfPath);
+    expect(seenOptions.allowedTools).toEqual(["Read", "Skill"]);
+    expect(seenOptions.settingSources).toEqual(["user", "project", "local"]);
+  });
+
+  it("rejects the whole malformed local PDF batch before SDK query", async () => {
+    let queryCalls = 0;
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      queryImpl() {
+        queryCalls += 1;
+        return makeStream([]);
+      },
+    });
+
+    await expect(runtime.startTurn({
+      conversationKey: "conv-invalid-pdf",
+      userMessage: "read it",
+      runtimeRequest: {
+        localDocuments: [{
+          kind: "local_pdf",
+          sourceKey: "zotero-pdf:10:999",
+          itemId: 10,
+          contextItemId: 20,
+          title: "Wrong identity",
+          name: "paper.pdf",
+          mimeType: "application/pdf",
+          absolutePath: "/papers/paper.pdf",
+        }],
+      },
+    })).rejects.toThrow("Invalid local PDF resource batch");
+    expect(queryCalls).toBe(0);
+  });
+
+  it("rejects an invalid file atomically before SDK query", async () => {
+    const validPdf = await createPdfFile("valid.pdf");
+    const invalidPdf = await createPdfFile("invalid.pdf", "not a PDF");
+    let queryCalls = 0;
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      queryImpl() {
+        queryCalls += 1;
+        return makeStream([]);
+      },
+    });
+
+    await expect(runtime.startTurn({
+      conversationKey: "conv-invalid-file",
+      userMessage: "compare",
+      runtimeRequest: {
+        localDocuments: [
+          {
+            kind: "local_pdf",
+            sourceKey: "zotero-pdf:10:20",
+            itemId: 10,
+            contextItemId: 20,
+            title: "Valid",
+            name: "valid.pdf",
+            mimeType: "application/pdf",
+            absolutePath: validPdf,
+          },
+          {
+            kind: "local_pdf",
+            sourceKey: "zotero-pdf:11:21",
+            itemId: 11,
+            contextItemId: 21,
+            title: "Invalid",
+            name: "invalid.pdf",
+            mimeType: "application/pdf",
+            absolutePath: invalidPdf,
+          },
+        ],
+      },
+    })).rejects.toThrow("zotero-pdf:11:21");
+    expect(queryCalls).toBe(0);
+  });
+
 
   it("does not request live context usage after normal final results", async () => {
     let contextUsageCalls = 0;
@@ -755,6 +964,73 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
     expect(queryCount).toBe(2);
     expect(seenResumes).toEqual([undefined, "sess-hot-rebuild"]);
   });
+
+  it("uses a fresh ephemeral query for every PDF turn", async () => {
+    const firstPdf = await createPdfFile("paper.pdf");
+    const secondPdf = await createPdfFile("paper.pdf");
+    let queryCount = 0;
+    const seenDirectories: unknown[] = [];
+    const seenPrompts: string[] = [];
+    const seenPersistence: unknown[] = [];
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      queryImpl(args) {
+        queryCount += 1;
+        seenDirectories.push(args.options.additionalDirectories);
+        seenPrompts.push(typeof args.prompt === "string" ? args.prompt : "[stream]");
+        seenPersistence.push(args.options.persistSession);
+        return makeStream([
+          { type: "system", session_id: `sess-${queryCount}`, subtype: "init" },
+          { type: "result", session_id: `sess-${queryCount}`, result: "ok", is_error: false },
+        ]);
+      },
+    });
+    const document = (itemId: number, contextItemId: number, absolutePath: string) => ({
+      kind: "local_pdf",
+      sourceKey: `zotero-pdf:${itemId}:${contextItemId}`,
+      itemId,
+      contextItemId,
+      title: "Paper",
+      name: "paper.pdf",
+      mimeType: "application/pdf",
+      absolutePath,
+    });
+
+    await runtime.retainHotRuntime({ conversationKey: "conv-hot-pdf", userMessage: "" }, "mount-1");
+    const first = await runtime.startTurn({
+      conversationKey: "conv-hot-pdf",
+      userMessage: "read A",
+      runtimeRequest: { localDocuments: [document(10, 20, firstPdf)] },
+    });
+    for await (const _event of first.events) void _event;
+
+    const second = await runtime.startTurn({
+      conversationKey: "conv-hot-pdf",
+      userMessage: "read B",
+      runtimeRequest: { localDocuments: [document(11, 21, secondPdf)] },
+    });
+    for await (const _event of second.events) void _event;
+
+    const third = await runtime.startTurn({
+      conversationKey: "conv-hot-pdf",
+      userMessage: "continue without a PDF",
+    });
+    for await (const _event of third.events) void _event;
+
+    expect(queryCount).toBe(3);
+    expect(seenDirectories).toEqual([
+      [dirname(firstPdf)],
+      [dirname(secondPdf)],
+      undefined,
+    ]);
+    expect(seenPrompts[0]).toContain(firstPdf);
+    expect(seenPrompts[0]).not.toContain(secondPdf);
+    expect(seenPrompts[1]).toContain(secondPdf);
+    expect(seenPrompts[1]).not.toContain(firstPdf);
+    expect(seenPrompts[2]).not.toContain(firstPdf);
+    expect(seenPrompts[2]).not.toContain(secondPdf);
+    expect(seenPersistence).toEqual([false, false, undefined]);
+  });
+
 
   it("rebuilds retained hot runtime when MCP server config changes", async () => {
     let queryCount = 0;

@@ -7,6 +7,12 @@ import type { ClaudeCodeRuntimeClient, McpServerStatus, ProviderEvent, RuntimeTu
 import { mapSdkMessageToProviderEvents } from "../event-mapper/map-sdk-message.js";
 import { globalPermissionStore } from "../permissions/permission-store.js";
 import type { PermissionResult } from "../permissions/permission-store.js";
+import {
+  collectLocalPdfs,
+  localPdfDirectories,
+  renderLocalPdfPrompt,
+  validateLocalPdfs,
+} from "../local-pdf.js";
 import { getCachedModels, normalizeProviderModelName, resolveModelAlias, resolveModelWithCache, setCachedModels } from "./model-resolver.js";
 import { createHotRuntimeTurn, HotRuntimePool, type HotRuntimeEntry, type HotRuntimeTurn } from "./hotRuntimePool.js";
 
@@ -182,6 +188,7 @@ type RuntimeRequestShape = {
   screenshots?: unknown;
   history?: unknown;
   activeNoteContext?: unknown;
+  localDocuments?: unknown;
 };
 
 type CompactTurnOptions = {
@@ -502,8 +509,9 @@ function buildPromptText(
   metadata?: Record<string, unknown>,
 ): string {
   const trimmedUserMessage = userMessage.trim();
+  const localPdfs = collectLocalPdfs(runtimeRequest);
   if (/^\/compact(?:\s|$)/i.test(trimmedUserMessage)) return "/compact";
-  if (trimmedUserMessage.startsWith("/")) return trimmedUserMessage;
+  if (trimmedUserMessage.startsWith("/") && !localPdfs.length) return trimmedUserMessage;
   const lines: string[] = [trimmedUserMessage];
   if (!runtimeRequest) return lines.join("\n\n");
   if (metadata?.claudeResumeFallbackHistory === true) {
@@ -559,6 +567,7 @@ function buildPromptText(
       lines.push("Active note context:", noteTitle ? `- Title: ${noteTitle}` : "- Title: (untitled)", noteText ? `- Content:\n${noteText}` : "");
     }
   }
+  if (localPdfs.length) lines.push(renderLocalPdfPrompt(localPdfs));
   return lines.filter(Boolean).join("\n\n");
 }
 async function buildPromptInput(request: RuntimeTurnRequest, metadata: Record<string, unknown>): Promise<string | AsyncIterable<SDKUserMessage>> {
@@ -750,6 +759,7 @@ function buildHotRuntimeSignature(
     model: requestedModel,
     effort: requestedEffort,
     cwd: typeof queryOptions.cwd === "string" && queryOptions.cwd.trim() ? queryOptions.cwd : null,
+    additionalDirectories: toStableStringList(queryOptions.additionalDirectories, true),
     settingSources: toStableStringList(queryOptions.settingSources),
     permissionMode:
       typeof queryOptions.permissionMode === "string" && queryOptions.permissionMode.trim()
@@ -955,6 +965,11 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
 
   async startTurn(request: RuntimeTurnRequest): Promise<RuntimeTurnStream> {
     const metadata = parseMetadata(request.metadata, this.options);
+    const localPdfs = collectLocalPdfs(toRuntimeRequest(request, metadata));
+    if (localPdfs.length && /^\/compact(?:\s|$)/i.test(request.userMessage.trim())) {
+      throw new Error("Cannot compact a raw PDF turn. Send the PDF request as a normal message.");
+    }
+    await validateLocalPdfs(localPdfs);
     const probeId = typeof metadata.retentionProbeId === "string" ? metadata.retentionProbeId : undefined;
     const hotEntry = this.hotRuntimePool.get(request.conversationKey);
     const forceFreshSession = metadata.forceFreshSession === true;
@@ -984,12 +999,25 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
           probeId,
         };
     const autoCompactNeeded =
+      localPdfs.length === 0 &&
       !/^\/compact(?:\s|$)/i.test(request.userMessage.trim()) &&
       shouldAutoCompact(
         metadata,
         this.usageSnapshots.get(request.conversationKey) ?? hotEntry?.lastUsageSnapshot,
       );
     const createProfilingEvent = this.createProfilingEvent.bind(this);
+    if (localPdfs.length) {
+      await this.invalidateHotRuntime(request.conversationKey);
+      const stream = await this.startColdTurn({
+        ...request,
+        providerSessionId: undefined,
+      }, { metadata, autoCompactNeeded: false });
+      async function* withProfiling() {
+        yield createProfilingEvent(request.conversationKey, "runtime.start_turn.local_pdf_ephemeral", hotEntrySnapshot);
+        for await (const event of stream.events) yield event;
+      }
+      return { ...stream, providerSessionId: undefined, events: withProfiling() };
+    }
     if (forceFreshSession) {
       await this.invalidateHotRuntime(request.conversationKey);
       const stream = await this.startColdTurn({
@@ -1907,6 +1935,19 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     const permissionModeOverride = parsePermissionModeOverride(metadata);
     const customInstruction = parseCustomInstruction(metadata);
     const effectiveCwd = this.resolveScopedCwd(request.metadata);
+    const runtimeRequest = toRuntimeRequest(request, metadata);
+    const localPdfs = collectLocalPdfs(runtimeRequest);
+    const localDocumentDirectories = localPdfDirectories(localPdfs);
+    const configuredAdditionalDirectories = (this.options.additionalDirectories || [])
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+    const additionalDirectories = Array.from(
+      new Set(
+        localDocumentDirectories.length
+          ? localDocumentDirectories.filter(Boolean)
+          : configuredAdditionalDirectories,
+      ),
+    );
     const effectiveSettingSources = settingSourcesOverride ?? this.options.settingSources ?? ["user", "project", "local"];
     const mcpServers = normalizeMcpServers(request.mcpServers ?? rawRequestMetadata.mcpServers);
     const providerKey =
@@ -2007,20 +2048,28 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
         effortFallbackNotice,
         effort: resolvedEffort,
         cwd: effectiveCwd,
-        additionalDirectories: this.options.additionalDirectories,
-        allowedTools: mergeAllowedTools(request.allowedTools, this.options.defaultAllowedTools),
+        additionalDirectories: additionalDirectories.length
+          ? additionalDirectories
+          : undefined,
+        allowedTools: mergeAllowedTools(
+          request.allowedTools,
+          localPdfs.length
+            ? [...(this.options.defaultAllowedTools ?? []), "Read"]
+            : this.options.defaultAllowedTools,
+        ),
         mcpServers,
         settingSources: effectiveSettingSources,
         permissionMode: effectivePermissionMode,
         includePartialMessages: this.options.includePartialMessages,
         maxTurns: this.options.maxTurns,
-        continue: this.options.continue,
+        continue: localPdfs.length ? false : this.options.continue,
+        persistSession: localPdfs.length ? false : undefined,
         appendSystemPrompt: [
           this.options.appendSystemPrompt,
           customInstruction,
           this.options.appendSystemPrompt || customInstruction ? undefined : this.buildConfigSourcePrompt(effectiveSettingSources, effectiveCwd, metadata),
         ].filter((entry): entry is string => Boolean(entry && entry.trim())).join("\n\n") || undefined,
-        resume: providerSessionId,
+        resume: localPdfs.length ? undefined : providerSessionId,
         abortController: request.signal ? this.createAbortController(request.signal) : undefined,
         canUseTool,
       }).filter(([, value]) => value !== undefined),

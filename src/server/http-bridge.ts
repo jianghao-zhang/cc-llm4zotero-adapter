@@ -299,7 +299,12 @@ export async function startHttpBridgeServer(
     try {
       const reqUrl = new URL(req.url || "/", `http://${host}:${port}`);
       if (req.method === "GET" && req.url === "/healthz") {
-        sendJson(res, 200, { ok: true, ts: Date.now() });
+        sendJson(res, 200, {
+          ok: true,
+          protocolVersion: 2,
+          capabilities: ["local_pdf_paths"],
+          ts: Date.now(),
+        });
         return;
       }
 

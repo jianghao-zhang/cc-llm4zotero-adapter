@@ -25,6 +25,32 @@ async function readNdjsonLines(response: Response): Promise<Array<Record<string,
 }
 
 describe("http bridge server", () => {
+  it("advertises local PDF path protocol support", async () => {
+    const runtimeClient: ClaudeCodeRuntimeClient = {
+      async startTurn() {
+        return { runId: "run-health", events: providerEvents([]) };
+      },
+    };
+    const base = new ClaudeCodeRuntimeAdapter({
+      runtimeClient,
+      sessionMapper: new InMemorySessionMapper(),
+    });
+    const server = await startHttpBridgeServer({
+      adapter: new Llm4ZoteroAgentBackendAdapter({ adapter: base }),
+    });
+
+    try {
+      const response = await fetch(`http://${server.host}:${server.port}/healthz`);
+      expect(await response.json()).toMatchObject({
+        ok: true,
+        protocolVersion: 2,
+        capabilities: ["local_pdf_paths"],
+      });
+    } finally {
+      await server.close();
+    }
+  });
+
   it("returns tool catalog from /tools", async () => {
     const runtimeClient: ClaudeCodeRuntimeClient = {
       async startTurn() {

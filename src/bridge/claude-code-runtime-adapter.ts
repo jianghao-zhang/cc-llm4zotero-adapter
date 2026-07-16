@@ -3,6 +3,11 @@ import type { SessionMapper } from "../session-link/session-mapper.js";
 import type { TraceStore } from "../trace-store/trace-store.js";
 import type { AgentEvent, RunTurnHooks, RunTurnOutcome, RunTurnRequest } from "../types.js";
 import { mapProviderEvent } from "../event-mapper/map-provider-event.js";
+import {
+  collectLocalPdfs,
+  LocalPdfOutputStreamSanitizer,
+  sanitizeLocalPdfOutput,
+} from "../local-pdf.js";
 
 export interface ClaudeCodeRuntimeAdapterOptions {
   runtimeClient: ClaudeCodeRuntimeClient;
@@ -10,7 +15,7 @@ export interface ClaudeCodeRuntimeAdapterOptions {
   traceStore?: TraceStore;
 }
 
-type ResumeSource = "map" | "legacy_provider_map" | "request_hint" | "none" | "force_fresh";
+type ResumeSource = "map" | "legacy_provider_map" | "request_hint" | "none" | "force_fresh" | "history_gap" | "local_pdf";
 
 export class ClaudeCodeRuntimeAdapter {
   private readonly runtimeClient: ClaudeCodeRuntimeClient;
@@ -121,6 +126,10 @@ export class ClaudeCodeRuntimeAdapter {
     return requestOrConversationKey.conversationKey;
   }
 
+  private buildLocalPdfHistoryGapKey(conversationKey: string): string {
+    return `${conversationKey}::local-pdf-history-gap`;
+  }
+
   private buildLegacyProviderSessionMapKey(
     requestOrConversationKey:
       | RunTurnRequest
@@ -201,6 +210,7 @@ export class ClaudeCodeRuntimeAdapter {
         : requestOrConversationKey.conversationKey;
     await this.sessionMapper.delete(baseConversationKey);
     await this.sessionMapper.deleteByPrefix(`${baseConversationKey}::provider:`);
+    await this.sessionMapper.delete(this.buildLocalPdfHistoryGapKey(baseConversationKey));
     await this.runtimeClient.invalidateHotRuntime?.(baseConversationKey);
   }
 
@@ -209,16 +219,18 @@ export class ClaudeCodeRuntimeAdapter {
     const metadata = request.metadata && typeof request.metadata === "object"
       ? (request.metadata as Record<string, unknown>)
       : {};
-    const { providerSessionId } = await this.resolveProviderSessionId(request);
-    await this.runtimeClient.warmHotRuntime?.({
-      conversationKey: request.conversationKey,
-      userMessage: "",
-      providerSessionId,
-      allowedTools: request.allowedTools,
-      runtimeRequest: request.runtimeRequest,
-      mcpServers: request.mcpServers,
-      metadata: request.metadata,
-    });
+    if (collectLocalPdfs(request.runtimeRequest).length === 0) {
+      const { providerSessionId } = await this.resolveProviderSessionId(request);
+      await this.runtimeClient.warmHotRuntime?.({
+        conversationKey: request.conversationKey,
+        userMessage: "",
+        providerSessionId,
+        allowedTools: request.allowedTools,
+        runtimeRequest: request.runtimeRequest,
+        mcpServers: request.mcpServers,
+        metadata: request.metadata,
+      });
+    }
     return {
       conversationKey: request.conversationKey,
       mountId,
@@ -237,6 +249,8 @@ export class ClaudeCodeRuntimeAdapter {
 
   async runTurn(request: RunTurnRequest, hooks: RunTurnHooks = {}): Promise<RunTurnOutcome> {
     const signal = hooks.signal ?? request.signal;
+    const localPdfs = collectLocalPdfs(request.runtimeRequest);
+    const isLocalPdfTurn = localPdfs.length > 0;
     if (hooks.onEvent) {
       await hooks.onEvent({
         type: "provider_event",
@@ -253,12 +267,20 @@ export class ClaudeCodeRuntimeAdapter {
         (request.metadata as Record<string, unknown>).forceFreshSession === true,
     );
     const sessionMapKey = this.buildSessionMapKey(request);
+    const historyGapKey = this.buildLocalPdfHistoryGapKey(request.conversationKey);
     if (forceFreshSession) {
       await this.invalidateConversationSession(request);
     }
+    const hasHistoryGap = !forceFreshSession && !isLocalPdfTurn && Boolean(
+      await this.sessionMapper.get(historyGapKey),
+    );
     const resolvedResume = forceFreshSession
       ? { providerSessionId: undefined, source: "force_fresh" as ResumeSource }
-      : await this.resolveProviderSessionId(request);
+      : isLocalPdfTurn
+        ? { providerSessionId: undefined, source: "local_pdf" as ResumeSource }
+        : hasHistoryGap
+          ? { providerSessionId: undefined, source: "history_gap" as ResumeSource }
+          : await this.resolveProviderSessionId(request);
     const initialSessionId = resolvedResume.providerSessionId;
     if (hooks.onEvent) {
       await hooks.onEvent({
@@ -273,13 +295,17 @@ export class ClaudeCodeRuntimeAdapter {
         },
       });
     }
-    let providerSessionId = initialSessionId;
+    const providerSessionId = initialSessionId;
+    const effectiveRequest = isLocalPdfTurn || hasHistoryGap
+      ? this.withResumeFallbackHistory(request)
+      : request;
 
     let firstOutcome: RunTurnOutcome;
     try {
-      firstOutcome = await this.runTurnOnce(request, hooks, signal, providerSessionId);
+      firstOutcome = await this.runTurnOnce(effectiveRequest, hooks, signal, providerSessionId);
     } catch (error) {
-      const err = error instanceof Error ? error : new Error(String(error));
+      const originalMessage = error instanceof Error ? error.message : String(error);
+      const err = new Error(sanitizeLocalPdfOutput(originalMessage, localPdfs));
       if (providerSessionId && this.isInvalidThinkingSignatureError(err.message)) {
         await this.sessionMapper.delete(sessionMapKey);
         hooks.onEvent?.({
@@ -304,6 +330,15 @@ export class ClaudeCodeRuntimeAdapter {
       });
       firstOutcome = await this.runTurnOnce(this.withResumeFallbackHistory(request), hooks, signal, undefined);
     }
+    if (isLocalPdfTurn && firstOutcome.status === "completed") {
+      await this.sessionMapper.delete(sessionMapKey);
+      await this.sessionMapper.deleteByPrefix(`${sessionMapKey}::provider:`);
+      await this.sessionMapper.set(historyGapKey, "1");
+      return { ...firstOutcome, providerSessionId: undefined };
+    }
+    if (hasHistoryGap && firstOutcome.status === "completed" && firstOutcome.providerSessionId) {
+      await this.sessionMapper.delete(historyGapKey);
+    }
     return firstOutcome;
   }
 
@@ -325,6 +360,9 @@ export class ClaudeCodeRuntimeAdapter {
     providerSessionId: string | undefined,
   ): Promise<RunTurnOutcome> {
     const sessionMapKey = this.buildSessionMapKey(request);
+    const localPdfs = collectLocalPdfs(request.runtimeRequest);
+    const persistProviderSession = localPdfs.length === 0;
+    const outputStreamSanitizer = new LocalPdfOutputStreamSanitizer(localPdfs);
     const stream = await this.runtimeClient.startTurn({
       conversationKey: request.conversationKey,
       userMessage: request.userMessage,
@@ -337,7 +375,7 @@ export class ClaudeCodeRuntimeAdapter {
     });
 
     let resolvedSessionId = providerSessionId;
-    if (stream.providerSessionId) {
+    if (persistProviderSession && stream.providerSessionId) {
       resolvedSessionId = stream.providerSessionId;
       await this.sessionMapper.set(sessionMapKey, stream.providerSessionId);
     }
@@ -345,36 +383,112 @@ export class ClaudeCodeRuntimeAdapter {
     hooks.onStart?.({
       runId: stream.runId,
       conversationKey: request.conversationKey,
-      providerSessionId: stream.providerSessionId ?? providerSessionId,
+      providerSessionId: persistProviderSession
+        ? stream.providerSessionId ?? providerSessionId
+        : undefined,
     });
 
     let finalText = "";
     let pendingTextDelta = "";
     let lastTextDeltaTs: number | undefined;
+    let lastReasoningRound = 1;
+    let lastReasoningTs: number | undefined;
 
-    const flushPendingTextDelta = async (): Promise<void> => {
-      if (!pendingTextDelta) return;
+    const sanitizeReasoningEvent = (event: AgentEvent): AgentEvent => {
+      const sanitized = sanitizeLocalPdfOutput(event, localPdfs);
+      if (event.type !== "reasoning") return sanitized;
+      const payload = event.payload && typeof event.payload === "object"
+        ? (event.payload as Record<string, unknown>)
+        : {};
+      const sanitizedPayload = sanitized.payload && typeof sanitized.payload === "object"
+        ? (sanitized.payload as Record<string, unknown>)
+        : {};
+      if (typeof payload.details !== "string") return sanitized;
+      if (typeof payload.round === "number" && Number.isFinite(payload.round)) {
+        lastReasoningRound = payload.round;
+      }
+      lastReasoningTs = event.ts;
+      return {
+        ...sanitized,
+        payload: {
+          ...sanitizedPayload,
+          details: outputStreamSanitizer.pushText("reasoning", payload.details),
+        },
+      };
+    };
+
+    const emitTextDelta = async (
+      redactedDelta: string,
+      eventTs: number | undefined,
+    ): Promise<void> => {
+      if (!redactedDelta) return;
       const mergedEvent: AgentEvent = {
         type: "message_delta",
         ts: Date.now(),
         payload: {
-          delta: pendingTextDelta,
+          delta: redactedDelta,
         },
       };
       this.logStreamingTiming("emit_merged_message_delta", {
         conversationKey: request.conversationKey,
         runId: stream.runId,
-        textLength: pendingTextDelta.length,
-        eventTs: lastTextDeltaTs,
+        textLength: redactedDelta.length,
+        eventTs,
       });
+      await this.emitEvent(stream.runId, request.conversationKey, mergedEvent, hooks);
+    };
+
+    const flushPendingTextDelta = async (): Promise<void> => {
+      if (!pendingTextDelta) return;
+      const redactedDelta = outputStreamSanitizer.pushText(
+        "message_delta",
+        pendingTextDelta,
+      );
+      const eventTs = lastTextDeltaTs;
       pendingTextDelta = "";
       lastTextDeltaTs = undefined;
-      await this.emitEvent(stream.runId, request.conversationKey, mergedEvent, hooks);
+      await emitTextDelta(redactedDelta, eventTs);
+    };
+
+    const flushHeldTextDelta = async (): Promise<void> => {
+      await emitTextDelta(
+        outputStreamSanitizer.flushText("message_delta"),
+        lastTextDeltaTs,
+      );
+    };
+
+    const flushHeldReasoning = async (): Promise<void> => {
+      const details = outputStreamSanitizer.flushText("reasoning");
+      if (!details) return;
+      await this.emitEvent(stream.runId, request.conversationKey, {
+        type: "reasoning",
+        ts: lastReasoningTs ?? Date.now(),
+        payload: {
+          round: lastReasoningRound,
+          details,
+        },
+      }, hooks);
     };
 
     try {
       for await (const providerEvent of stream.events) {
-        const event = mapProviderEvent(providerEvent);
+        const mappedEvent = mapProviderEvent(providerEvent);
+        const mappedProviderType =
+          mappedEvent.type === "provider_event" &&
+          mappedEvent.payload &&
+          typeof mappedEvent.payload === "object"
+            ? (mappedEvent.payload as Record<string, unknown>).providerType
+            : undefined;
+        const event = mappedEvent.type === "message_delta"
+          ? mappedEvent
+          : mappedEvent.type === "reasoning"
+            ? sanitizeReasoningEvent(mappedEvent)
+          : mappedProviderType === "stream_event"
+            ? outputStreamSanitizer.sanitizeChunk(
+                "provider_event:stream_event",
+                mappedEvent,
+              )
+          : sanitizeLocalPdfOutput(mappedEvent, localPdfs);
         const eventSessionId = this.extractSessionId(event.payload);
         const providerType =
           event.type === "provider_event" && event.payload && typeof event.payload === "object"
@@ -388,7 +502,12 @@ export class ClaudeCodeRuntimeAdapter {
           event.type === "tool_result" ||
           event.type === "message_delta" ||
           event.type === "final";
-        if (canAdoptSessionId && eventSessionId && eventSessionId !== resolvedSessionId) {
+        if (
+          persistProviderSession &&
+          canAdoptSessionId &&
+          eventSessionId &&
+          eventSessionId !== resolvedSessionId
+        ) {
           resolvedSessionId = eventSessionId;
           await this.sessionMapper.set(sessionMapKey, eventSessionId);
         }
@@ -403,6 +522,10 @@ export class ClaudeCodeRuntimeAdapter {
         }
 
         await flushPendingTextDelta();
+        if (event.type === "final") {
+          await flushHeldTextDelta();
+          await flushHeldReasoning();
+        }
         if (event.type === "final") {
           const output = event.payload.output;
           this.logStreamingTiming("emit_final", {
@@ -423,6 +546,9 @@ export class ClaudeCodeRuntimeAdapter {
       }
 
       await flushPendingTextDelta();
+      await flushHeldTextDelta();
+      await flushHeldReasoning();
+      outputStreamSanitizer.discardAll();
       this.logStreamingTiming("return_outcome", {
         conversationKey: request.conversationKey,
         runId: stream.runId,
@@ -432,12 +558,14 @@ export class ClaudeCodeRuntimeAdapter {
       return {
         runId: stream.runId,
         conversationKey: request.conversationKey,
-        providerSessionId: resolvedSessionId,
+        providerSessionId: persistProviderSession ? resolvedSessionId : undefined,
         status: signal?.aborted ? "cancelled" : "completed",
-        finalText,
+        finalText: sanitizeLocalPdfOutput(finalText, localPdfs),
       };
     } catch (error) {
-      const err = error instanceof Error ? error : new Error(String(error));
+      outputStreamSanitizer.discardAll();
+      const originalMessage = error instanceof Error ? error.message : String(error);
+      const err = new Error(sanitizeLocalPdfOutput(originalMessage, localPdfs));
       const fallbackEvent: AgentEvent = {
         type: "fallback",
         ts: Date.now(),
@@ -451,9 +579,9 @@ export class ClaudeCodeRuntimeAdapter {
       return {
         runId: stream.runId,
         conversationKey: request.conversationKey,
-        providerSessionId: resolvedSessionId,
+        providerSessionId: persistProviderSession ? resolvedSessionId : undefined,
         status: signal?.aborted ? "cancelled" : "failed",
-        finalText,
+        finalText: sanitizeLocalPdfOutput(finalText, localPdfs),
         error: err.message,
       };
     }

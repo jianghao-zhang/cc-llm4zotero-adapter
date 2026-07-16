@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { ClaudeCodeRuntimeAdapter } from "../src/bridge/claude-code-runtime-adapter.js";
 import type { ClaudeCodeRuntimeClient, ProviderEvent } from "../src/runtime.js";
+import type { AgentEvent } from "../src/types.js";
 import { InMemorySessionMapper } from "../src/session-link/session-mapper.js";
 import { InMemoryTraceStore } from "../src/trace-store/trace-store.js";
 
@@ -108,6 +109,164 @@ describe("ClaudeCodeRuntimeAdapter", () => {
     const traces = await traceStore.list("conv-A");
     expect(traces).toHaveLength(3);
     expect(traces[0]?.runId).toBe("run-1");
+  });
+
+  it("keeps PDF turns ephemeral, redacts their path, and rebuilds continuity once", async () => {
+    const pdfPath = "/private/library/paper a.pdf";
+    const split = Math.floor(pdfPath.length / 2);
+    const firstPathChunk = pdfPath.slice(0, split);
+    const secondPathChunk = pdfPath.slice(split);
+    const seenRequests: Array<{
+      providerSessionId?: string;
+      fallbackHistory?: unknown;
+    }> = [];
+    let callCount = 0;
+    const runtimeClient: ClaudeCodeRuntimeClient = {
+      async startTurn(request) {
+        callCount += 1;
+        seenRequests.push({
+          providerSessionId: request.providerSessionId,
+          fallbackHistory: request.metadata?.claudeResumeFallbackHistory,
+        });
+        if (callCount === 1) {
+          return {
+            runId: "run-pdf",
+            providerSessionId: "ephemeral-session",
+            events: providerEvents([
+              {
+                type: "provider_event",
+                payload: {
+                  providerType: "stream_event",
+                  sessionId: "ephemeral-session",
+                  payload: { event: { delta: { text: `Read ${firstPathChunk}` } } },
+                },
+              },
+              {
+                type: "message_delta",
+                payload: { delta: `Read ${firstPathChunk}`, sessionId: "ephemeral-session" },
+              },
+              {
+                type: "reasoning",
+                payload: {
+                  round: 1,
+                  details: firstPathChunk,
+                  sessionId: "ephemeral-session",
+                },
+              },
+              {
+                type: "provider_event",
+                payload: {
+                  providerType: "stream_event",
+                  sessionId: "ephemeral-session",
+                  payload: { event: { delta: { text: secondPathChunk } } },
+                },
+              },
+              {
+                type: "message_delta",
+                payload: { delta: secondPathChunk, sessionId: "ephemeral-session" },
+              },
+              {
+                type: "reasoning",
+                payload: {
+                  round: 1,
+                  details: secondPathChunk,
+                  sessionId: "ephemeral-session",
+                },
+              },
+              {
+                type: "tool_call",
+                payload: {
+                  name: "Read",
+                  input: { file_path: pdfPath, session_id: "ephemeral-session" },
+                  sessionId: "ephemeral-session",
+                },
+              },
+              {
+                type: "final",
+                payload: { output: `Read ${pdfPath}`, sessionId: "ephemeral-session" },
+              },
+            ]),
+          };
+        }
+        return {
+          runId: "run-normal",
+          providerSessionId: "new-persistent-session",
+          events: providerEvents([
+            { type: "final", payload: { output: "continued" } },
+          ]),
+        };
+      },
+    };
+
+    const sessionMapper = new InMemorySessionMapper();
+    await sessionMapper.set("conv-pdf-continuity", "old-persistent-session");
+    const traceStore = new InMemoryTraceStore();
+    const adapter = new ClaudeCodeRuntimeAdapter({ runtimeClient, sessionMapper, traceStore });
+    const seenEvents: AgentEvent[] = [];
+
+    const pdfOutcome = await adapter.runTurn({
+      conversationKey: "conv-pdf-continuity",
+      userMessage: "read it",
+      providerSessionId: "old-persistent-session",
+      runtimeRequest: {
+        history: [
+          { role: "user", content: "earlier question" },
+          { role: "assistant", content: "earlier answer" },
+        ],
+        localDocuments: [{
+          kind: "local_pdf",
+          sourceKey: "zotero-pdf:10:20",
+          itemId: 10,
+          contextItemId: 20,
+          title: "Paper",
+          name: "paper a.pdf",
+          mimeType: "application/pdf",
+          absolutePath: pdfPath,
+        }],
+      },
+    }, {
+      onEvent(event) {
+        seenEvents.push(event);
+      },
+    });
+
+    expect(seenRequests[0]).toEqual({
+      providerSessionId: undefined,
+      fallbackHistory: true,
+    });
+    expect(pdfOutcome.providerSessionId).toBeUndefined();
+    expect(pdfOutcome.finalText).not.toContain(pdfPath);
+    expect(await sessionMapper.get("conv-pdf-continuity")).toBeUndefined();
+    expect(await sessionMapper.get("conv-pdf-continuity::local-pdf-history-gap")).toBe("1");
+    const serializedEvents = JSON.stringify(seenEvents);
+    expect(serializedEvents).not.toContain(pdfPath);
+    expect(serializedEvents).not.toContain(firstPathChunk);
+    expect(serializedEvents).not.toContain(secondPathChunk);
+    const serializedTraces = JSON.stringify(await traceStore.list("conv-pdf-continuity"));
+    expect(serializedTraces).not.toContain(pdfPath);
+    expect(serializedTraces).not.toContain(firstPathChunk);
+    expect(serializedTraces).not.toContain(secondPathChunk);
+    expect(serializedTraces).not.toContain("ephemeral-session");
+
+    const normalOutcome = await adapter.runTurn({
+      conversationKey: "conv-pdf-continuity",
+      userMessage: "continue",
+      providerSessionId: "old-persistent-session",
+      runtimeRequest: {
+        history: [
+          { role: "user", content: "read it" },
+          { role: "assistant", content: "summary" },
+        ],
+      },
+    });
+
+    expect(seenRequests[1]).toEqual({
+      providerSessionId: undefined,
+      fallbackHistory: true,
+    });
+    expect(normalOutcome.providerSessionId).toBe("new-persistent-session");
+    expect(await sessionMapper.get("conv-pdf-continuity")).toBe("new-persistent-session");
+    expect(await sessionMapper.get("conv-pdf-continuity::local-pdf-history-gap")).toBeUndefined();
   });
 
   it("resumes the base conversation session when provider identity changes", async () => {

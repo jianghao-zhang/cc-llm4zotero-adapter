@@ -308,6 +308,15 @@ export async function startHttpBridgeServer(
         return;
       }
 
+      if (req.method === "GET" && reqUrl.pathname === "/metrics") {
+        const metrics = options.adapter.getMetrics();
+        sendJson(res, 200, {
+          ts: Date.now(),
+          ...metrics,
+        });
+        return;
+      }
+
       if (req.method === "GET" && reqUrl.pathname === "/tools") {
         const settingSources = parseSettingSources(
           reqUrl.searchParams.get("settingSources"),

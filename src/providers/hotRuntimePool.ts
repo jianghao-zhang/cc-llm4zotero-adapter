@@ -21,7 +21,7 @@ export type HotRuntimeTurn = {
 export type HotRuntimeEntry = {
   conversationKey: string;
   mounts: Set<string>;
-  closeTimer: NodeJS.Timeout | null;
+  closeTimer: ReturnType<typeof setTimeout> | null;
   closeRequested: boolean;
   lastActivityAt: number;
   query: Query | null;
@@ -37,6 +37,8 @@ export type HotRuntimeEntry = {
   currentTurnMessage?: SDKUserMessage;
   pendingEarlyRuntimeError?: Error;
   pendingEarlyRuntimeQueryOptions?: Record<string, unknown>;
+  // Memory tracking
+  estimatedSize: number;
 };
 
 function createMessageChannel(): {
@@ -157,6 +159,37 @@ export function createHotRuntimeTurn(runId: string): HotRuntimeTurn {
   };
 }
 
+/**
+ * Estimate memory size of a message for LRU eviction decisions.
+ * This is a rough estimate to help manage memory usage.
+ */
+function estimateMessageSize(message: SDKUserMessage | undefined): number {
+  if (!message) return 0;
+
+  let size = 100; // Base overhead
+
+  // Estimate size of message content
+  if (message.message) {
+    const content = message.message.content;
+    if (typeof content === "string") {
+      size += content.length * 2; // UTF-16 characters
+    } else if (Array.isArray(content)) {
+      for (const block of content) {
+        if (block.type === "text" && "text" in block) {
+          size += (block.text as string).length * 2;
+        } else if (block.type === "image" && "source" in block) {
+          const source = block.source as { type: string; data?: string };
+          if (source.type === "base64" && source.data) {
+            size += source.data.length * 0.75; // Base64 -> binary estimate
+          }
+        }
+      }
+    }
+  }
+
+  return size;
+}
+
 export function createHotRuntimeEntry(conversationKey: string): HotRuntimeEntry {
   const channel = createMessageChannel();
   return {
@@ -178,27 +211,60 @@ export function createHotRuntimeEntry(conversationKey: string): HotRuntimeEntry 
     currentTurnMessage: undefined,
     pendingEarlyRuntimeError: undefined,
     pendingEarlyRuntimeQueryOptions: undefined,
+    estimatedSize: 0,
   };
 }
 
+export interface HotRuntimePoolOptions {
+  graceMs?: number;
+  maxEntries?: number;
+  maxMemoryBytes?: number;
+}
+
+/**
+ * Pool of hot runtime entries with LRU eviction strategy.
+ *
+ * Features:
+ * - Maximum entries limit to prevent unbounded growth
+ * - Memory-based eviction when estimated size exceeds threshold
+ * - Idle timeout for automatic cleanup
+ * - Active monitoring via getStats()
+ */
 export class HotRuntimePool {
   private readonly entries = new Map<string, HotRuntimeEntry>();
+  private readonly accessOrder: string[] = [];
   private readonly graceMs: number;
+  private readonly maxEntries: number;
+  private readonly maxMemoryBytes: number;
 
-  constructor(options?: { graceMs?: number }) {
-    this.graceMs = options?.graceMs ?? 3000;
+  constructor(options?: HotRuntimePoolOptions) {
+    this.graceMs = options?.graceMs ?? 5 * 60 * 1000; // 5 minutes default
+    this.maxEntries = options?.maxEntries ?? 50; // Maximum 50 concurrent sessions
+    this.maxMemoryBytes = options?.maxMemoryBytes ?? 500 * 1024 * 1024; // 500MB estimate
   }
 
   ensure(conversationKey: string): HotRuntimeEntry {
     const existing = this.entries.get(conversationKey);
-    if (existing) return existing;
+    if (existing) {
+      this.touchAccess(conversationKey);
+      return existing;
+    }
+
+    // Check capacity before creating new entry
+    this.enforceCapacityLimits();
+
     const created = createHotRuntimeEntry(conversationKey);
     this.entries.set(conversationKey, created);
+    this.accessOrder.push(conversationKey);
     return created;
   }
 
   get(conversationKey: string): HotRuntimeEntry | undefined {
-    return this.entries.get(conversationKey);
+    const entry = this.entries.get(conversationKey);
+    if (entry) {
+      this.touchAccess(conversationKey);
+    }
+    return entry;
   }
 
   retain(conversationKey: string, mountId: string): HotRuntimeEntry {
@@ -210,6 +276,7 @@ export class HotRuntimePool {
       clearTimeout(entry.closeTimer);
       entry.closeTimer = null;
     }
+    this.touchAccess(conversationKey);
     return entry;
   }
 
@@ -228,7 +295,7 @@ export class HotRuntimePool {
     entry.closeTimer = setTimeout(() => {
       entry.closeTimer = null;
       if (entry.mounts.size > 0 || entry.currentTurn) return;
-      this.entries.delete(entry.conversationKey);
+      this.delete(entry.conversationKey);
       onExpire(entry);
     }, this.graceMs);
   }
@@ -237,10 +304,128 @@ export class HotRuntimePool {
     const entry = this.entries.get(conversationKey);
     if (!entry) return undefined;
     this.entries.delete(conversationKey);
+
+    // Remove from access order
+    const idx = this.accessOrder.indexOf(conversationKey);
+    if (idx >= 0) {
+      this.accessOrder.splice(idx, 1);
+    }
+
     if (entry.closeTimer) {
       clearTimeout(entry.closeTimer);
       entry.closeTimer = null;
     }
     return entry;
+  }
+
+  /**
+   * Update access order for LRU tracking.
+   */
+  private touchAccess(conversationKey: string): void {
+    const idx = this.accessOrder.indexOf(conversationKey);
+    if (idx >= 0) {
+      this.accessOrder.splice(idx, 1);
+    }
+    this.accessOrder.push(conversationKey);
+  }
+
+  /**
+   * Estimate total memory usage across all entries.
+   */
+  private estimateTotalMemory(): number {
+    let total = 0;
+    for (const entry of this.entries.values()) {
+      total += entry.estimatedSize;
+      // Add estimated size of current turn message
+      total += estimateMessageSize(entry.currentTurnMessage);
+    }
+    return total;
+  }
+
+  /**
+   * Enforce capacity limits by evicting least recently used entries.
+   */
+  private enforceCapacityLimits(): void {
+    // Check entry count limit
+    while (this.entries.size >= this.maxEntries && this.accessOrder.length > 0) {
+      const lruKey = this.accessOrder.shift();
+      if (lruKey && this.entries.has(lruKey)) {
+        const entry = this.entries.get(lruKey);
+        if (entry && entry.mounts.size === 0 && !entry.currentTurn) {
+          this.delete(lruKey);
+          console.log(`[hot-runtime] Evicted entry ${lruKey} due to max entries limit`);
+        }
+      }
+    }
+
+    // Check memory limit
+    const currentMemory = this.estimateTotalMemory();
+    if (currentMemory > this.maxMemoryBytes) {
+      // Evict LRU entries until under limit
+      const keysToEvict: string[] = [];
+      let projectedMemory = currentMemory;
+
+      for (const key of this.accessOrder) {
+        if (projectedMemory <= this.maxMemoryBytes * 0.8) break;
+        const entry = this.entries.get(key);
+        if (entry && entry.mounts.size === 0 && !entry.currentTurn) {
+          keysToEvict.push(key);
+          projectedMemory -= entry.estimatedSize + estimateMessageSize(entry.currentTurnMessage);
+        }
+      }
+
+      for (const key of keysToEvict) {
+        this.delete(key);
+        console.log(`[hot-runtime] Evicted entry ${key} due to memory limit`);
+      }
+    }
+  }
+
+  /**
+   * Get pool statistics for monitoring.
+   */
+  getStats(): {
+    entryCount: number;
+    maxEntries: number;
+    estimatedMemoryBytes: number;
+    maxMemoryBytes: number;
+    activeMounts: number;
+    idleEntries: number;
+  } {
+    let activeMounts = 0;
+    let idleEntries = 0;
+    let estimatedMemory = 0;
+
+    for (const entry of this.entries.values()) {
+      activeMounts += entry.mounts.size;
+      if (entry.mounts.size === 0 && !entry.currentTurn) {
+        idleEntries++;
+      }
+      estimatedMemory += entry.estimatedSize + estimateMessageSize(entry.currentTurnMessage);
+    }
+
+    return {
+      entryCount: this.entries.size,
+      maxEntries: this.maxEntries,
+      estimatedMemoryBytes: estimatedMemory,
+      maxMemoryBytes: this.maxMemoryBytes,
+      activeMounts,
+      idleEntries,
+    };
+  }
+
+  /**
+   * Force cleanup of all idle entries.
+   */
+  cleanupIdle(onExpire: (entry: HotRuntimeEntry) => void): number {
+    let cleaned = 0;
+    for (const [key, entry] of this.entries) {
+      if (entry.mounts.size === 0 && !entry.currentTurn) {
+        this.delete(key);
+        onExpire(entry);
+        cleaned++;
+      }
+    }
+    return cleaned;
   }
 }

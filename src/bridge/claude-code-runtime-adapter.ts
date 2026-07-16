@@ -594,7 +594,8 @@ export class ClaudeCodeRuntimeAdapter {
     hooks: RunTurnHooks,
   ): Promise<void> {
     hooks.onEvent?.(event);
-    if (this.traceStore) {
+    // Only trace important events, skip high-frequency message_delta for performance
+    if (this.traceStore && event.type !== "message_delta") {
       void this.traceStore.append({ runId, conversationKey, event });
     }
   }
@@ -633,5 +634,52 @@ export class ClaudeCodeRuntimeAdapter {
       return true;
     }
     return false;
+  }
+
+  /**
+   * Get runtime pool statistics.
+   */
+  getRuntimePoolStats(): { entryCount: number; maxEntries: number; activeMounts: number; idleEntries: number } {
+    const runtimeClient = this.runtimeClient as { hotRuntimePool?: { getStats(): { entryCount: number; maxEntries: number; activeMounts: number; idleEntries: number } } };
+    if (runtimeClient.hotRuntimePool && typeof runtimeClient.hotRuntimePool.getStats === "function") {
+      return runtimeClient.hotRuntimePool.getStats();
+    }
+    return { entryCount: 0, maxEntries: 0, activeMounts: 0, idleEntries: 0 };
+  }
+
+  /**
+   * Get session mapper statistics.
+   */
+  getSessionMapperStats(): { cacheSize: number; pendingWrites: number; compactionCounter: number } {
+    const mapper = this.sessionMapper as unknown as { getStats?: () => { cacheSize: number; pendingWrites: number; compactionCounter: number } };
+    if (mapper.getStats) {
+      return mapper.getStats();
+    }
+    return { cacheSize: 0, pendingWrites: 0, compactionCounter: 0 };
+  }
+
+  /**
+   * Get trace store statistics.
+   */
+  getTraceStoreStats(): { bufferSize: number } {
+    if (this.traceStore && typeof this.traceStore.getStats === "function") {
+      const stats = this.traceStore.getStats();
+      return { bufferSize: stats.bufferSize };
+    }
+    return { bufferSize: 0 };
+  }
+
+  /**
+   * Get model cache statistics.
+   */
+  getModelCacheStats(): { entryCount: number; totalModels: number; oldestEntryAge: number } {
+    // Model cache is in model-resolver.ts - use dynamic import to avoid circular deps
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { getModelCacheStats } = require("../providers/model-resolver.js") as { getModelCacheStats: () => { entryCount: number; totalModels: number; oldestEntryAge: number } };
+      return getModelCacheStats();
+    } catch {
+      return { entryCount: 0, totalModels: 0, oldestEntryAge: 0 };
+    }
   }
 }

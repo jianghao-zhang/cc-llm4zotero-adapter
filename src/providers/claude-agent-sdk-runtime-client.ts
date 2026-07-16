@@ -841,10 +841,8 @@ export interface ClaudeAgentSdkRuntimeClientOptions {
 
 export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
   private readonly options: ClaudeAgentSdkRuntimeClientOptions;
-  private modelInfoCache = new Map<string, { expiresAt: number; infos: ClaudeModelInfo[] }>();
   private commandInfoCache = new Map<string, { expiresAt: number; commands: ClaudeSlashCommandInfo[] }>();
   private effortSuccessCache = new Map<string, EffortSuccessRecord>();
-  private readonly modelInfoTtlMs = 60_000;
   private readonly commandInfoTtlMs = 5 * 60_000;
   private readonly effortSuccessTtlMs = 5 * 60_000;
   private readonly hotRuntimePool = new HotRuntimePool({ graceMs: 5 * 60_000 });
@@ -2235,15 +2233,13 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     const requestedSources = options?.settingSources;
     const settingSources = Array.isArray(requestedSources) && requestedSources.length > 0 ? requestedSources : this.options.settingSources ?? ["user", "project", "local"];
     const providerKey = options?.providerKey || "default";
-    const cacheKey = `${providerKey}::${settingSources.join(",")}`;
-    const cached = this.modelInfoCache.get(cacheKey);
-    if (cached && Date.now() < cached.expiresAt) return cached.infos;
-    const sharedCached = getCachedModels(settingSources, providerKey);
-    if (sharedCached && sharedCached.length > 0) {
-      const infos = sharedCached as ClaudeModelInfo[];
-      this.modelInfoCache.set(cacheKey, { infos, expiresAt: Date.now() + this.modelInfoTtlMs });
-      return infos;
+
+    // Use unified cache from model-resolver.ts
+    const cached = getCachedModels(settingSources, providerKey);
+    if (cached && cached.length > 0) {
+      return cached as ClaudeModelInfo[];
     }
+
     try {
       const query = this.options.queryImpl ?? (await this.loadQuery());
       const session = query({
@@ -2254,7 +2250,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       try { await session.return(undefined); } catch {}
       try { session.close(); } catch {}
       const infos = Array.isArray(infosRaw) ? infosRaw : [];
-      this.modelInfoCache.set(cacheKey, { infos, expiresAt: Date.now() + this.modelInfoTtlMs });
+      // Update unified cache
       setCachedModels(settingSources, infos, providerKey);
       return infos;
     } catch {

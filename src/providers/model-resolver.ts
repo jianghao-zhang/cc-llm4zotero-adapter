@@ -1,7 +1,6 @@
 /**
- * Dynamic model resolver based on available SDK models.
- * Maps frontend aliases (opus/sonnet/haiku) to actual provider models.
- * Supports hot-swapping profiles via settingSources-aware caching.
+ * Unified model resolver with centralized caching.
+ * This is the single source of truth for model information caching.
  */
 
 export interface ModelInfo {
@@ -16,7 +15,7 @@ const CLAUDE_CONTEXT_ALIAS_RE = /^(opus|sonnet)\[[0-9]+[km]\]$/i;
 function cleanModelName(value: unknown): string {
   if (typeof value !== "string") return "";
   return value
-    .replace(/\u001b\[[0-9;]*m/g, "")
+    .replace(/\[[0-9;]*m/g, "")
     .trim()
     .toLowerCase();
 }
@@ -36,13 +35,14 @@ export function normalizeProviderModelName(value: unknown): string {
 }
 
 /**
- * Cache key includes settingSources to support profile hot-swapping.
- * When user switches profiles, settingSources changes → cache miss → fresh model fetch.
+ * Global model cache - single source of truth.
+ * Key format: `${providerKey}::${settingSources.join(",")}`
  */
-const modelCache = new Map<
-  string,
-  { models: ModelInfo[]; expiresAt: number }
->();
+const modelCache = new Map<string, {
+  models: ModelInfo[];
+  expiresAt: number;
+  fetchedAt: number;
+}>();
 
 const CACHE_TTL_MS = 60_000; // 1 minute cache
 
@@ -71,7 +71,40 @@ export function setCachedModels(
   modelCache.set(key, {
     models,
     expiresAt: Date.now() + CACHE_TTL_MS,
+    fetchedAt: Date.now(),
   });
+}
+
+/**
+ * Clear all cached models (useful for testing or forced refresh).
+ */
+export function clearModelCache(): void {
+  modelCache.clear();
+}
+
+/**
+ * Get cache statistics for monitoring.
+ */
+export function getModelCacheStats(): {
+  entryCount: number;
+  totalModels: number;
+  oldestEntryAge: number;
+} {
+  let totalModels = 0;
+  let oldestFetchedAt = Date.now();
+
+  for (const entry of modelCache.values()) {
+    totalModels += entry.models.length;
+    if (entry.fetchedAt < oldestFetchedAt) {
+      oldestFetchedAt = entry.fetchedAt;
+    }
+  }
+
+  return {
+    entryCount: modelCache.size,
+    totalModels,
+    oldestEntryAge: Date.now() - oldestFetchedAt,
+  };
 }
 
 /**

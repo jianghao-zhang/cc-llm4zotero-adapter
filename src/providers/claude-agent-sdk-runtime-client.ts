@@ -937,6 +937,25 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     this.usageSnapshots.delete(conversationKey);
   }
 
+  private async invalidateHotRuntimePreservingMounts(
+    conversationKey: string,
+  ): Promise<void> {
+    const entry = this.hotRuntimePool.get(conversationKey);
+    if (!entry) {
+      this.usageSnapshots.delete(conversationKey);
+      return;
+    }
+    const preservedMounts = Array.from(entry.mounts);
+    await this.closeHotRuntime(entry);
+    this.hotRuntimePool.delete(conversationKey);
+    this.usageSnapshots.delete(conversationKey);
+    if (!preservedMounts.length) return;
+    const retainedEntry = this.hotRuntimePool.ensure(conversationKey);
+    for (const mountId of preservedMounts) {
+      retainedEntry.mounts.add(mountId);
+    }
+  }
+
   async invalidateAllHotRuntimes(): Promise<void> {
     const keys = Array.from(this.hotRuntimePool["entries"].keys()) as string[];
     for (const key of keys) {
@@ -1007,7 +1026,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       );
     const createProfilingEvent = this.createProfilingEvent.bind(this);
     if (localPdfs.length) {
-      await this.invalidateHotRuntime(request.conversationKey);
+      await this.invalidateHotRuntimePreservingMounts(request.conversationKey);
       const stream = await this.startColdTurn({
         ...request,
         providerSessionId: undefined,

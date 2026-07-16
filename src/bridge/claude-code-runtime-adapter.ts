@@ -3,7 +3,11 @@ import type { SessionMapper } from "../session-link/session-mapper.js";
 import type { TraceStore } from "../trace-store/trace-store.js";
 import type { AgentEvent, RunTurnHooks, RunTurnOutcome, RunTurnRequest } from "../types.js";
 import { mapProviderEvent } from "../event-mapper/map-provider-event.js";
-import { collectLocalPdfs, sanitizeLocalPdfOutput } from "../local-pdf.js";
+import {
+  collectLocalPdfs,
+  LocalPdfOutputStreamSanitizer,
+  sanitizeLocalPdfOutput,
+} from "../local-pdf.js";
 
 export interface ClaudeCodeRuntimeAdapterOptions {
   runtimeClient: ClaudeCodeRuntimeClient;
@@ -292,7 +296,7 @@ export class ClaudeCodeRuntimeAdapter {
       });
     }
     const providerSessionId = initialSessionId;
-    const effectiveRequest = hasHistoryGap
+    const effectiveRequest = isLocalPdfTurn || hasHistoryGap
       ? this.withResumeFallbackHistory(request)
       : request;
 
@@ -358,6 +362,7 @@ export class ClaudeCodeRuntimeAdapter {
     const sessionMapKey = this.buildSessionMapKey(request);
     const localPdfs = collectLocalPdfs(request.runtimeRequest);
     const persistProviderSession = localPdfs.length === 0;
+    const outputStreamSanitizer = new LocalPdfOutputStreamSanitizer(localPdfs);
     const stream = await this.runtimeClient.startTurn({
       conversationKey: request.conversationKey,
       userMessage: request.userMessage,
@@ -387,9 +392,11 @@ export class ClaudeCodeRuntimeAdapter {
     let pendingTextDelta = "";
     let lastTextDeltaTs: number | undefined;
 
-    const flushPendingTextDelta = async (): Promise<void> => {
-      if (!pendingTextDelta) return;
-      const redactedDelta = sanitizeLocalPdfOutput(pendingTextDelta, localPdfs);
+    const emitTextDelta = async (
+      redactedDelta: string,
+      eventTs: number | undefined,
+    ): Promise<void> => {
+      if (!redactedDelta) return;
       const mergedEvent: AgentEvent = {
         type: "message_delta",
         ts: Date.now(),
@@ -401,18 +408,46 @@ export class ClaudeCodeRuntimeAdapter {
         conversationKey: request.conversationKey,
         runId: stream.runId,
         textLength: redactedDelta.length,
-        eventTs: lastTextDeltaTs,
+        eventTs,
       });
+      await this.emitEvent(stream.runId, request.conversationKey, mergedEvent, hooks);
+    };
+
+    const flushPendingTextDelta = async (): Promise<void> => {
+      if (!pendingTextDelta) return;
+      const redactedDelta = outputStreamSanitizer.pushText(
+        "message_delta",
+        pendingTextDelta,
+      );
+      const eventTs = lastTextDeltaTs;
       pendingTextDelta = "";
       lastTextDeltaTs = undefined;
-      await this.emitEvent(stream.runId, request.conversationKey, mergedEvent, hooks);
+      await emitTextDelta(redactedDelta, eventTs);
+    };
+
+    const flushHeldTextDelta = async (): Promise<void> => {
+      await emitTextDelta(
+        outputStreamSanitizer.flushText("message_delta"),
+        lastTextDeltaTs,
+      );
     };
 
     try {
       for await (const providerEvent of stream.events) {
         const mappedEvent = mapProviderEvent(providerEvent);
+        const mappedProviderType =
+          mappedEvent.type === "provider_event" &&
+          mappedEvent.payload &&
+          typeof mappedEvent.payload === "object"
+            ? (mappedEvent.payload as Record<string, unknown>).providerType
+            : undefined;
         const event = mappedEvent.type === "message_delta"
           ? mappedEvent
+          : mappedProviderType === "stream_event"
+            ? outputStreamSanitizer.sanitizeChunk(
+                "provider_event:stream_event",
+                mappedEvent,
+              )
           : sanitizeLocalPdfOutput(mappedEvent, localPdfs);
         const eventSessionId = this.extractSessionId(event.payload);
         const providerType =
@@ -448,6 +483,9 @@ export class ClaudeCodeRuntimeAdapter {
 
         await flushPendingTextDelta();
         if (event.type === "final") {
+          await flushHeldTextDelta();
+        }
+        if (event.type === "final") {
           const output = event.payload.output;
           this.logStreamingTiming("emit_final", {
             conversationKey: request.conversationKey,
@@ -467,6 +505,8 @@ export class ClaudeCodeRuntimeAdapter {
       }
 
       await flushPendingTextDelta();
+      await flushHeldTextDelta();
+      outputStreamSanitizer.discardAll();
       this.logStreamingTiming("return_outcome", {
         conversationKey: request.conversationKey,
         runId: stream.runId,
@@ -481,6 +521,7 @@ export class ClaudeCodeRuntimeAdapter {
         finalText: sanitizeLocalPdfOutput(finalText, localPdfs),
       };
     } catch (error) {
+      outputStreamSanitizer.discardAll();
       const originalMessage = error instanceof Error ? error.message : String(error);
       const err = new Error(sanitizeLocalPdfOutput(originalMessage, localPdfs));
       const fallbackEvent: AgentEvent = {

@@ -975,13 +975,26 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
     const runtime = new ClaudeAgentSdkRuntimeClient({
       queryImpl(args) {
         queryCount += 1;
+        const sessionId = `sess-${queryCount}`;
         seenDirectories.push(args.options.additionalDirectories);
         seenPrompts.push(typeof args.prompt === "string" ? args.prompt : "[stream]");
         seenPersistence.push(args.options.persistSession);
-        return makeStream([
-          { type: "system", session_id: `sess-${queryCount}`, subtype: "init" },
-          { type: "result", session_id: `sess-${queryCount}`, result: "ok", is_error: false },
-        ]);
+        if (typeof args.prompt === "string") {
+          return makeStream([
+            { type: "system", session_id: sessionId, subtype: "init" },
+            { type: "result", session_id: sessionId, result: "ok", is_error: false },
+          ]);
+        }
+        const prompt = args.prompt as AsyncIterable<unknown>;
+        return {
+          async *[Symbol.asyncIterator]() {
+            for await (const _message of prompt) {
+              yield { type: "system", session_id: sessionId, subtype: "init" };
+              yield { type: "result", session_id: sessionId, result: "ok", is_error: false };
+            }
+          },
+          close() {},
+        } as any;
       },
     });
     const document = (itemId: number, contextItemId: number, absolutePath: string) => ({
@@ -1014,7 +1027,15 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
       conversationKey: "conv-hot-pdf",
       userMessage: "continue without a PDF",
     });
-    for await (const _event of third.events) void _event;
+    const thirdTurnStages: string[] = [];
+    for await (const event of third.events) {
+      if (event.type !== "provider_event") continue;
+      const payload = event.payload as Record<string, unknown>;
+      const nested = payload.payload as Record<string, unknown> | undefined;
+      if (payload.providerType === "profiling" && typeof nested?.stage === "string") {
+        thirdTurnStages.push(nested.stage);
+      }
+    }
 
     expect(queryCount).toBe(3);
     expect(seenDirectories).toEqual([
@@ -1029,6 +1050,10 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
     expect(seenPrompts[2]).not.toContain(firstPdf);
     expect(seenPrompts[2]).not.toContain(secondPdf);
     expect(seenPersistence).toEqual([false, false, undefined]);
+    expect(thirdTurnStages).toContain("runtime.start_turn.hot_entry_found");
+    const retainedEntry = (runtime as any).hotRuntimePool.get("conv-hot-pdf");
+    expect(Array.from(retainedEntry?.mounts || [])).toEqual(["mount-1"]);
+    await runtime.invalidateHotRuntime("conv-hot-pdf");
   });
 
 

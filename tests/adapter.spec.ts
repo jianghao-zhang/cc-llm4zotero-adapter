@@ -113,6 +113,9 @@ describe("ClaudeCodeRuntimeAdapter", () => {
 
   it("keeps PDF turns ephemeral, redacts their path, and rebuilds continuity once", async () => {
     const pdfPath = "/private/library/paper a.pdf";
+    const split = Math.floor(pdfPath.length / 2);
+    const firstPathChunk = pdfPath.slice(0, split);
+    const secondPathChunk = pdfPath.slice(split);
     const seenRequests: Array<{
       providerSessionId?: string;
       fallbackHistory?: unknown;
@@ -126,18 +129,33 @@ describe("ClaudeCodeRuntimeAdapter", () => {
           fallbackHistory: request.metadata?.claudeResumeFallbackHistory,
         });
         if (callCount === 1) {
-          const split = Math.floor(pdfPath.length / 2);
           return {
             runId: "run-pdf",
             providerSessionId: "ephemeral-session",
             events: providerEvents([
               {
-                type: "message_delta",
-                payload: { delta: `Read ${pdfPath.slice(0, split)}`, sessionId: "ephemeral-session" },
+                type: "provider_event",
+                payload: {
+                  providerType: "stream_event",
+                  sessionId: "ephemeral-session",
+                  payload: { event: { delta: { text: `Read ${firstPathChunk}` } } },
+                },
               },
               {
                 type: "message_delta",
-                payload: { delta: pdfPath.slice(split), sessionId: "ephemeral-session" },
+                payload: { delta: `Read ${firstPathChunk}`, sessionId: "ephemeral-session" },
+              },
+              {
+                type: "provider_event",
+                payload: {
+                  providerType: "stream_event",
+                  sessionId: "ephemeral-session",
+                  payload: { event: { delta: { text: secondPathChunk } } },
+                },
+              },
+              {
+                type: "message_delta",
+                payload: { delta: secondPathChunk, sessionId: "ephemeral-session" },
               },
               {
                 type: "tool_call",
@@ -175,6 +193,10 @@ describe("ClaudeCodeRuntimeAdapter", () => {
       userMessage: "read it",
       providerSessionId: "old-persistent-session",
       runtimeRequest: {
+        history: [
+          { role: "user", content: "earlier question" },
+          { role: "assistant", content: "earlier answer" },
+        ],
         localDocuments: [{
           kind: "local_pdf",
           sourceKey: "zotero-pdf:10:20",
@@ -192,14 +214,22 @@ describe("ClaudeCodeRuntimeAdapter", () => {
       },
     });
 
-    expect(seenRequests[0]?.providerSessionId).toBeUndefined();
+    expect(seenRequests[0]).toEqual({
+      providerSessionId: undefined,
+      fallbackHistory: true,
+    });
     expect(pdfOutcome.providerSessionId).toBeUndefined();
     expect(pdfOutcome.finalText).not.toContain(pdfPath);
     expect(await sessionMapper.get("conv-pdf-continuity")).toBeUndefined();
     expect(await sessionMapper.get("conv-pdf-continuity::local-pdf-history-gap")).toBe("1");
-    expect(JSON.stringify(seenEvents)).not.toContain(pdfPath);
+    const serializedEvents = JSON.stringify(seenEvents);
+    expect(serializedEvents).not.toContain(pdfPath);
+    expect(serializedEvents).not.toContain(firstPathChunk);
+    expect(serializedEvents).not.toContain(secondPathChunk);
     const serializedTraces = JSON.stringify(await traceStore.list("conv-pdf-continuity"));
     expect(serializedTraces).not.toContain(pdfPath);
+    expect(serializedTraces).not.toContain(firstPathChunk);
+    expect(serializedTraces).not.toContain(secondPathChunk);
     expect(serializedTraces).not.toContain("ephemeral-session");
 
     const normalOutcome = await adapter.runTurn({

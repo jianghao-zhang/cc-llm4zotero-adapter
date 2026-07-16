@@ -50,6 +50,33 @@ function stringifyJson(value: unknown): string {
     .replace(/\u2029/g, "\\u2029");
 }
 
+type LocalPdfOutputReplacement = Readonly<{
+  pattern: string;
+  replacement: string;
+}>;
+
+function buildLocalPdfOutputReplacements(
+  resources: readonly LocalPdfResource[],
+): LocalPdfOutputReplacement[] {
+  return resources.flatMap((resource) => {
+    const escaped = stringifyJson(resource.absolutePath).slice(1, -1);
+    const replacement = `[local-pdf-path:${resource.sourceKey}]`;
+    return Array.from(new Set([resource.absolutePath, escaped]))
+      .filter(Boolean)
+      .map((pattern) => ({ pattern, replacement }));
+  }).sort((left, right) => right.pattern.length - left.pattern.length);
+}
+
+function replaceLocalPdfOutputPatterns(
+  value: string,
+  replacements: readonly LocalPdfOutputReplacement[],
+): string {
+  return replacements.reduce(
+    (text, replacement) => text.split(replacement.pattern).join(replacement.replacement),
+    value,
+  );
+}
+
 export function collectLocalPdfs(runtimeRequest: unknown): readonly LocalPdfResource[] {
   const request = asRecord(runtimeRequest);
   if (!request || request.localDocuments === undefined) return [];
@@ -145,22 +172,96 @@ export function renderLocalPdfPrompt(resources: readonly LocalPdfResource[]): st
   ].join("\n");
 }
 
+/**
+ * Holds only a suffix that can still become a selected local PDF path. SDK text
+ * deltas are separated by raw provider events, so complete paths cannot be
+ * safely redacted by treating each event as an independent string.
+ */
+export class LocalPdfOutputStreamSanitizer {
+  private readonly replacements: readonly LocalPdfOutputReplacement[];
+  private readonly pendingByChannel = new Map<
+    string,
+    { text: string; replacement: string }
+  >();
+
+  constructor(resources: readonly LocalPdfResource[]) {
+    this.replacements = buildLocalPdfOutputReplacements(resources);
+  }
+
+  pushText(channel: string, chunk: string): string {
+    if (!this.replacements.length || !chunk) return chunk;
+    const previous = this.pendingByChannel.get(channel);
+    const redacted = replaceLocalPdfOutputPatterns(
+      `${previous?.text || ""}${chunk}`,
+      this.replacements,
+    );
+    let pending:
+      | { length: number; replacement: string }
+      | undefined;
+    for (const replacement of this.replacements) {
+      const maximumLength = Math.min(
+        redacted.length,
+        replacement.pattern.length - 1,
+      );
+      for (let length = maximumLength; length > 0; length -= 1) {
+        if (
+          length > (pending?.length || 0) &&
+          redacted.endsWith(replacement.pattern.slice(0, length))
+        ) {
+          pending = { length, replacement: replacement.replacement };
+          break;
+        }
+      }
+    }
+    if (!pending) {
+      this.pendingByChannel.delete(channel);
+      return redacted;
+    }
+    this.pendingByChannel.set(channel, {
+      text: redacted.slice(-pending.length),
+      replacement: pending.replacement,
+    });
+    return redacted.slice(0, -pending.length);
+  }
+
+  sanitizeChunk<T>(channel: string, value: T): T {
+    if (!this.replacements.length) return value;
+    const visit = (entry: unknown, path: readonly (string | number)[]): unknown => {
+      if (typeof entry === "string") {
+        return this.pushText(`${channel}:${stringifyJson(path)}`, entry);
+      }
+      if (Array.isArray(entry)) {
+        return entry.map((child, index) => visit(child, [...path, index]));
+      }
+      const record = asRecord(entry);
+      if (!record) return entry;
+      return Object.fromEntries(
+        Object.entries(record)
+          .filter(([key]) => key !== "sessionId" && key !== "session_id")
+          .map(([key, child]) => [key, visit(child, [...path, key])]),
+      );
+    };
+    return visit(value, []) as T;
+  }
+
+  flushText(channel: string): string {
+    const pending = this.pendingByChannel.get(channel);
+    this.pendingByChannel.delete(channel);
+    return pending?.replacement || "";
+  }
+
+  discardAll(): void {
+    this.pendingByChannel.clear();
+  }
+}
+
 export function sanitizeLocalPdfOutput<T>(value: T, resources: readonly LocalPdfResource[]): T {
   if (!resources.length) return value;
-  const replacements = resources.flatMap((resource) => {
-    const escaped = stringifyJson(resource.absolutePath).slice(1, -1);
-    const replacement = `[local-pdf-path:${resource.sourceKey}]`;
-    return Array.from(new Set([resource.absolutePath, escaped]))
-      .filter(Boolean)
-      .map((pattern) => ({ pattern, replacement }));
-  }).sort((left, right) => right.pattern.length - left.pattern.length);
+  const replacements = buildLocalPdfOutputReplacements(resources);
 
   const visit = (entry: unknown): unknown => {
     if (typeof entry === "string") {
-      return replacements.reduce(
-        (text, replacement) => text.split(replacement.pattern).join(replacement.replacement),
-        entry,
-      );
+      return replaceLocalPdfOutputPatterns(entry, replacements);
     }
     if (Array.isArray(entry)) return entry.map(visit);
     const record = asRecord(entry);

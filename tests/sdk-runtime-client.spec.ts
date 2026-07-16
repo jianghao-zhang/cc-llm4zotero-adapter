@@ -199,7 +199,7 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
     expect(seenPrompt).toContain("normalizedName=drift");
   });
 
-  it("passes exact current-turn PDF paths and parent directories to Claude", async () => {
+  it("passes exact current-turn PDF paths and enforces path-scoped Read access", async () => {
     const firstPdf = await createPdfFile("paper a.pdf");
     const secondPdf = await createPdfFile("paper\nβ\u2028.pdf");
     let seenPrompt = "";
@@ -268,7 +268,39 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
       dirname(firstPdf),
       dirname(secondPdf),
     ]);
-    expect(seenOptions.allowedTools).toContain("Read");
+    expect(seenOptions.allowedTools).toBeUndefined();
+    const hooks = seenOptions.hooks as {
+      PreToolUse?: Array<{
+        matcher?: string;
+        hooks?: Array<(input: unknown, toolUseId: string | undefined, options: unknown) => Promise<unknown>>;
+      }>;
+    };
+    const readMatcher = hooks.PreToolUse?.[0];
+    const readHook = readMatcher?.hooks?.[0];
+    expect(readMatcher?.matcher).toBe("Read");
+    expect(readHook).toBeTypeOf("function");
+    await expect(readHook?.({
+      hook_event_name: "PreToolUse",
+      tool_name: "Read",
+      tool_input: { file_path: firstPdf },
+      tool_use_id: "read-selected",
+    }, "read-selected", {})).resolves.toMatchObject({
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "allow",
+      },
+    });
+    await expect(readHook?.({
+      hook_event_name: "PreToolUse",
+      tool_name: "Read",
+      tool_input: { file_path: join(dirname(firstPdf), "sibling.pdf") },
+      tool_use_id: "read-sibling",
+    }, "read-sibling", {})).resolves.toMatchObject({
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+      },
+    });
     expect(seenOptions.persistSession).toBe(false);
     expect(seenOptions.resume).toBeUndefined();
     expect(seenOptions.continue).toBe(false);
@@ -292,7 +324,7 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
     const stream = await runtime.startTurn({
       conversationKey: "conv-pdf-skill",
       userMessage: "/my-pdf-skill answer with my format",
-      allowedTools: ["Skill"],
+      allowedTools: ["Read", "Skill"],
       runtimeRequest: {
         localDocuments: [{
           kind: "local_pdf",
@@ -310,8 +342,81 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
 
     expect(seenPrompt).toContain("/my-pdf-skill answer with my format");
     expect(seenPrompt).toContain(pdfPath);
-    expect(seenOptions.allowedTools).toEqual(["Read", "Skill"]);
+    expect(seenOptions.allowedTools).toEqual(["Skill"]);
     expect(seenOptions.settingSources).toEqual(["user", "project", "local"]);
+  });
+
+  it("does not carry ephemeral PDF usage into auto-compaction", async () => {
+    const pdfPath = await createPdfFile();
+    const seenPrompts: string[] = [];
+    let queryCount = 0;
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      queryImpl(args) {
+        queryCount += 1;
+        seenPrompts.push(typeof args.prompt === "string" ? args.prompt : "[stream]");
+        if (queryCount === 1) {
+          return makeStream([
+            {
+              type: "assistant",
+              session_id: "ephemeral-pdf-session",
+              message: {
+                content: [{ type: "text", text: "summary" }],
+                usage: { input_tokens: 90, output_tokens: 1 },
+              },
+            },
+            {
+              type: "result",
+              session_id: "ephemeral-pdf-session",
+              result: "summary",
+              is_error: false,
+              modelUsage: { sonnet: { contextWindow: 100 } },
+            },
+          ]);
+        }
+        return makeStream([
+          {
+            type: "result",
+            session_id: "persistent-session",
+            result: "follow-up answer",
+            is_error: false,
+          },
+        ]);
+      },
+    });
+
+    const pdfTurn = await runtime.startTurn({
+      conversationKey: "conv-pdf-usage",
+      userMessage: "read it",
+      metadata: {
+        claudeAutoCompactEligible: true,
+        claudeAutoCompactThresholdPercent: 80,
+      },
+      runtimeRequest: {
+        localDocuments: [{
+          kind: "local_pdf",
+          sourceKey: "zotero-pdf:10:20",
+          itemId: 10,
+          contextItemId: 20,
+          title: "Paper",
+          name: "paper.pdf",
+          mimeType: "application/pdf",
+          absolutePath: pdfPath,
+        }],
+      },
+    });
+    for await (const _event of pdfTurn.events) void _event;
+
+    const followUp = await runtime.startTurn({
+      conversationKey: "conv-pdf-usage",
+      userMessage: "keep this follow-up",
+      metadata: {
+        claudeAutoCompactEligible: true,
+        claudeAutoCompactThresholdPercent: 80,
+      },
+    });
+    for await (const _event of followUp.events) void _event;
+
+    expect(seenPrompts[1]).toBe("keep this follow-up");
   });
 
   it("rejects the whole malformed local PDF batch before SDK query", async () => {
@@ -801,6 +906,73 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
     expect(String(fallbackPrompt)).toContain("old answer");
     expect(String(normalPrompt)).not.toContain("Local Zotero conversation history");
     expect(String(normalPrompt)).not.toContain("old answer");
+  });
+
+  it("preserves history-gap continuity across compact and skill commands", async () => {
+    const pdfPath = await createPdfFile();
+    const seenPrompts: string[] = [];
+    let queryCalls = 0;
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      queryImpl(args) {
+        queryCalls += 1;
+        seenPrompts.push(typeof args.prompt === "string" ? args.prompt : "[stream]");
+        return makeStream([
+          {
+            type: "result",
+            session_id: `session-${queryCalls}`,
+            result: "ok",
+            is_error: false,
+          },
+        ]);
+      },
+    });
+    const sessionMapper = new InMemorySessionMapper();
+    const adapter = new ClaudeCodeRuntimeAdapter({
+      runtimeClient: runtime,
+      sessionMapper,
+    });
+
+    await adapter.runTurn({
+      conversationKey: "conv-gap-command",
+      userMessage: "read the selected PDF",
+      runtimeRequest: {
+        history: [{ role: "user", content: "earlier question" }],
+        localDocuments: [{
+          kind: "local_pdf",
+          sourceKey: "zotero-pdf:10:20",
+          itemId: 10,
+          contextItemId: 20,
+          title: "Paper",
+          name: "paper.pdf",
+          mimeType: "application/pdf",
+          absolutePath: pdfPath,
+        }],
+      },
+    });
+    expect(await sessionMapper.get("conv-gap-command::local-pdf-history-gap")).toBe("1");
+
+    const history = [
+      { role: "user", content: "read the selected PDF" },
+      { role: "assistant", content: "PDF summary" },
+    ];
+    await expect(adapter.runTurn({
+      conversationKey: "conv-gap-command",
+      userMessage: "/compact",
+      runtimeRequest: { history },
+    })).rejects.toThrow("Cannot compact while Claude continuity is being rebuilt");
+    expect(queryCalls).toBe(1);
+    expect(await sessionMapper.get("conv-gap-command::local-pdf-history-gap")).toBe("1");
+
+    await adapter.runTurn({
+      conversationKey: "conv-gap-command",
+      userMessage: "/my-skill compare the result",
+      runtimeRequest: { history },
+    });
+
+    expect(seenPrompts[1]).toMatch(/^\/my-skill compare the result/);
+    expect(seenPrompts[1]).toContain("Local Zotero conversation history");
+    expect(seenPrompts[1]).toContain("PDF summary");
+    expect(await sessionMapper.get("conv-gap-command::local-pdf-history-gap")).toBeUndefined();
   });
 
   it("adapter updates session mapper from streamed sessionId", async () => {

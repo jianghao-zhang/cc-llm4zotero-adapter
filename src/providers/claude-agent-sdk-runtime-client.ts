@@ -1,4 +1,10 @@
-import type { Query, PermissionMode, SDKUserMessage, SettingSource } from "@anthropic-ai/claude-agent-sdk";
+import type {
+  HookCallbackMatcher,
+  PermissionMode,
+  Query,
+  SDKUserMessage,
+  SettingSource,
+} from "@anthropic-ai/claude-agent-sdk";
 import { readFile } from "node:fs/promises";
 import { mkdirSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
@@ -10,6 +16,7 @@ import type { PermissionResult } from "../permissions/permission-store.js";
 import {
   collectLocalPdfs,
   localPdfDirectories,
+  type LocalPdfResource,
   renderLocalPdfPrompt,
   validateLocalPdfs,
 } from "../local-pdf.js";
@@ -194,6 +201,7 @@ type RuntimeRequestShape = {
 type CompactTurnOptions = {
   metadata: Record<string, unknown>;
   autoCompactNeeded: boolean;
+  persistUsageSnapshot?: boolean;
 };
 
 const RUNTIME_EFFORT_DESCENDING: RuntimeEffortLevel[] = ["max", "xhigh", "high", "medium", "low"];
@@ -510,11 +518,18 @@ function buildPromptText(
 ): string {
   const trimmedUserMessage = userMessage.trim();
   const localPdfs = collectLocalPdfs(runtimeRequest);
+  const includeFallbackHistory = metadata?.claudeResumeFallbackHistory === true;
   if (/^\/compact(?:\s|$)/i.test(trimmedUserMessage)) return "/compact";
-  if (trimmedUserMessage.startsWith("/") && !localPdfs.length) return trimmedUserMessage;
+  if (
+    trimmedUserMessage.startsWith("/") &&
+    !localPdfs.length &&
+    !includeFallbackHistory
+  ) {
+    return trimmedUserMessage;
+  }
   const lines: string[] = [trimmedUserMessage];
   if (!runtimeRequest) return lines.join("\n\n");
-  if (metadata?.claudeResumeFallbackHistory === true) {
+  if (includeFallbackHistory) {
     lines.push(...formatFallbackHistory(runtimeRequest));
   }
   const selectedTexts = Array.isArray(runtimeRequest.selectedTexts)
@@ -648,6 +663,37 @@ function mergeAllowedTools(requestAllowedTools: string[] | undefined, defaultAll
     if (normalized && !BLOCKED_ALLOWED_TOOLS.has(normalized)) merged.add(normalized);
   }
   return merged.size > 0 ? Array.from(merged) : undefined;
+}
+
+function buildLocalPdfReadHooks(
+  resources: readonly LocalPdfResource[],
+): { PreToolUse: HookCallbackMatcher[] } | undefined {
+  if (!resources.length) return undefined;
+  const selectedPaths = new Set(resources.map((resource) => resource.absolutePath));
+  return {
+    PreToolUse: [{
+      matcher: "Read",
+      hooks: [async (input) => {
+        if (input.hook_event_name !== "PreToolUse" || input.tool_name !== "Read") {
+          return { continue: true };
+        }
+        const toolInput = asRecord(input.tool_input);
+        const filePath = typeof toolInput?.file_path === "string"
+          ? toolInput.file_path
+          : "";
+        const allowed = Boolean(filePath && selectedPaths.has(filePath));
+        return {
+          hookSpecificOutput: {
+            hookEventName: "PreToolUse",
+            permissionDecision: allowed ? "allow" : "deny",
+            permissionDecisionReason: allowed
+              ? "This exact PDF was selected for the current turn."
+              : "Raw PDF turns may read only exact PDF paths selected for the current turn.",
+          },
+        };
+      }],
+    }],
+  };
 }
 function isRuntimeEffortLevel(value: unknown): value is RuntimeEffortLevel {
   return value === "low" || value === "medium" || value === "high" || value === "xhigh" || value === "max";
@@ -985,8 +1031,14 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
   async startTurn(request: RuntimeTurnRequest): Promise<RuntimeTurnStream> {
     const metadata = parseMetadata(request.metadata, this.options);
     const localPdfs = collectLocalPdfs(toRuntimeRequest(request, metadata));
-    if (localPdfs.length && /^\/compact(?:\s|$)/i.test(request.userMessage.trim())) {
+    const isCompactTurn = /^\/compact(?:\s|$)/i.test(request.userMessage.trim());
+    if (localPdfs.length && isCompactTurn) {
       throw new Error("Cannot compact a raw PDF turn. Send the PDF request as a normal message.");
+    }
+    if (metadata.claudeResumeFallbackHistory === true && isCompactTurn) {
+      throw new Error(
+        "Cannot compact while Claude continuity is being rebuilt. Send a normal message first.",
+      );
     }
     await validateLocalPdfs(localPdfs);
     const probeId = typeof metadata.retentionProbeId === "string" ? metadata.retentionProbeId : undefined;
@@ -1030,7 +1082,11 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       const stream = await this.startColdTurn({
         ...request,
         providerSessionId: undefined,
-      }, { metadata, autoCompactNeeded: false });
+      }, {
+        metadata,
+        autoCompactNeeded: false,
+        persistUsageSnapshot: false,
+      });
       async function* withProfiling() {
         yield createProfilingEvent(request.conversationKey, "runtime.start_turn.local_pdf_ephemeral", hotEntrySnapshot);
         for await (const event of stream.events) yield event;
@@ -1569,6 +1625,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
         queryOptions,
         shouldInjectCompact || /^\/compact(?:\s|$)/i.test(request.userMessage.trim()),
         permissionEvents,
+        options?.persistUsageSnapshot !== false,
       ),
     };
   }
@@ -1582,6 +1639,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     initialQueryOptions: Record<string, unknown>,
     awaitingAutoCompact = false,
     permissionEvents = createProviderEventQueue(),
+    persistUsageSnapshot = true,
   ): AsyncIterable<ProviderEvent> {
     const hotRuntimePool = this.hotRuntimePool;
     const getLiveContextUsageSnapshot = this.getLiveContextUsageSnapshot.bind(this);
@@ -1673,7 +1731,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
                 if (event.type === "message_delta" || event.type === "tool_call" || event.type === "final") {
                   sawModelOutput = true;
                 }
-                if (event.type === "usage") {
+                if (event.type === "usage" && persistUsageSnapshot) {
                   const payload = event.payload as Record<string, unknown>;
                   const nextContextTokens = Number(payload.contextTokens);
                   const nextContextWindow = Number(payload.contextWindow);
@@ -1692,7 +1750,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
                     liveEntry.lastUsageSnapshot = merged;
                   }
                 }
-                if (event.type === "context_compacted") {
+                if (event.type === "context_compacted" && persistUsageSnapshot) {
                   const liveSnapshot = await getLiveContextUsageSnapshot(sdkStream);
                   if (liveSnapshot) {
                     const merged = mergeUsageSnapshot(request.conversationKey, liveSnapshot);
@@ -1957,6 +2015,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     const runtimeRequest = toRuntimeRequest(request, metadata);
     const localPdfs = collectLocalPdfs(runtimeRequest);
     const localDocumentDirectories = localPdfDirectories(localPdfs);
+    const localPdfReadHooks = buildLocalPdfReadHooks(localPdfs);
     const configuredAdditionalDirectories = (this.options.additionalDirectories || [])
       .map((entry) => entry.trim())
       .filter(Boolean);
@@ -2021,6 +2080,13 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       effortSuccessKey,
     });
     const effectivePermissionMode = permissionModeOverride ?? this.options.permissionMode;
+    const mergedAllowedTools = mergeAllowedTools(
+      request.allowedTools,
+      this.options.defaultAllowedTools,
+    );
+    const allowedTools = localPdfs.length
+      ? mergedAllowedTools?.filter((tool) => tool !== "Read")
+      : mergedAllowedTools;
     const canUseTool =
       effectivePermissionMode === "bypassPermissions"
         ? undefined
@@ -2070,12 +2136,8 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
         additionalDirectories: additionalDirectories.length
           ? additionalDirectories
           : undefined,
-        allowedTools: mergeAllowedTools(
-          request.allowedTools,
-          localPdfs.length
-            ? [...(this.options.defaultAllowedTools ?? []), "Read"]
-            : this.options.defaultAllowedTools,
-        ),
+        allowedTools: allowedTools?.length ? allowedTools : undefined,
+        hooks: localPdfReadHooks ?? metadata.hooks,
         mcpServers,
         settingSources: effectiveSettingSources,
         permissionMode: effectivePermissionMode,

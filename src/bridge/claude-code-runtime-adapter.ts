@@ -391,6 +391,31 @@ export class ClaudeCodeRuntimeAdapter {
     let finalText = "";
     let pendingTextDelta = "";
     let lastTextDeltaTs: number | undefined;
+    let lastReasoningRound = 1;
+    let lastReasoningTs: number | undefined;
+
+    const sanitizeReasoningEvent = (event: AgentEvent): AgentEvent => {
+      const sanitized = sanitizeLocalPdfOutput(event, localPdfs);
+      if (event.type !== "reasoning") return sanitized;
+      const payload = event.payload && typeof event.payload === "object"
+        ? (event.payload as Record<string, unknown>)
+        : {};
+      const sanitizedPayload = sanitized.payload && typeof sanitized.payload === "object"
+        ? (sanitized.payload as Record<string, unknown>)
+        : {};
+      if (typeof payload.details !== "string") return sanitized;
+      if (typeof payload.round === "number" && Number.isFinite(payload.round)) {
+        lastReasoningRound = payload.round;
+      }
+      lastReasoningTs = event.ts;
+      return {
+        ...sanitized,
+        payload: {
+          ...sanitizedPayload,
+          details: outputStreamSanitizer.pushText("reasoning", payload.details),
+        },
+      };
+    };
 
     const emitTextDelta = async (
       redactedDelta: string,
@@ -432,6 +457,19 @@ export class ClaudeCodeRuntimeAdapter {
       );
     };
 
+    const flushHeldReasoning = async (): Promise<void> => {
+      const details = outputStreamSanitizer.flushText("reasoning");
+      if (!details) return;
+      await this.emitEvent(stream.runId, request.conversationKey, {
+        type: "reasoning",
+        ts: lastReasoningTs ?? Date.now(),
+        payload: {
+          round: lastReasoningRound,
+          details,
+        },
+      }, hooks);
+    };
+
     try {
       for await (const providerEvent of stream.events) {
         const mappedEvent = mapProviderEvent(providerEvent);
@@ -443,6 +481,8 @@ export class ClaudeCodeRuntimeAdapter {
             : undefined;
         const event = mappedEvent.type === "message_delta"
           ? mappedEvent
+          : mappedEvent.type === "reasoning"
+            ? sanitizeReasoningEvent(mappedEvent)
           : mappedProviderType === "stream_event"
             ? outputStreamSanitizer.sanitizeChunk(
                 "provider_event:stream_event",
@@ -484,6 +524,7 @@ export class ClaudeCodeRuntimeAdapter {
         await flushPendingTextDelta();
         if (event.type === "final") {
           await flushHeldTextDelta();
+          await flushHeldReasoning();
         }
         if (event.type === "final") {
           const output = event.payload.output;
@@ -506,6 +547,7 @@ export class ClaudeCodeRuntimeAdapter {
 
       await flushPendingTextDelta();
       await flushHeldTextDelta();
+      await flushHeldReasoning();
       outputStreamSanitizer.discardAll();
       this.logStreamingTiming("return_outcome", {
         conversationKey: request.conversationKey,

@@ -146,6 +146,14 @@ describe("ClaudeCodeRuntimeAdapter", () => {
                 payload: { delta: `Read ${firstPathChunk}`, sessionId: "ephemeral-session" },
               },
               {
+                type: "reasoning",
+                payload: {
+                  round: 1,
+                  details: firstPathChunk,
+                  sessionId: "ephemeral-session",
+                },
+              },
+              {
                 type: "provider_event",
                 payload: {
                   providerType: "stream_event",
@@ -156,6 +164,14 @@ describe("ClaudeCodeRuntimeAdapter", () => {
               {
                 type: "message_delta",
                 payload: { delta: secondPathChunk, sessionId: "ephemeral-session" },
+              },
+              {
+                type: "reasoning",
+                payload: {
+                  round: 1,
+                  details: secondPathChunk,
+                  sessionId: "ephemeral-session",
+                },
               },
               {
                 type: "tool_call",

@@ -571,4 +571,23 @@ export class Llm4ZoteroAgentBackendAdapter {
     }
     return "";
   }
+
+  /**
+   * Get performance metrics for monitoring.
+   */
+  getMetrics(): {
+    permissionStore: { pendingCount: number; maxPending: number; totalCreated: number; totalResolved: number; totalTimedOut: number; totalCleanedUp: number };
+    runtimePool: { entryCount: number; maxEntries: number; activeMounts: number; idleEntries: number };
+    sessionMapper: { cacheSize: number; pendingWrites: number; compactionCounter: number };
+    traceStore: { bufferSize: number };
+    modelCache: { entryCount: number; totalModels: number; oldestEntryAge: number };
+  } {
+    return {
+      permissionStore: globalPermissionStore.getStats(),
+      runtimePool: this.adapter.getRuntimePoolStats(),
+      sessionMapper: this.adapter.getSessionMapperStats(),
+      traceStore: this.adapter.getTraceStoreStats(),
+      modelCache: this.adapter.getModelCacheStats(),
+    };
+  }
 }

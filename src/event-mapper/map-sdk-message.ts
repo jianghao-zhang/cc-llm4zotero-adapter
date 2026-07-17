@@ -1,7 +1,6 @@
 import type { ProviderEvent } from "../runtime.js";
 import { globalPermissionStore } from "../permissions/permission-store.js";
 
-
 interface ClaudeContentBlock {
   type?: string;
   id?: string;
@@ -202,19 +201,34 @@ function extractResultOutput(msg: Record<string, unknown>): string {
   return "";
 }
 
+/**
+ * Create a lightweight provider_event that only includes essential fields.
+ * Avoids embedding the full raw message to reduce serialization overhead.
+ */
+function createLightweightProviderEvent(
+  type: string,
+  sessionId: string | undefined,
+  ts: number,
+  essentialPayload?: Record<string, unknown>
+): ProviderEvent {
+  const payload: Record<string, unknown> = {
+    providerType: type,
+    sessionId,
+    ts,
+  };
+  if (essentialPayload) {
+    payload.payload = essentialPayload;
+  }
+  return {
+    type: "provider_event",
+    payload,
+  };
+}
+
 export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
   const msg = asRecord(raw);
   const type = typeof msg.type === "string" ? msg.type : "unknown";
   const sessionId = getSessionId(msg);
-  const providerEvent: ProviderEvent = {
-    type: "provider_event",
-    payload: {
-      providerType: type,
-      sessionId,
-      ts: Date.now(),
-      payload: msg,
-    },
-  };
 
   if (type === "confirmation_required") {
     const requestId =
@@ -222,7 +236,7 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
       (typeof msg.request_id === "string" && msg.request_id.trim()) ||
       "";
     if (!requestId) {
-      return [providerEvent];
+      return [createLightweightProviderEvent(type, sessionId, Date.now())];
     }
     const actionCandidate =
       (msg.action && typeof msg.action === "object" ? msg.action : undefined) ??
@@ -239,7 +253,7 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
       (typeof msg.name === "string" && msg.name === "AskUserQuestion") ||
       (typeof msg.message === "string" && msg.message.includes("AskUserQuestion"));
     if (!looksLikeSdkPermission && !isAskUserQuestion && !actionCandidate) {
-      return [providerEvent];
+      return [createLightweightProviderEvent(type, sessionId, Date.now())];
     }
     const action =
       (actionCandidate as Record<string, unknown> | undefined) ?? {
@@ -253,7 +267,7 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
         fields: Array.isArray(msg.fields) ? msg.fields : [],
       };
     return [
-      providerEvent,
+      createLightweightProviderEvent(type, sessionId, Date.now(), { requestId }),
       {
         type: "confirmation_required",
         payload: {
@@ -271,10 +285,10 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
       (typeof msg.request_id === "string" && msg.request_id.trim()) ||
       "";
     if (!requestId) {
-      return [providerEvent];
+      return [createLightweightProviderEvent(type, sessionId, Date.now())];
     }
     return [
-      providerEvent,
+      createLightweightProviderEvent(type, sessionId, Date.now(), { requestId }),
       {
         type: "confirmation_resolved",
         payload: {
@@ -289,10 +303,10 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
   }
 
   if (type === "assistant") {
-    const events: ProviderEvent[] = [providerEvent];
+    const events: ProviderEvent[] = [createLightweightProviderEvent(type, sessionId, Date.now())];
     const message = asRecord(msg.message) as MessageContainer;
     const contentBlocks = Array.isArray(message.content) ? message.content : [];
-     const parentToolUseId =
+    const parentToolUseId =
       (typeof msg.parent_tool_use_id === "string" && msg.parent_tool_use_id.trim())
         ? msg.parent_tool_use_id.trim()
         : null;
@@ -347,7 +361,7 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
   }
 
   if (type === "user") {
-    const events: ProviderEvent[] = [providerEvent];
+    const events: ProviderEvent[] = [createLightweightProviderEvent(type, sessionId, Date.now())];
     const message = asRecord(msg.message) as MessageContainer;
     for (const block of Array.isArray(message.content) ? message.content : []) {
       if (block.type === "tool_result") {
@@ -365,12 +379,12 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
     if (events.length > 1) {
       return events;
     }
-    return [providerEvent];
+    return [createLightweightProviderEvent(type, sessionId, Date.now())];
   }
 
   if (type === "result") {
     const output = extractResultOutput(msg);
-    const events: ProviderEvent[] = [providerEvent];
+    const events: ProviderEvent[] = [createLightweightProviderEvent(type, sessionId, Date.now())];
     const contextWindowEvent = normalizeContextWindowPayload({
       modelUsage: asRecord(msg.modelUsage) as Record<string, ModelUsageEntry> | undefined,
       sessionId,
@@ -396,7 +410,7 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
     const subtype = typeof msg.subtype === "string" ? msg.subtype.trim() : "";
     if (subtype === "compact_boundary") {
       return [
-        providerEvent,
+        createLightweightProviderEvent(type, sessionId, Date.now(), { subtype }),
         {
           type: "context_compacted",
           payload: {
@@ -421,7 +435,7 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
                 ? `System event: ${subtype}`
                 : "System event";
     return [
-      providerEvent,
+      createLightweightProviderEvent(type, sessionId, Date.now(), { subtype }),
       {
         type: "status",
         payload: {
@@ -436,7 +450,7 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
 
   if (type === "tool_progress") {
     return [
-      providerEvent,
+      createLightweightProviderEvent(type, sessionId, Date.now()),
       {
         type: "status",
         payload: {
@@ -456,13 +470,15 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
         sessionId,
         includeOutputTokens: true,
       });
-      return usageEvent ? [providerEvent, usageEvent] : [providerEvent];
+      return usageEvent
+        ? [createLightweightProviderEvent(type, sessionId, Date.now()), usageEvent]
+        : [createLightweightProviderEvent(type, sessionId, Date.now())];
     }
     if (event.type === "content_block_start") {
       const contentBlock = asRecord(event.content_block);
       if (contentBlock.type === "tool_use") {
         return [
-          providerEvent,
+          createLightweightProviderEvent(type, sessionId, Date.now()),
           {
             type: "tool_call",
             payload: {
@@ -479,7 +495,7 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
       const delta = asRecord(event.delta);
       if (delta.type === "text_delta" && typeof delta.text === "string") {
         return [
-          providerEvent,
+          createLightweightProviderEvent(type, sessionId, Date.now()),
           {
             type: "message_delta",
             payload: {
@@ -494,7 +510,7 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
         const thinking = typeof delta.thinking === "string" ? delta.thinking : "";
         if (thinking) {
           return [
-            providerEvent,
+            createLightweightProviderEvent(type, sessionId, Date.now()),
             {
               type: "reasoning",
               payload: {
@@ -510,7 +526,7 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
         const thinking = typeof delta.text === "string" ? delta.text : "";
         if (thinking) {
           return [
-            providerEvent,
+            createLightweightProviderEvent(type, sessionId, Date.now()),
             {
               type: "reasoning",
               payload: {
@@ -525,5 +541,5 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
     }
   }
 
-  return [providerEvent];
+  return [createLightweightProviderEvent(type, sessionId, Date.now())];
 }

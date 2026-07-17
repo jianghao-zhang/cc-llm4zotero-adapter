@@ -285,9 +285,11 @@ async function main() {
     sessionMapper: new JsonFileSessionMapper(
       `${stateDirResolved}/session-links/sessions.json`,
     ),
-    traceStore: new JsonFileTraceStore(
-      `${stateDirResolved}/turn-traces/trace.json`,
-    ),
+    // TraceStore disabled by default for better performance
+    // Enable only for debugging: traceStore: new JsonFileTraceStore(...)
+    traceStore: process.env.LLM4ZOTERO_ENABLE_TRACE === "1"
+      ? new JsonFileTraceStore(`${stateDirResolved}/turn-traces/trace.json`)
+      : undefined,
   });
 
   const compat = new Llm4ZoteroAgentBackendAdapter({

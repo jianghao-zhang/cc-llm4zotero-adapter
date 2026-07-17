@@ -44,9 +44,40 @@ export type PendingPermissionEvent = {
   input: Record<string, unknown>;
 };
 
+export interface PermissionStoreOptions {
+  defaultTimeoutMs?: number;
+  maxPendingRequests?: number;
+  cleanupIntervalMs?: number;
+}
+
+/**
+ * Permission store with improved timeout handling and monitoring.
+ *
+ * Features:
+ * - Configurable timeout and max pending requests
+ * - Periodic cleanup of orphaned requests
+ * - Statistics for monitoring
+ */
 export class PermissionStore {
   private pending = new Map<string, PendingPermission>();
-  private readonly defaultTimeoutMs = 300_000; // 5 minutes
+  private readonly defaultTimeoutMs: number;
+  private readonly maxPendingRequests: number;
+  private cleanupTimer: ReturnType<typeof setTimeout> | null = null;
+  private stats = {
+    totalCreated: 0,
+    totalResolved: 0,
+    totalTimedOut: 0,
+    totalCleanedUp: 0,
+  };
+
+  constructor(options?: PermissionStoreOptions) {
+    this.defaultTimeoutMs = options?.defaultTimeoutMs ?? 300_000; // 5 minutes
+    this.maxPendingRequests = options?.maxPendingRequests ?? 100;
+
+    // Start periodic cleanup
+    const cleanupInterval = options?.cleanupIntervalMs ?? 60_000; // 1 minute
+    this.cleanupTimer = setInterval(() => this.cleanupOrphaned(), cleanupInterval);
+  }
 
   create(
     toolUseID: string,
@@ -60,7 +91,17 @@ export class PermissionStore {
       decisionReason?: string;
     }
   ): { requestId: string; promise: Promise<PermissionResult> } {
+    // Check capacity
+    if (this.pending.size >= this.maxPendingRequests) {
+      // Force cleanup of oldest pending request
+      const oldestKey = this.findOldestPendingKey();
+      if (oldestKey) {
+        this.forceDeny(oldestKey, "Request superseded due to capacity limit");
+      }
+    }
+
     const requestId = `perm-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    this.stats.totalCreated++;
 
     const promise = new Promise<PermissionResult>((resolve, reject) => {
       const pending: PendingPermission = {
@@ -77,14 +118,7 @@ export class PermissionStore {
         resolve,
         reject,
         timeoutId: setTimeout(() => {
-          // Timeout: auto-deny instead of reject to avoid SDK errors
-          this.pending.delete(requestId);
-          resolve({
-            behavior: "deny",
-            message: `Permission request timed out after ${this.defaultTimeoutMs}ms`,
-            interrupt: false,
-            toolUseID,
-          });
+          this.handleTimeout(requestId, toolUseID);
         }, this.defaultTimeoutMs),
       };
 
@@ -92,6 +126,81 @@ export class PermissionStore {
     });
 
     return { requestId, promise };
+  }
+
+  private handleTimeout(requestId: string, toolUseID: string): void {
+    const pending = this.pending.get(requestId);
+    if (!pending) return;
+
+    this.pending.delete(requestId);
+    this.stats.totalTimedOut++;
+
+    // Log timeout for debugging
+    console.warn(
+      `[permission-store] Request ${requestId} timed out after ${this.defaultTimeoutMs}ms (tool: ${pending.toolName})`
+    );
+
+    pending.resolve({
+      behavior: "deny",
+      message: `Permission request timed out after ${Math.round(this.defaultTimeoutMs / 1000)}s`,
+      interrupt: false,
+      toolUseID,
+    });
+  }
+
+  private forceDeny(requestId: string, reason: string): void {
+    const pending = this.pending.get(requestId);
+    if (!pending) return;
+
+    if (pending.timeoutId) {
+      clearTimeout(pending.timeoutId);
+    }
+
+    this.pending.delete(requestId);
+    this.stats.totalCleanedUp++;
+
+    pending.resolve({
+      behavior: "deny",
+      message: reason,
+      interrupt: false,
+      toolUseID: pending.toolUseID,
+    });
+  }
+
+  private findOldestPendingKey(): string | null {
+    let oldestKey: string | null = null;
+    let oldestTime = Infinity;
+
+    for (const [key, pending] of this.pending) {
+      if (pending.createdAt < oldestTime) {
+        oldestTime = pending.createdAt;
+        oldestKey = key;
+      }
+    }
+
+    return oldestKey;
+  }
+
+  /**
+   * Cleanup orphaned requests that are older than 2x the timeout.
+   */
+  private cleanupOrphaned(): void {
+    const orphanThreshold = Date.now() - (2 * this.defaultTimeoutMs);
+    const keysToRemove: string[] = [];
+
+    for (const [key, pending] of this.pending) {
+      if (pending.createdAt < orphanThreshold) {
+        keysToRemove.push(key);
+      }
+    }
+
+    for (const key of keysToRemove) {
+      this.forceDeny(key, "Request cleaned up as orphaned");
+    }
+
+    if (keysToRemove.length > 0) {
+      console.log(`[permission-store] Cleaned up ${keysToRemove.length} orphaned requests`);
+    }
   }
 
   resolve(
@@ -134,6 +243,7 @@ export class PermissionStore {
     }
 
     this.pending.delete(requestId);
+    this.stats.totalResolved++;
     return true;
   }
 
@@ -165,7 +275,33 @@ export class PermissionStore {
     return Array.from(this.pending.keys()).slice(-limit);
   }
 
+  /**
+   * Get statistics for monitoring.
+   */
+  getStats(): {
+    pendingCount: number;
+    maxPending: number;
+    totalCreated: number;
+    totalResolved: number;
+    totalTimedOut: number;
+    totalCleanedUp: number;
+  } {
+    return {
+      pendingCount: this.pending.size,
+      maxPending: this.maxPendingRequests,
+      ...this.stats,
+    };
+  }
+
+  /**
+   * Cleanup all pending requests and stop cleanup timer.
+   */
   cleanup(): void {
+    if (this.cleanupTimer) {
+      clearInterval(this.cleanupTimer);
+      this.cleanupTimer = null;
+    }
+
     for (const [, p] of this.pending) {
       if (p.timeoutId) clearTimeout(p.timeoutId);
       p.reject(new Error("Permission store cleanup"));

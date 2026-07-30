@@ -146,6 +146,40 @@ Returns Claude slash commands.
 
 - Query: `settingSources=user,project,local` (optional)
 
+### GET `/models`
+
+Returns the ordered model catalog reported by Claude Code for the active settings stack.
+
+- Query: `settingSources=user,project,local` (optional)
+- Query: `conversationKey`, `scopeType`, `scopeId`, `scopeLabel` (optional; use together to discover models from the same scoped conversation directory as a turn)
+
+The response keeps the legacy `models` string array and adds structured `modelInfos` metadata:
+
+```json
+{
+  "models": ["default", "opus[1m]", "claude-fable-5[1m]"],
+  "modelInfos": [
+    {
+      "value": "default",
+      "resolvedModel": "claude-opus-5[1m]",
+      "displayName": "Default",
+      "description": "Current account default",
+      "supportsEffort": true,
+      "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"],
+      "supportsAdaptiveThinking": true,
+      "supportsFastMode": false,
+      "supportsAutoMode": true
+    }
+  ]
+}
+```
+
+Model values are opaque Claude Code identifiers and are returned without removing context suffixes such as `[1m]`.
+When Claude Code returns a catalog successfully, that catalog is authoritative, including an intentionally empty or settings-restricted result.
+Settings and environment values are synthesized only when model discovery itself fails.
+When conversation and scope query parameters are provided, catalog discovery uses the same contained runtime directory and `.claude/settings.local.json` stack as the corresponding turn.
+The health endpoint advertises this response contract through the `model_catalog_v1` capability.
+
 ### GET `/session-info`
 
 Returns session mapping information for a conversation.
@@ -200,7 +234,7 @@ npm run serve:bridge
 | `--setting-sources` | `ADAPTER_SETTING_SOURCES` | Claude settings sources: `user`, `project`, `local` (comma-separated). Default: `user,project,local`. |
 | `--append-system-prompt` | `ADAPTER_APPEND_SYSTEM_PROMPT` | Inline overlay prompt text. |
 | `--append-system-prompt-file` | `ADAPTER_APPEND_SYSTEM_PROMPT_FILE` | File-based overlay prompt. Missing optional files are ignored. |
-| `--forward-frontend-model` | `ADAPTER_FORWARD_FRONTEND_MODEL` | Pass frontend `metadata.model` to runtime (default `true`). Generic aliases like `opus`, `sonnet`, and `haiku` are forwarded when the SDK accepts them. |
+| `--forward-frontend-model` | `ADAPTER_FORWARD_FRONTEND_MODEL` | Pass every non-empty frontend `metadata.model` value to Claude Code unchanged (default `true`). Claude Code resolves aliases, custom provider names, and future model families. |
 | `--log-file` | `ADAPTER_LOG_FILE` | Mirror bridge stdout/stderr to a file. Use `1` / `true` to write to `<state-dir>/bridge.log`. |
 
 Default additional readable directories:

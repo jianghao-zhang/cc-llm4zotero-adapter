@@ -52,6 +52,23 @@ export interface McpServerStatus {
   }>;
 }
 
+export interface RuntimeModelInfo {
+  value: string;
+  resolvedModel?: string;
+  displayName?: string;
+  description?: string;
+  supportsEffort?: boolean;
+  supportedEffortLevels?: string[];
+  supportsAdaptiveThinking?: boolean;
+  supportsFastMode?: boolean;
+  supportsAutoMode?: boolean;
+}
+
+export interface RuntimeModelCatalog {
+  models: string[];
+  modelInfos?: RuntimeModelInfo[];
+}
+
 export interface ClaudeCodeRuntimeClient {
   startTurn(request: RuntimeTurnRequest): Promise<RuntimeTurnStream>;
   retainHotRuntime?(request: RuntimeTurnRequest, mountId: string): Promise<void>;
@@ -67,8 +84,10 @@ export interface ClaudeCodeRuntimeClient {
   listModels?(
     options?: {
       settingSources?: Array<"user" | "project" | "local">;
+      runtimeCwdRelative?: string;
+      forceRefresh?: boolean;
     }
-  ): Promise<string[]>;
+  ): Promise<Array<RuntimeModelInfo | string>>;
   listEfforts?(
     options?: {
       model?: string;

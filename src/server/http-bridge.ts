@@ -302,7 +302,7 @@ export async function startHttpBridgeServer(
         sendJson(res, 200, {
           ok: true,
           protocolVersion: 2,
-          capabilities: ["local_pdf_paths"],
+          capabilities: ["local_pdf_paths", "model_catalog_v1"],
           ts: Date.now(),
         });
         return;
@@ -339,8 +339,32 @@ export async function startHttpBridgeServer(
         const settingSources = parseSettingSources(
           reqUrl.searchParams.get("settingSources"),
         );
-        const models = await options.adapter.listModels({ settingSources });
-        sendJson(res, 200, { models });
+        const conversationKey = parseConversationKey(
+          reqUrl.searchParams.get("conversationKey"),
+        );
+        const scopeType = parseScopeType(reqUrl.searchParams.get("scopeType"));
+        const scopeIdRaw = reqUrl.searchParams.get("scopeId");
+        const scopeLabelRaw = reqUrl.searchParams.get("scopeLabel");
+        const scopeId =
+          typeof scopeIdRaw === "string" && scopeIdRaw.trim().length > 0
+            ? scopeIdRaw.trim()
+            : undefined;
+        const scopeLabel =
+          typeof scopeLabelRaw === "string" && scopeLabelRaw.trim().length > 0
+            ? scopeLabelRaw.trim()
+            : undefined;
+        const forceRefresh =
+          reqUrl.searchParams.get("refresh") === "1" ||
+          reqUrl.searchParams.get("refresh") === "true";
+        const catalog = await options.adapter.listModels({
+          settingSources,
+          conversationKey,
+          scopeType,
+          scopeId,
+          scopeLabel,
+          forceRefresh,
+        });
+        sendJson(res, 200, catalog);
         return;
       }
 

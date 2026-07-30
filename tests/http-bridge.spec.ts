@@ -44,7 +44,166 @@ describe("http bridge server", () => {
       expect(await response.json()).toMatchObject({
         ok: true,
         protocolVersion: 2,
-        capabilities: ["local_pdf_paths"],
+        capabilities: ["local_pdf_paths", "model_catalog_v1"],
+      });
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("returns structured model metadata alongside the legacy string list", async () => {
+    const runtimeClient: ClaudeCodeRuntimeClient = {
+      async startTurn() {
+        return {
+          runId: "run-http-models",
+          events: providerEvents([]),
+        };
+      },
+      async listModels() {
+        return [
+          {
+            value: "default",
+            resolvedModel: "claude-opus-5[1m]",
+            displayName: "Default",
+            description: "Current account default",
+            supportsEffort: true,
+            supportedEffortLevels: ["low", "high", "max"],
+            supportsAdaptiveThinking: true,
+            supportsFastMode: false,
+            supportsAutoMode: true,
+          },
+          {
+            value: "claude-fable-5[1m]",
+            displayName: "Fable",
+          },
+          "LegacyProvider/Model-X",
+        ];
+      },
+    };
+    const base = new ClaudeCodeRuntimeAdapter({
+      runtimeClient,
+      sessionMapper: new InMemorySessionMapper(),
+    });
+    const server = await startHttpBridgeServer({
+      adapter: new Llm4ZoteroAgentBackendAdapter({ adapter: base }),
+    });
+
+    try {
+      const response = await fetch(
+        `http://${server.host}:${server.port}/models`,
+      );
+      expect(response.ok).toBe(true);
+      expect(await response.json()).toEqual({
+        models: ["default", "claude-fable-5[1m]", "LegacyProvider/Model-X"],
+        modelInfos: [
+          {
+            value: "default",
+            resolvedModel: "claude-opus-5[1m]",
+            displayName: "Default",
+            description: "Current account default",
+            supportsEffort: true,
+            supportedEffortLevels: ["low", "high", "max"],
+            supportsAdaptiveThinking: true,
+            supportsFastMode: false,
+            supportsAutoMode: true,
+          },
+          {
+            value: "claude-fable-5[1m]",
+            displayName: "Fable",
+          },
+          {
+            value: "LegacyProvider/Model-X",
+          },
+        ],
+      });
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("discovers models in the same derived scoped directory as the turn", async () => {
+    let seenOptions:
+      | {
+          settingSources?: Array<"user" | "project" | "local">;
+          runtimeCwdRelative?: string;
+        }
+      | undefined;
+    const runtimeClient: ClaudeCodeRuntimeClient = {
+      async startTurn() {
+        return {
+          runId: "run-http-scoped-models",
+          events: providerEvents([]),
+        };
+      },
+      async listModels(options) {
+        seenOptions = options;
+        return [{ value: "ScopedModel" }];
+      },
+    };
+    const base = new ClaudeCodeRuntimeAdapter({
+      runtimeClient,
+      sessionMapper: new InMemorySessionMapper(),
+    });
+    const server = await startHttpBridgeServer({
+      adapter: new Llm4ZoteroAgentBackendAdapter({ adapter: base }),
+    });
+
+    try {
+      const params = new URLSearchParams({
+        settingSources: "project,local",
+        conversationKey: "0042",
+        scopeType: "paper",
+        scopeId: "profile-test:1:42",
+        scopeLabel: "Paper 42",
+        refresh: "1",
+      });
+      const response = await fetch(
+        `http://${server.host}:${server.port}/models?${params}`,
+      );
+
+      expect(response.ok).toBe(true);
+      expect(await response.json()).toEqual({
+        models: ["ScopedModel"],
+        modelInfos: [{ value: "ScopedModel" }],
+      });
+      expect(seenOptions).toEqual({
+        settingSources: ["project", "local"],
+        runtimeCwdRelative:
+          "profile-test/scopes/paper/profile-test:1:42/conversations/0042",
+        forceRefresh: true,
+      });
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("reports model catalog discovery failures instead of returning an authoritative empty catalog", async () => {
+    const runtimeClient: ClaudeCodeRuntimeClient = {
+      async startTurn() {
+        return {
+          runId: "run-http-model-error",
+          events: providerEvents([]),
+        };
+      },
+      async listModels() {
+        throw new Error("catalog probe failed");
+      },
+    };
+    const base = new ClaudeCodeRuntimeAdapter({
+      runtimeClient,
+      sessionMapper: new InMemorySessionMapper(),
+    });
+    const server = await startHttpBridgeServer({
+      adapter: new Llm4ZoteroAgentBackendAdapter({ adapter: base }),
+    });
+
+    try {
+      const response = await fetch(
+        `http://${server.host}:${server.port}/models`,
+      );
+      expect(response.status).toBe(500);
+      expect(await response.json()).toEqual({
+        error: "catalog probe failed",
       });
     } finally {
       await server.close();

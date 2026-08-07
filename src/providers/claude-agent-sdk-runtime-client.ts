@@ -996,19 +996,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
   }
 
   async retainHotRuntime(request: RuntimeTurnRequest, mountId: string): Promise<void> {
-    const metadata = parseMetadata(request.metadata, this.options);
-    const probeId = typeof metadata.retentionProbeId === "string" ? metadata.retentionProbeId : undefined;
-    const entry = this.hotRuntimePool.retain(request.conversationKey, mountId);
-    entry.lastUsageSnapshot = entry.lastUsageSnapshot;
-    console.log("[RETENTION_PROBE]", JSON.stringify({
-      stage: "runtime.retain_hot_runtime",
-      probeId,
-      conversationKey: request.conversationKey,
-      mountId,
-      runtimeClientInstanceId: this.runtimeClientInstanceId,
-      hotRuntimePoolInstanceId: this.hotRuntimePoolInstanceId,
-      mountCount: entry.mounts.size,
-    }));
+    this.hotRuntimePool.retain(request.conversationKey, mountId);
   }
 
   async warmHotRuntime(request: RuntimeTurnRequest): Promise<void> {

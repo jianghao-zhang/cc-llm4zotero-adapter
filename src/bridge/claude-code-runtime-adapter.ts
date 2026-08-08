@@ -1,4 +1,4 @@
-import type { ClaudeCodeRuntimeClient } from "../runtime.js";
+import type { ClaudeCodeRuntimeClient, RuntimeModelInfo } from "../runtime.js";
 import type { SessionMapper } from "../session-link/session-mapper.js";
 import type { TraceStore } from "../trace-store/trace-store.js";
 import type { AgentEvent, RunTurnHooks, RunTurnOutcome, RunTurnRequest } from "../types.js";
@@ -58,19 +58,27 @@ export class ClaudeCodeRuntimeAdapter {
     );
   }
 
-  async listRuntimeModels(
-    options?: {
-      settingSources?: Array<"user" | "project" | "local">;
-    },
-  ): Promise<string[]> {
+  async listRuntimeModels(options?: {
+    settingSources?: Array<"user" | "project" | "local">;
+    runtimeCwdRelative?: string;
+    forceRefresh?: boolean;
+  }): Promise<RuntimeModelInfo[]> {
     if (typeof this.runtimeClient.listModels !== "function") {
-      return [];
+      throw new Error("Claude Code runtime model catalog is unavailable");
     }
-    try {
-      return await this.runtimeClient.listModels(options);
-    } catch {
-      return [];
+    const entries = await this.runtimeClient.listModels(options);
+    const modelInfos: RuntimeModelInfo[] = [];
+    const seen = new Set<string>();
+    for (const entry of entries) {
+      const value =
+        typeof entry === "string" ? entry.trim() : entry.value.trim();
+      if (!value || seen.has(value)) continue;
+      seen.add(value);
+      modelInfos.push(
+        typeof entry === "string" ? { value } : { ...entry, value },
+      );
     }
+    return modelInfos;
   }
 
   async listRuntimeCommands(
@@ -92,6 +100,7 @@ export class ClaudeCodeRuntimeAdapter {
     options?: {
       model?: string;
       settingSources?: Array<"user" | "project" | "local">;
+      runtimeCwdRelative?: string;
     },
   ): Promise<string[]> {
     if (typeof this.runtimeClient.listEfforts !== "function") {

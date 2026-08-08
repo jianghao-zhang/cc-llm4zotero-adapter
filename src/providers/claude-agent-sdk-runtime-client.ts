@@ -9,7 +9,7 @@ import { readFile } from "node:fs/promises";
 import { mkdirSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import type { ClaudeCodeRuntimeClient, McpServerStatus, ProviderEvent, RuntimeTurnRequest, RuntimeTurnStream } from "../runtime.js";
+import type { ClaudeCodeRuntimeClient, McpServerStatus, ProviderEvent, RuntimeModelInfo, RuntimeTurnRequest, RuntimeTurnStream } from "../runtime.js";
 import { mapSdkMessageToProviderEvents } from "../event-mapper/map-sdk-message.js";
 import { globalPermissionStore } from "../permissions/permission-store.js";
 import type { PermissionResult } from "../permissions/permission-store.js";
@@ -20,7 +20,7 @@ import {
   renderLocalPdfPrompt,
   validateLocalPdfs,
 } from "../local-pdf.js";
-import { getCachedModels, normalizeProviderModelName, resolveModelAlias, resolveModelWithCache, setCachedModels } from "./model-resolver.js";
+import { getCachedModels, normalizeProviderModelName, setCachedModels } from "./model-resolver.js";
 import { createHotRuntimeTurn, HotRuntimePool, type HotRuntimeEntry, type HotRuntimeTurn } from "./hotRuntimePool.js";
 
 type QueryFunction = (args: {
@@ -28,10 +28,28 @@ type QueryFunction = (args: {
   options: Record<string, unknown>;
 }) => Query;
 
+type ResolveSettingsFunction = (options?: {
+  cwd?: string;
+  settingSources?: SettingSource[];
+}) => Promise<{
+  effective?: ClaudeSettingsShape;
+}>;
+
 type ClaudeModelInfo = {
   value?: string;
+  resolvedModel?: string;
+  displayName?: string;
+  description?: string;
   supportedEffortLevels?: string[];
   supportsEffort?: boolean;
+  supportsAdaptiveThinking?: boolean;
+  supportsFastMode?: boolean;
+  supportsAutoMode?: boolean;
+};
+
+type ClaudeModelDiscovery = {
+  infos: ClaudeModelInfo[];
+  succeeded: boolean;
 };
 
 type ClaudeSlashCommandInfo = {
@@ -173,6 +191,7 @@ type ClaudeSettingsShape = {
   model?: unknown;
   availableModels?: unknown;
   modelOverrides?: unknown;
+  env?: unknown;
 };
 
 type RuntimeAttachment = {
@@ -238,7 +257,41 @@ const IMAGE_MIME_FROM_TYPE: Record<string, "image/jpeg" | "image/png" | "image/g
 
 function normalizeModelName(value: unknown): string {
   if (typeof value !== "string") return "";
-  return value.replace(/\u001b\[[0-9;]*m/g, "").replace(/\[[0-9;]*m\]?/g, "").trim();
+  return value.replace(/\u001b\[[0-9;]*m/g, "").trim();
+}
+function normalizeModelInfo(
+  value: ClaudeModelInfo,
+): RuntimeModelInfo | undefined {
+  const model = normalizeModelName(value.value);
+  if (!model) return undefined;
+  const resolvedModel = normalizeModelName(value.resolvedModel);
+  const displayName = normalizeModelName(value.displayName);
+  const description =
+    typeof value.description === "string" ? value.description.trim() : "";
+  const supportedEffortLevels = Array.isArray(value.supportedEffortLevels)
+    ? normalizeSupportedEfforts(value.supportedEffortLevels).filter(
+        (entry) => entry !== "default",
+      )
+    : [];
+  return {
+    value: model,
+    ...(resolvedModel ? { resolvedModel } : {}),
+    ...(displayName ? { displayName } : {}),
+    ...(description ? { description } : {}),
+    ...(typeof value.supportsEffort === "boolean"
+      ? { supportsEffort: value.supportsEffort }
+      : {}),
+    ...(supportedEffortLevels.length > 0 ? { supportedEffortLevels } : {}),
+    ...(typeof value.supportsAdaptiveThinking === "boolean"
+      ? { supportsAdaptiveThinking: value.supportsAdaptiveThinking }
+      : {}),
+    ...(typeof value.supportsFastMode === "boolean"
+      ? { supportsFastMode: value.supportsFastMode }
+      : {}),
+    ...(typeof value.supportsAutoMode === "boolean"
+      ? { supportsAutoMode: value.supportsAutoMode }
+      : {}),
+  };
 }
 function trimInline(value: unknown, max = 280): string {
   if (typeof value !== "string") return "";
@@ -837,16 +890,35 @@ export interface ClaudeAgentSdkRuntimeClientOptions {
   forwardFrontendModel?: boolean;
   blockedMetadataKeys?: string[];
   queryImpl?: QueryFunction;
+  resolveSettingsImpl?: ResolveSettingsFunction;
+  /** Upper bound on a single supportedModels() probe. Tests override it. */
+  modelProbeTimeoutMs?: number;
+  /** Upper bound on SDK query teardown after a model probe. Tests override it. */
+  modelProbeTeardownTimeoutMs?: number;
 }
 
 export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
   private readonly options: ClaudeAgentSdkRuntimeClientOptions;
-  private modelInfoCache = new Map<string, { expiresAt: number; infos: ClaudeModelInfo[] }>();
+  private modelInfoCache = new Map<
+    string,
+    { expiresAt: number; discovery: ClaudeModelDiscovery }
+  >();
+  private modelInfoProbeCache = new Map<
+    string,
+    Promise<ClaudeModelDiscovery>
+  >();
+  private modelInfoProbeGeneration = new Map<string, number>();
   private commandInfoCache = new Map<string, { expiresAt: number; commands: ClaudeSlashCommandInfo[] }>();
   private effortSuccessCache = new Map<string, EffortSuccessRecord>();
   private readonly modelInfoTtlMs = 60_000;
   private readonly commandInfoTtlMs = 5 * 60_000;
   private readonly effortSuccessTtlMs = 5 * 60_000;
+  private readonly modelInfoCacheMaxEntries = 128;
+  // Deliberately below the plugin's 20s request bound so a healthy adapter can
+  // fall back to the settings-derived catalog and answer the HTTP request
+  // before the plugin gives up on it.
+  private readonly modelProbeTimeoutMsDefault = 15_000;
+  private readonly modelProbeTeardownTimeoutMsDefault = 1_000;
   private readonly hotRuntimePool = new HotRuntimePool({ graceMs: 5 * 60_000 });
   private readonly usageSnapshots = new Map<string, { contextTokens: number; contextWindow?: number }>();
   private readonly runtimeClientInstanceId = `runtime-client-${Math.random().toString(36).slice(2, 10)}`;
@@ -934,19 +1006,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
   }
 
   async retainHotRuntime(request: RuntimeTurnRequest, mountId: string): Promise<void> {
-    const metadata = parseMetadata(request.metadata, this.options);
-    const probeId = typeof metadata.retentionProbeId === "string" ? metadata.retentionProbeId : undefined;
-    const entry = this.hotRuntimePool.retain(request.conversationKey, mountId);
-    entry.lastUsageSnapshot = entry.lastUsageSnapshot;
-    console.log("[RETENTION_PROBE]", JSON.stringify({
-      stage: "runtime.retain_hot_runtime",
-      probeId,
-      conversationKey: request.conversationKey,
-      mountId,
-      runtimeClientInstanceId: this.runtimeClientInstanceId,
-      hotRuntimePoolInstanceId: this.hotRuntimePoolInstanceId,
-      mountCount: entry.mounts.size,
-    }));
+    this.hotRuntimePool.retain(request.conversationKey, mountId);
   }
 
   async warmHotRuntime(request: RuntimeTurnRequest): Promise<void> {
@@ -1806,22 +1866,55 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     })();
   }
 
-  async listModels(options?: { settingSources?: Array<"user" | "project" | "local">; providerKey?: string }): Promise<string[]> {
-    const sdkInfos = await this.readSupportedModelsFromSdk(options);
+  async listModels(options?: {
+    settingSources?: Array<"user" | "project" | "local">;
+    providerKey?: string;
+    runtimeCwdRelative?: string;
+    forceRefresh?: boolean;
+  }): Promise<RuntimeModelInfo[]> {
+    const discovery = await this.readSupportedModelsFromSdk(options);
+    const sdkInfos = discovery.infos;
+    const sdkCatalog: RuntimeModelInfo[] = [];
+    const seenSdkValues = new Set<string>();
+    for (const rawInfo of sdkInfos) {
+      const info = normalizeModelInfo(rawInfo);
+      if (!info || seenSdkValues.has(info.value)) continue;
+      seenSdkValues.add(info.value);
+      sdkCatalog.push(info);
+    }
+    if (discovery.succeeded) {
+      return sdkCatalog;
+    }
+
     const requestedSources = options?.settingSources;
-    const settingSources = Array.isArray(requestedSources) && requestedSources.length > 0 ? requestedSources : this.options.settingSources ?? ["user", "project", "local"];
+    const settingSources =
+      Array.isArray(requestedSources) && requestedSources.length > 0
+        ? requestedSources
+        : (this.options.settingSources ?? ["user", "project", "local"]);
+    const effectiveCwd = this.resolveCatalogCwd(options?.runtimeCwdRelative);
+    const effectiveSettings = await this.readEffectiveSettingsFromSdk(
+      effectiveCwd,
+      settingSources,
+    );
+
+    if (!effectiveSettings) {
+      return [{ value: "default" }];
+    }
+    if (Array.isArray(effectiveSettings.availableModels)) {
+      const allowed = new Set<string>(["default"]);
+      for (const entry of effectiveSettings.availableModels) {
+        const normalized = normalizeModelName(entry);
+        if (normalized) allowed.add(normalized);
+      }
+      return Array.from(allowed, (value) => ({ value }));
+    }
+
     const unique = new Set<string>();
-    for (const info of sdkInfos) {
-      const value = normalizeModelName(info.value);
-      if (value) unique.add(value);
-    }
-    for (const source of settingSources) {
-      const settingsPath = this.resolveSettingsPathBySource(source);
-      if (!settingsPath) continue;
-      const settings = await this.readSettingsFile(settingsPath);
-      this.collectModelsFromSettings(settings, unique);
-    }
-    return Array.from(unique);
+    unique.add("default");
+    this.collectModelsFromSettings(effectiveSettings, unique);
+    this.collectModelsFromSettingsEnvironment(effectiveSettings, unique);
+    this.collectModelsFromEnvironment(unique);
+    return Array.from(unique, (value) => ({ value }));
   }
 
   async listCommands(options?: { settingSources?: Array<"user" | "project" | "local">; providerKey?: string }): Promise<Array<{ name: string; description: string; argumentHint: string }>> {
@@ -1831,25 +1924,42 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       .filter((entry) => entry.name.length > 0);
   }
 
-  async listEfforts(options?: { model?: string; settingSources?: Array<"user" | "project" | "local">; providerKey?: string }): Promise<string[]> {
+  async listEfforts(options?: { model?: string; settingSources?: Array<"user" | "project" | "local">; providerKey?: string; runtimeCwdRelative?: string }): Promise<string[]> {
     return (await this.listEffortCapabilities(options)).efforts;
   }
 
-  private async listEffortCapabilities(options?: { model?: string; settingSources?: Array<"user" | "project" | "local">; providerKey?: string }): Promise<EffortCapabilityInfo> {
-    const sdkInfos = await this.readSupportedModelsFromSdk({ settingSources: options?.settingSources, providerKey: options?.providerKey });
+  private async listEffortCapabilities(options?: {
+    model?: string;
+    settingSources?: Array<"user" | "project" | "local">;
+    providerKey?: string;
+    runtimeCwdRelative?: string;
+  }): Promise<EffortCapabilityInfo> {
+    const sdkInfos = (
+      await this.readSupportedModelsFromSdk({
+        settingSources: options?.settingSources,
+        providerKey: options?.providerKey,
+        runtimeCwdRelative: options?.runtimeCwdRelative,
+      })
+    ).infos;
     const model = normalizeProviderModelName(options?.model);
     const base = ["default", "low", "medium", "high"] as string[];
     if (model) {
       const matched = sdkInfos.find((info) => {
         const value = normalizeProviderModelName(info.value);
-        return value === model;
+        const resolvedModel = normalizeProviderModelName(info.resolvedModel);
+        return value === model || resolvedModel === model;
       });
       if (matched?.supportsEffort && Array.isArray(matched.supportedEffortLevels)) {
         const efforts = normalizeSupportedEfforts(["default", ...matched.supportedEffortLevels]);
         return { efforts: efforts.length > 0 ? efforts : base, source: "sdk_explicit" };
       }
     }
-    if (/(?:^|[._-])max(?:$|[._-])/.test(model) || /opus[\s._-]*4[\s._-]*6/.test(model) || /claude-opus-4-6/.test(model)) {
+    const heuristicModel = model.toLowerCase();
+    if (
+      /(?:^|[._-])max(?:$|[._-])/.test(heuristicModel) ||
+      /opus[\s._-]*4[\s._-]*6/.test(heuristicModel) ||
+      /claude-opus-4-6/.test(heuristicModel)
+    ) {
       return { efforts: [...base, "xhigh", "max"], source: "heuristic" };
     }
     return { efforts: [...base, "xhigh", "max"], source: "unknown" };
@@ -2003,15 +2113,31 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     onPermissionRequired?: PermissionEventSink,
   ): Promise<Record<string, unknown>> {
     const rawRequestMetadata = asRecord(request.metadata) ?? {};
-    const shouldForwardFrontendModel = this.options.forwardFrontendModel === true;
-    const requestedModelRaw = typeof rawRequestMetadata.model === "string" ? rawRequestMetadata.model.trim() : "";
-    const requestedModel = shouldForwardFrontendModel && requestedModelRaw && requestedModelRaw.toLowerCase() !== "default" && requestedModelRaw.toLowerCase() !== "auto" ? requestedModelRaw : undefined;
-    const requestedEffortRaw = typeof rawRequestMetadata.effort === "string" ? rawRequestMetadata.effort.trim().toLowerCase() : "";
-    const requestedEffort = isRuntimeEffortLevel(requestedEffortRaw) ? requestedEffortRaw : undefined;
+    const shouldForwardFrontendModel =
+      this.options.forwardFrontendModel === true;
+    const requestedModelRaw =
+      typeof rawRequestMetadata.model === "string"
+        ? rawRequestMetadata.model.trim()
+        : "";
+    const requestedModel =
+      shouldForwardFrontendModel && requestedModelRaw
+        ? requestedModelRaw
+        : undefined;
+    const requestedEffortRaw =
+      typeof rawRequestMetadata.effort === "string"
+        ? rawRequestMetadata.effort.trim().toLowerCase()
+        : "";
+    const requestedEffort = isRuntimeEffortLevel(requestedEffortRaw)
+      ? requestedEffortRaw
+      : undefined;
     const settingSourcesOverride = parseSettingSourcesOverride(metadata);
     const permissionModeOverride = parsePermissionModeOverride(metadata);
     const customInstruction = parseCustomInstruction(metadata);
     const effectiveCwd = this.resolveScopedCwd(request.metadata);
+    const runtimeCwdRelative =
+      typeof rawRequestMetadata.runtimeCwdRelative === "string"
+        ? rawRequestMetadata.runtimeCwdRelative.trim() || undefined
+        : undefined;
     const runtimeRequest = toRuntimeRequest(request, metadata);
     const localPdfs = collectLocalPdfs(runtimeRequest);
     const localDocumentDirectories = localPdfDirectories(localPdfs);
@@ -2037,49 +2163,30 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       (typeof metadata.claudeConfigSource === "string" && metadata.claudeConfigSource.trim()
         ? metadata.claudeConfigSource.trim()
         : "default");
-    let resolvedModel: string | undefined;
-    if (shouldForwardFrontendModel && requestedModelRaw && requestedModelRaw.toLowerCase() !== "default" && requestedModelRaw.toLowerCase() !== "auto") {
-      const cachedResolution = resolveModelWithCache(
-        requestedModelRaw,
-        effectiveSettingSources,
-        providerKey,
-      );
-      if (cachedResolution.model) {
-        resolvedModel = normalizeProviderModelName(cachedResolution.model);
-      } else {
-        const modelInfos = await this.readSupportedModelsFromSdk({
+    const modelForSdk = requestedModel;
+    const effortSuccessKey = makeEffortSuccessKey(
+      providerKey,
+      modelForSdk || requestedModel,
+    );
+    const capabilityInfo = requestedEffort
+      ? await this.listEffortCapabilities({
+          model: modelForSdk || requestedModel,
           settingSources: effectiveSettingSources,
           providerKey,
-        });
-        const normalizedResolved = resolveModelAlias(
-          requestedModelRaw,
-          modelInfos,
-        );
-        if (normalizedResolved) {
-          resolvedModel = normalizeProviderModelName(normalizedResolved);
-        } else {
-          const rawLower = normalizeProviderModelName(requestedModelRaw);
-          if (rawLower === "opus" || rawLower === "sonnet" || rawLower === "haiku") {
-            resolvedModel = rawLower;
-          }
-        }
-      }
-    }
-    const modelForSdk = resolvedModel;
-    const effortSuccessKey = makeEffortSuccessKey(providerKey, modelForSdk || requestedModel);
-    const capabilityInfo = requestedEffort
-      ? await this.listEffortCapabilities({ model: modelForSdk || requestedModel, settingSources: effectiveSettingSources, providerKey })
-      : { efforts: ["default", "low", "medium", "high", "xhigh", "max"], source: "unknown" as const };
-    const {
-      resolvedEffort,
-      effortFallbackNotice,
-      effortResolutionSource,
-    } = this.resolveEffortFromCapabilities({
-      requestedEffort,
-      capabilityInfo,
-      effortSuccessKey,
-    });
-    const effectivePermissionMode = permissionModeOverride ?? this.options.permissionMode;
+          runtimeCwdRelative,
+        })
+      : {
+          efforts: ["default", "low", "medium", "high", "xhigh", "max"],
+          source: "unknown" as const,
+        };
+    const { resolvedEffort, effortFallbackNotice, effortResolutionSource } =
+      this.resolveEffortFromCapabilities({
+        requestedEffort,
+        capabilityInfo,
+        effortSuccessKey,
+      });
+    const effectivePermissionMode =
+      permissionModeOverride ?? this.options.permissionMode;
     const mergedAllowedTools = mergeAllowedTools(
       request.allowedTools,
       this.options.defaultAllowedTools,
@@ -2195,13 +2302,29 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     return resolve(effectiveCwd, ".claude/settings.local.json");
   }
 
-  private async readSettingsFile(path: string): Promise<ClaudeSettingsShape> {
+  private async readEffectiveSettingsFromSdk(
+    cwd: string,
+    settingSources: SettingSource[],
+  ): Promise<ClaudeSettingsShape | undefined> {
     try {
-      const raw = await readFile(path, "utf8");
-      const parsed = JSON.parse(raw) as ClaudeSettingsShape;
-      return parsed && typeof parsed === "object" ? parsed : {};
+      const resolveSettings =
+        this.options.resolveSettingsImpl ??
+        (
+          (await import("@anthropic-ai/claude-agent-sdk")) as {
+            resolveSettings?: ResolveSettingsFunction;
+          }
+        ).resolveSettings;
+      if (typeof resolveSettings !== "function") return undefined;
+      const resolvedSettings = await resolveSettings({
+        cwd,
+        settingSources,
+      });
+      const effective = resolvedSettings?.effective;
+      return effective && typeof effective === "object" ? effective : {};
     } catch {
-      return {};
+      // If both live discovery and authoritative settings resolution fail,
+      // expose only Default rather than risk bypassing a managed allowlist.
+      return undefined;
     }
   }
 
@@ -2225,40 +2348,256 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     }
   }
 
+  private collectModelsFromSettingsEnvironment(
+    settings: ClaudeSettingsShape,
+    unique: Set<string>,
+  ): void {
+    if (
+      !settings.env ||
+      typeof settings.env !== "object" ||
+      Array.isArray(settings.env)
+    ) {
+      return;
+    }
+    const env = settings.env as Record<string, unknown>;
+    const directValues = [
+      env.ANTHROPIC_MODEL,
+      env.ANTHROPIC_CUSTOM_MODEL_OPTION,
+    ];
+    for (const value of directValues) {
+      const normalized = normalizeModelName(value);
+      if (normalized) unique.add(normalized);
+    }
+    const familyOverrideKeys = Object.keys(env)
+      .filter((key) => /^ANTHROPIC_DEFAULT_.+_MODEL$/.test(key))
+      .sort();
+    for (const key of familyOverrideKeys) {
+      const normalized = normalizeModelName(env[key]);
+      if (normalized) unique.add(normalized);
+    }
+  }
+
+  private collectModelsFromEnvironment(unique: Set<string>): void {
+    const directValues = [
+      process.env.ANTHROPIC_MODEL,
+      process.env.ANTHROPIC_CUSTOM_MODEL_OPTION,
+    ];
+    for (const value of directValues) {
+      const normalized = normalizeModelName(value);
+      if (normalized) unique.add(normalized);
+    }
+    const familyOverrideKeys = Object.keys(process.env)
+      .filter((key) => /^ANTHROPIC_DEFAULT_.+_MODEL$/.test(key))
+      .sort();
+    for (const key of familyOverrideKeys) {
+      const normalized = normalizeModelName(process.env[key]);
+      if (normalized) unique.add(normalized);
+    }
+  }
+
   private async loadQuery(): Promise<QueryFunction> {
     const sdk = (await import("@anthropic-ai/claude-agent-sdk")) as { query: QueryFunction };
     if (typeof sdk.query !== "function") throw new Error("@anthropic-ai/claude-agent-sdk does not export query()");
     return sdk.query;
   }
 
-  private async readSupportedModelsFromSdk(options?: { settingSources?: Array<"user" | "project" | "local">; providerKey?: string }): Promise<ClaudeModelInfo[]> {
-    const requestedSources = options?.settingSources;
-    const settingSources = Array.isArray(requestedSources) && requestedSources.length > 0 ? requestedSources : this.options.settingSources ?? ["user", "project", "local"];
-    const providerKey = options?.providerKey || "default";
-    const cacheKey = `${providerKey}::${settingSources.join(",")}`;
-    const cached = this.modelInfoCache.get(cacheKey);
-    if (cached && Date.now() < cached.expiresAt) return cached.infos;
-    const sharedCached = getCachedModels(settingSources, providerKey);
-    if (sharedCached && sharedCached.length > 0) {
-      const infos = sharedCached as ClaudeModelInfo[];
-      this.modelInfoCache.set(cacheKey, { infos, expiresAt: Date.now() + this.modelInfoTtlMs });
-      return infos;
+  private resolveCatalogCwd(runtimeCwdRelative?: string): string {
+    const metadata =
+      typeof runtimeCwdRelative === "string" && runtimeCwdRelative.trim()
+        ? { runtimeCwdRelative }
+        : undefined;
+    return (
+      this.resolveScopedCwd(metadata) ||
+      (this.options.cwd ? resolve(this.options.cwd) : process.cwd())
+    );
+  }
+
+  private pruneModelInfoCaches(now = Date.now()): void {
+    for (const [cacheKey, cached] of this.modelInfoCache) {
+      if (
+        cached.expiresAt <= now &&
+        !this.modelInfoProbeCache.has(cacheKey)
+      ) {
+        this.modelInfoCache.delete(cacheKey);
+        this.modelInfoProbeGeneration.delete(cacheKey);
+      }
     }
+
+    while (this.modelInfoCache.size > this.modelInfoCacheMaxEntries) {
+      let evictedKey: string | undefined;
+      for (const cacheKey of this.modelInfoCache.keys()) {
+        if (!this.modelInfoProbeCache.has(cacheKey)) {
+          evictedKey = cacheKey;
+          break;
+        }
+      }
+      if (!evictedKey) break;
+      this.modelInfoCache.delete(evictedKey);
+      this.modelInfoProbeGeneration.delete(evictedKey);
+    }
+
+    // A completed failed probe has no modelInfoCache entry. Drop its
+    // generation token as well so scoped keys cannot accumulate there.
+    for (const cacheKey of this.modelInfoProbeGeneration.keys()) {
+      if (
+        !this.modelInfoCache.has(cacheKey) &&
+        !this.modelInfoProbeCache.has(cacheKey)
+      ) {
+        this.modelInfoProbeGeneration.delete(cacheKey);
+      }
+    }
+  }
+
+  private cacheModelInfo(
+    cacheKey: string,
+    discovery: ClaudeModelDiscovery,
+  ): void {
+    // Map insertion order supplies a small LRU policy for scoped catalogs.
+    this.modelInfoCache.delete(cacheKey);
+    this.modelInfoCache.set(cacheKey, {
+      discovery,
+      expiresAt: Date.now() + this.modelInfoTtlMs,
+    });
+    this.pruneModelInfoCaches();
+  }
+
+  private async readSupportedModelsFromSdk(options?: {
+    settingSources?: Array<"user" | "project" | "local">;
+    providerKey?: string;
+    runtimeCwdRelative?: string;
+    forceRefresh?: boolean;
+  }): Promise<ClaudeModelDiscovery> {
+    const requestedSources = options?.settingSources;
+    const settingSources =
+      Array.isArray(requestedSources) && requestedSources.length > 0
+        ? requestedSources
+        : (this.options.settingSources ?? ["user", "project", "local"]);
+    const cwd = this.resolveCatalogCwd(options?.runtimeCwdRelative);
+    const providerKey =
+      options?.providerKey ||
+      (await buildSettingsStackIdentity(
+        settingSources,
+        this.resolveSettingsPathBySource.bind(this),
+        cwd,
+      )) ||
+      "default";
+    const scopedProviderKey = `${providerKey}::cwd:${cwd}`;
+    const cacheKey = `${scopedProviderKey}::${settingSources.join(",")}`;
+    this.pruneModelInfoCaches();
+    if (!options?.forceRefresh) {
+      const cached = this.modelInfoCache.get(cacheKey);
+      if (cached && Date.now() < cached.expiresAt) {
+        this.modelInfoCache.delete(cacheKey);
+        this.modelInfoCache.set(cacheKey, cached);
+        return cached.discovery;
+      }
+      const sharedCached = getCachedModels(settingSources, scopedProviderKey);
+      if (sharedCached && sharedCached.length > 0) {
+        const infos = sharedCached as ClaudeModelInfo[];
+        const discovery = { infos, succeeded: true };
+        this.cacheModelInfo(cacheKey, discovery);
+        return discovery;
+      }
+      const inFlight = this.modelInfoProbeCache.get(cacheKey);
+      if (inFlight) return inFlight;
+    }
+    const generation = (this.modelInfoProbeGeneration.get(cacheKey) ?? 0) + 1;
+    this.modelInfoProbeGeneration.set(cacheKey, generation);
+    const probe = this.probeSupportedModels({
+      cacheKey,
+      providerKey: scopedProviderKey,
+      settingSources,
+      cwd,
+      generation,
+    });
+    this.modelInfoProbeCache.set(cacheKey, probe);
+    try {
+      return await probe;
+    } finally {
+      if (this.modelInfoProbeCache.get(cacheKey) === probe) {
+        this.modelInfoProbeCache.delete(cacheKey);
+        if (this.modelInfoProbeGeneration.get(cacheKey) === generation) {
+          this.modelInfoProbeGeneration.delete(cacheKey);
+        }
+      }
+      this.pruneModelInfoCaches();
+    }
+  }
+
+  private async probeSupportedModels(input: {
+    cacheKey: string;
+    providerKey: string;
+    settingSources: SettingSource[];
+    cwd: string;
+    generation: number;
+  }): Promise<ClaudeModelDiscovery> {
+    let session: Query | undefined;
     try {
       const query = this.options.queryImpl ?? (await this.loadQuery());
-      const session = query({
+      session = query({
         prompt: "",
-        options: { cwd: this.options.cwd ? resolve(this.options.cwd) : process.cwd(), settingSources, permissionMode: this.options.permissionMode },
+        options: {
+          cwd: input.cwd,
+          settingSources: input.settingSources,
+          permissionMode: this.options.permissionMode,
+        },
       }) as Query;
-      const infosRaw = await session.supportedModels();
-      try { await session.return(undefined); } catch {}
-      try { session.close(); } catch {}
+      // A wedged CLI can leave supportedModels() pending forever, which pins
+      // the bridge request and every plugin UI waiting on it. Bound it the
+      // same way getLiveContextUsageSnapshot bounds getContextUsage.
+      const probeTimeoutMs =
+        this.options.modelProbeTimeoutMs ?? this.modelProbeTimeoutMsDefault;
+      let probeTimeoutHandle: ReturnType<typeof setTimeout> | undefined;
+      const probeTimeoutPromise = new Promise<"timeout">((resolve) => {
+        probeTimeoutHandle = setTimeout(() => resolve("timeout"), probeTimeoutMs);
+      });
+      let probeResult: unknown | "timeout";
+      try {
+        probeResult = await Promise.race([
+          session.supportedModels(),
+          probeTimeoutPromise,
+        ]);
+      } finally {
+        if (probeTimeoutHandle !== undefined) clearTimeout(probeTimeoutHandle);
+      }
+      // Report the probe as failed rather than caching an empty catalog:
+      // listModels() then falls through to the settings-derived list, which the
+      // plugin already renders.
+      if (probeResult === "timeout") return { infos: [], succeeded: false };
+      const infosRaw = probeResult;
       const infos = Array.isArray(infosRaw) ? infosRaw : [];
-      this.modelInfoCache.set(cacheKey, { infos, expiresAt: Date.now() + this.modelInfoTtlMs });
-      setCachedModels(settingSources, infos, providerKey);
-      return infos;
+      const discovery = { infos, succeeded: Array.isArray(infosRaw) };
+      if (
+        this.modelInfoProbeGeneration.get(input.cacheKey) === input.generation
+      ) {
+        this.cacheModelInfo(input.cacheKey, discovery);
+        setCachedModels(input.settingSources, infos, input.providerKey);
+      }
+      return discovery;
     } catch {
-      return [];
+      return { infos: [], succeeded: false };
+    } finally {
+      try {
+        session?.close();
+      } catch {}
+      try {
+        if (session) {
+          const teardownTimeoutMs =
+            this.options.modelProbeTeardownTimeoutMs ??
+            this.modelProbeTeardownTimeoutMsDefault;
+          let teardownTimeoutHandle: ReturnType<typeof setTimeout> | undefined;
+          const teardownTimeout = new Promise<void>((resolve) => {
+            teardownTimeoutHandle = setTimeout(resolve, teardownTimeoutMs);
+          });
+          try {
+            await Promise.race([session.return(undefined), teardownTimeout]);
+          } finally {
+            if (teardownTimeoutHandle !== undefined) {
+              clearTimeout(teardownTimeoutHandle);
+            }
+          }
+        }
+      } catch {}
     }
   }
 

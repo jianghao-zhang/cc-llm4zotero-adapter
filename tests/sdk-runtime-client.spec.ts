@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { ClaudeCodeRuntimeAdapter } from "../src/bridge/claude-code-runtime-adapter.js";
 import { ClaudeAgentSdkRuntimeClient } from "../src/providers/claude-agent-sdk-runtime-client.js";
 import { setCachedModels } from "../src/providers/model-resolver.js";
@@ -70,6 +70,7 @@ async function nextEvent(
 describe("ClaudeAgentSdkRuntimeClient", () => {
   const originalHome = process.env.HOME;
   const originalUserProfile = process.env.USERPROFILE;
+  const originalDefaultMythosModel = process.env.ANTHROPIC_DEFAULT_MYTHOS_MODEL;
 
   afterEach(async () => {
     if (originalHome === undefined) {
@@ -81,6 +82,11 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
       delete process.env.USERPROFILE;
     } else {
       process.env.USERPROFILE = originalUserProfile;
+    }
+    if (originalDefaultMythosModel === undefined) {
+      delete process.env.ANTHROPIC_DEFAULT_MYTHOS_MODEL;
+    } else {
+      process.env.ANTHROPIC_DEFAULT_MYTHOS_MODEL = originalDefaultMythosModel;
     }
     globalPermissionStore.cleanup();
     await Promise.all(
@@ -657,6 +663,616 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
     });
 
     expect(seenOptions.model).toBe("gemini-3.1-pro-preview");
+  });
+
+  it("forwards every non-empty model value exactly, including future aliases", async () => {
+    const seenModels: unknown[] = [];
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      forwardFrontendModel: true,
+      queryImpl(args) {
+        seenModels.push(args.options.model);
+        return makeStream([
+          {
+            type: "result",
+            session_id: "session-model-forwarding",
+            result: "ok",
+            is_error: false,
+          },
+        ]);
+      },
+    });
+
+    for (const model of [
+      "default",
+      "auto",
+      "FutureProvider/Model-X",
+      "Claude-Mythos-6[1m]",
+    ]) {
+      await runtime.startTurn({
+        conversationKey: `conv-${model}`,
+        userMessage: "hello",
+        metadata: { model },
+      });
+    }
+
+    expect(seenModels).toEqual([
+      "default",
+      "auto",
+      "FutureProvider/Model-X",
+      "Claude-Mythos-6[1m]",
+    ]);
+  });
+
+  it("returns the ordered structured SDK catalog without lossy suffix normalization", async () => {
+    let queryCount = 0;
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      queryImpl() {
+        queryCount += 1;
+        return makeModelProbe([
+          {
+            value: "default",
+            resolvedModel: "claude-opus-5[1m]",
+            displayName: "Default",
+            description: "Current account default",
+            supportsEffort: true,
+            supportedEffortLevels: ["low", "xhigh", "max"],
+            supportsAdaptiveThinking: true,
+            supportsFastMode: false,
+            supportsAutoMode: true,
+          },
+          {
+            value: "claude-fable-5[1m]",
+            displayName: "Fable",
+            description: "Future model family",
+          },
+          {
+            value: "default",
+            displayName: "Duplicate should not replace first",
+            description: "Duplicate",
+          },
+        ]);
+      },
+    });
+
+    const [first, concurrent] = await Promise.all([
+      runtime.listModels({ settingSources: ["user"] }),
+      runtime.listModels({ settingSources: ["user"] }),
+    ]);
+
+    expect(queryCount).toBe(1);
+    expect(first).toEqual([
+      {
+        value: "default",
+        resolvedModel: "claude-opus-5[1m]",
+        displayName: "Default",
+        description: "Current account default",
+        supportsEffort: true,
+        supportedEffortLevels: ["low", "xhigh", "max"],
+        supportsAdaptiveThinking: true,
+        supportsFastMode: false,
+        supportsAutoMode: true,
+      },
+      {
+        value: "claude-fable-5[1m]",
+        displayName: "Fable",
+        description: "Future model family",
+      },
+    ]);
+    expect(concurrent).toEqual(first);
+  });
+
+  it("bypasses both model catalog caches for an explicit refresh", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "cc-l4z-model-refresh-"));
+    temporaryDirectories.add(directory);
+    let queryCount = 0;
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      cwd: directory,
+      settingSources: ["project"],
+      queryImpl() {
+        queryCount += 1;
+        return makeModelProbe([{ value: `Catalog-${queryCount}` }]);
+      },
+    });
+
+    const first = await runtime.listModels();
+    const cached = await runtime.listModels();
+    const refreshed = await runtime.listModels({ forceRefresh: true });
+
+    expect(first).toEqual([{ value: "Catalog-1" }]);
+    expect(cached).toEqual(first);
+    expect(refreshed).toEqual([{ value: "Catalog-2" }]);
+    expect(queryCount).toBe(2);
+  });
+
+  it("does not let an older model probe overwrite a forced refresh", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "cc-l4z-model-refresh-race-"),
+    );
+    temporaryDirectories.add(directory);
+    let resolveOlder!: (models: unknown[]) => void;
+    let resolveForced!: (models: unknown[]) => void;
+    let markOlderStarted!: () => void;
+    let markForcedStarted!: () => void;
+    const olderModels = new Promise<unknown[]>((resolve) => {
+      resolveOlder = resolve;
+    });
+    const forcedModels = new Promise<unknown[]>((resolve) => {
+      resolveForced = resolve;
+    });
+    const olderStarted = new Promise<void>((resolve) => {
+      markOlderStarted = resolve;
+    });
+    const forcedStarted = new Promise<void>((resolve) => {
+      markForcedStarted = resolve;
+    });
+    let queryCount = 0;
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      cwd: directory,
+      settingSources: ["project"],
+      queryImpl() {
+        queryCount += 1;
+        const probeNumber = queryCount;
+        return {
+          async supportedModels() {
+            if (probeNumber === 1) {
+              markOlderStarted();
+              return olderModels;
+            }
+            markForcedStarted();
+            return forcedModels;
+          },
+          async return() {
+            return undefined;
+          },
+          close() {},
+        } as any;
+      },
+    });
+
+    const olderRequest = runtime.listModels();
+    await olderStarted;
+    const forcedRequest = runtime.listModels({ forceRefresh: true });
+    await forcedStarted;
+    resolveForced([{ value: "FreshModel" }]);
+    expect(await forcedRequest).toEqual([{ value: "FreshModel" }]);
+    resolveOlder([{ value: "StaleModel" }]);
+    expect(await olderRequest).toEqual([{ value: "StaleModel" }]);
+
+    expect(await runtime.listModels()).toEqual([{ value: "FreshModel" }]);
+    expect(queryCount).toBe(2);
+  });
+
+  it("invalidates the model catalog when selected settings contents change", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "cc-l4z-model-settings-identity-"),
+    );
+    temporaryDirectories.add(directory);
+    const settingsDirectory = join(directory, ".claude");
+    const settingsPath = join(settingsDirectory, "settings.json");
+    await mkdir(settingsDirectory, { recursive: true });
+    await writeFile(settingsPath, JSON.stringify({ model: "FirstModel" }));
+    let queryCount = 0;
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      cwd: directory,
+      settingSources: ["project"],
+      queryImpl() {
+        queryCount += 1;
+        return makeModelProbe([{ value: `Catalog-${queryCount}` }]);
+      },
+    });
+
+    const first = await runtime.listModels();
+    await writeFile(settingsPath, JSON.stringify({ model: "SecondModel" }));
+    const second = await runtime.listModels();
+
+    expect(first).toEqual([{ value: "Catalog-1" }]);
+    expect(second).toEqual([{ value: "Catalog-2" }]);
+    expect(queryCount).toBe(2);
+  });
+
+  it("probes and caches model catalogs by the contained scoped cwd", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "cc-l4z-model-scope-"));
+    temporaryDirectories.add(directory);
+    const seenCwds: string[] = [];
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      cwd: directory,
+      queryImpl({ options }) {
+        seenCwds.push(String(options.cwd));
+        return makeModelProbe([{ value: `ScopedModel-${seenCwds.length}` }]);
+      },
+    });
+    const firstScope =
+      "profile-test/scopes/paper/profile-test:1:42/conversations/0042";
+    const secondScope =
+      "profile-test/scopes/paper/profile-test:1:43/conversations/0043";
+
+    const first = await runtime.listModels({
+      settingSources: ["project", "local"],
+      runtimeCwdRelative: firstScope,
+    });
+    const cachedFirst = await runtime.listModels({
+      settingSources: ["project", "local"],
+      runtimeCwdRelative: firstScope,
+    });
+    const second = await runtime.listModels({
+      settingSources: ["project", "local"],
+      runtimeCwdRelative: secondScope,
+    });
+    const rejectedEscape = await runtime.listModels({
+      settingSources: ["project", "local"],
+      runtimeCwdRelative: "../../outside-runtime-root",
+    });
+
+    expect(seenCwds).toEqual([
+      resolve(directory, firstScope),
+      resolve(directory, secondScope),
+      resolve(directory),
+    ]);
+    expect(first).toEqual([{ value: "ScopedModel-1" }]);
+    expect(cachedFirst).toEqual(first);
+    expect(second).toEqual([{ value: "ScopedModel-2" }]);
+    expect(rejectedEscape).toEqual([{ value: "ScopedModel-3" }]);
+  });
+
+  it("bounds per-runtime scoped model caches and drops completed generations", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "cc-l4z-model-cache-bound-"));
+    temporaryDirectories.add(directory);
+    let queryCount = 0;
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      cwd: directory,
+      queryImpl() {
+        queryCount += 1;
+        return makeModelProbe([{ value: `BoundedModel-${queryCount}` }]);
+      },
+    });
+    const providerKey = "bounded-scoped-cache-test";
+    const scopeFor = (index: number) =>
+      `profile-test/scopes/paper/profile-test:1:${index}/conversations/${index}`;
+
+    for (let index = 0; index <= 128; index += 1) {
+      await runtime.listModels({
+        providerKey,
+        settingSources: ["project"],
+        runtimeCwdRelative: scopeFor(index),
+      });
+    }
+    const probesBeforeRevisit = queryCount;
+    await runtime.listModels({
+      providerKey,
+      settingSources: ["project"],
+      runtimeCwdRelative: scopeFor(0),
+    });
+
+    const state = runtime as unknown as {
+      modelInfoCache: Map<string, unknown>;
+      modelInfoProbeGeneration: Map<string, unknown>;
+    };
+    expect(queryCount).toBe(probesBeforeRevisit + 1);
+    expect(state.modelInfoCache.size).toBeLessThanOrEqual(128);
+    expect(state.modelInfoProbeGeneration.size).toBe(0);
+  });
+
+  it("uses the scoped model catalog for turn-time effort validation", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "cc-l4z-effort-scope-"));
+    temporaryDirectories.add(directory);
+    const runtimeCwdRelative =
+      "profile-test/scopes/paper/profile-test:1:42/conversations/0042";
+    const scopedCwd = resolve(directory, runtimeCwdRelative);
+    const probeCwds: string[] = [];
+    let turnOptions: Record<string, unknown> = {};
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      cwd: directory,
+      forwardFrontendModel: true,
+      queryImpl(args) {
+        if (args.prompt === "") {
+          const cwd = String(args.options.cwd);
+          probeCwds.push(cwd);
+          return makeModelProbe([
+            {
+              value: "ScopedModel",
+              supportsEffort: true,
+              supportedEffortLevels:
+                cwd === scopedCwd ? ["low", "high"] : ["low", "high", "xhigh"],
+            },
+          ]);
+        }
+        turnOptions = args.options;
+        return makeStream([
+          {
+            type: "result",
+            session_id: "session-scoped-effort",
+            result: "ok",
+            is_error: false,
+          },
+        ]);
+      },
+    });
+
+    const turn = await runtime.startTurn({
+      conversationKey: "conv-scoped-effort",
+      userMessage: "hello",
+      metadata: {
+        model: "ScopedModel",
+        effort: "xhigh",
+        runtimeCwdRelative,
+      },
+    });
+    for await (const _event of turn.events) {
+      // Drain the turn so the query completes.
+    }
+
+    expect(probeCwds).toEqual([scopedCwd]);
+    expect(turnOptions.cwd).toBe(scopedCwd);
+    expect(turnOptions.effort).toBe("high");
+  });
+
+  it("keeps a successful empty SDK catalog empty despite configured fallbacks", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "cc-l4z-model-empty-"));
+    temporaryDirectories.add(directory);
+    await mkdir(join(directory, ".claude"), { recursive: true });
+    await writeFile(
+      join(directory, ".claude", "settings.json"),
+      JSON.stringify({
+        model: "configured-model",
+        availableModels: ["allowed"],
+      }),
+    );
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      cwd: directory,
+      settingSources: ["project"],
+      queryImpl() {
+        return makeModelProbe([]);
+      },
+    });
+
+    expect(await runtime.listModels()).toEqual([]);
+  });
+
+  it("uses configured fallback models only when discovery fails and closes the probe", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "cc-l4z-model-fallback-"));
+    temporaryDirectories.add(directory);
+    await mkdir(join(directory, ".claude"), { recursive: true });
+    await writeFile(
+      join(directory, ".claude", "settings.json"),
+      JSON.stringify({
+        model: "Configured/Model[1m]",
+      }),
+    );
+    let returnCalls = 0;
+    let closeCalls = 0;
+    process.env.ANTHROPIC_DEFAULT_MYTHOS_MODEL = "Mythos-Environment-Model";
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      cwd: directory,
+      settingSources: ["project"],
+      queryImpl() {
+        return {
+          async supportedModels() {
+            throw new Error("catalog unavailable");
+          },
+          async return() {
+            returnCalls += 1;
+          },
+          close() {
+            closeCalls += 1;
+          },
+        } as any;
+      },
+    });
+
+    const models = await runtime.listModels();
+    expect(models.slice(0, 2)).toEqual([
+      { value: "default" },
+      { value: "Configured/Model[1m]" },
+    ]);
+    expect(models).toContainEqual({ value: "Mythos-Environment-Model" });
+    expect(returnCalls).toBe(1);
+    expect(closeCalls).toBe(1);
+  });
+
+  it("bounds a wedged supportedModels() probe and falls back instead of hanging", async () => {
+    // Blocker: a stale-auth CLI could leave supportedModels() pending forever,
+    // pinning the /models request and every plugin UI waiting on it.
+    const directory = await mkdtemp(join(tmpdir(), "cc-l4z-model-probe-"));
+    let returnCalls = 0;
+    let closeCalls = 0;
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      cwd: directory,
+      // Project scope keyed to this test's own temp dir, so the module-level
+      // model cache cannot leak into neighbouring tests.
+      settingSources: ["project"],
+      modelProbeTimeoutMs: 20,
+      modelProbeTeardownTimeoutMs: 20,
+      queryImpl() {
+        return {
+          supportedModels() {
+            // Never settles, like a wedged CLI.
+            return new Promise(() => {});
+          },
+          async return() {
+            returnCalls += 1;
+            // A closed SDK query can still expose a wedged async-generator
+            // return path. Teardown must not keep the catalog request open.
+            return new Promise(() => {});
+          },
+          close() {
+            closeCalls += 1;
+          },
+        } as any;
+      },
+    });
+
+    const models = await runtime.listModels();
+    // Falls through to the settings-derived catalog rather than hanging.
+    expect(Array.isArray(models)).toBe(true);
+    expect(models.length).toBeGreaterThan(0);
+    // The throwaway session is still torn down on the timeout path.
+    expect(returnCalls).toBe(1);
+    expect(closeCalls).toBe(1);
+  });
+
+  it("uses the SDK-merged configured model allowlist when discovery fails", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "cc-l4z-model-allowlist-"));
+    const homeDirectory = await mkdtemp(join(tmpdir(), "cc-l4z-model-home-"));
+    temporaryDirectories.add(directory);
+    temporaryDirectories.add(homeDirectory);
+    await mkdir(join(directory, ".claude"), { recursive: true });
+    await mkdir(join(homeDirectory, ".claude"), { recursive: true });
+    await writeFile(
+      join(homeDirectory, ".claude", "settings.json"),
+      JSON.stringify({ availableModels: ["UserModel"] }),
+    );
+    await writeFile(
+      join(directory, ".claude", "settings.json"),
+      JSON.stringify({
+        model: "ExcludedConfiguredModel",
+        availableModels: ["FutureModel[1m]", "Provider/Exact-Model"],
+      }),
+    );
+    process.env.HOME = homeDirectory;
+    process.env.ANTHROPIC_DEFAULT_MYTHOS_MODEL = "ExcludedEnvironmentModel";
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      cwd: directory,
+      settingSources: ["user", "project"],
+      queryImpl() {
+        return {
+          async supportedModels() {
+            throw new Error("catalog unavailable");
+          },
+          async return() {
+            return undefined;
+          },
+          close() {},
+        } as any;
+      },
+    });
+
+    expect(await runtime.listModels()).toEqual([
+      { value: "default" },
+      { value: "UserModel" },
+      { value: "FutureModel[1m]" },
+      { value: "Provider/Exact-Model" },
+    ]);
+  });
+
+  it("limits failed-discovery fallback to default for an explicit empty allowlist", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "cc-l4z-model-allowlist-empty-"),
+    );
+    temporaryDirectories.add(directory);
+    await mkdir(join(directory, ".claude"), { recursive: true });
+    await writeFile(
+      join(directory, ".claude", "settings.json"),
+      JSON.stringify({
+        model: "ExcludedConfiguredModel",
+        availableModels: [],
+      }),
+    );
+    process.env.ANTHROPIC_DEFAULT_MYTHOS_MODEL = "ExcludedEnvironmentModel";
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      cwd: directory,
+      settingSources: ["project"],
+      queryImpl() {
+        return {
+          async supportedModels() {
+            throw new Error("catalog unavailable");
+          },
+          async return() {
+            return undefined;
+          },
+          close() {},
+        } as any;
+      },
+    });
+
+    expect(await runtime.listModels()).toEqual([{ value: "default" }]);
+  });
+
+  it("uses the SDK effective settings so managed model policy remains authoritative", async () => {
+    process.env.ANTHROPIC_DEFAULT_MYTHOS_MODEL = "ExcludedEnvironmentModel";
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      queryImpl() {
+        return {
+          async supportedModels() {
+            throw new Error("catalog unavailable");
+          },
+          async return() {
+            return undefined;
+          },
+          close() {},
+        } as any;
+      },
+      async resolveSettingsImpl() {
+        return {
+          effective: {
+            model: "ExcludedConfiguredModel",
+            availableModels: ["ManagedModel"],
+          },
+        };
+      },
+    });
+
+    expect(await runtime.listModels()).toEqual([
+      { value: "default" },
+      { value: "ManagedModel" },
+    ]);
+  });
+
+  it("includes cc-switch model overrides from SDK-merged settings when discovery fails", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "cc-l4z-model-cc-switch-"));
+    temporaryDirectories.add(directory);
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      cwd: directory,
+      settingSources: ["user"],
+      queryImpl() {
+        return {
+          async supportedModels() {
+            throw new Error("catalog unavailable");
+          },
+          async return() {
+            return undefined;
+          },
+          close() {},
+        } as any;
+      },
+      async resolveSettingsImpl() {
+        return {
+          effective: {
+            env: {
+              ANTHROPIC_MODEL: "CCSwitch/Exact-Model[1m]",
+              ANTHROPIC_DEFAULT_FABLE_MODEL: "Fable-X",
+            },
+          },
+        };
+      },
+    });
+
+    expect((await runtime.listModels()).slice(0, 3)).toEqual([
+      { value: "default" },
+      { value: "CCSwitch/Exact-Model[1m]" },
+      { value: "Fable-X" },
+    ]);
+  });
+
+  it("fails closed to default when both discovery and settings resolution fail", async () => {
+    process.env.ANTHROPIC_DEFAULT_MYTHOS_MODEL = "ExcludedEnvironmentModel";
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      queryImpl() {
+        return {
+          async supportedModels() {
+            throw new Error("catalog unavailable");
+          },
+          async return() {
+            return undefined;
+          },
+          close() {},
+        } as any;
+      },
+      async resolveSettingsImpl() {
+        throw new Error("settings unavailable");
+      },
+    });
+
+    expect(await runtime.listModels()).toEqual([{ value: "default" }]);
   });
 
   it("falls back unsupported xhigh effort when SDK capabilities are explicit", async () => {

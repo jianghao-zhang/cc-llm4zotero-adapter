@@ -11,6 +11,7 @@ import type {
 import { mapToLlm4ZoteroEvent } from "../event-mapper/map-to-llm4zotero-event.js";
 import { findToolByName, getToolCatalog } from "./tool-catalog.js";
 import { globalPermissionStore } from "../permissions/permission-store.js";
+import type { RuntimeModelCatalog } from "../runtime.js";
 
 const CATASTROPHIC_ARG_PATTERNS: RegExp[] = [
   /\brm\s+-rf\s+\/(?!\S)/i,
@@ -226,38 +227,68 @@ export class Llm4ZoteroAgentBackendAdapter {
     }));
   }
 
-  async listModels(
-    options?: {
-      settingSources?: Array<"user" | "project" | "local">;
-    },
-  ): Promise<string[]> {
-    const models = await this.adapter.listRuntimeModels(options);
-    const unique = new Set<string>();
-    unique.add("default");
-    for (const model of models) {
-      const normalized = (model || "").trim();
-      if (normalized) unique.add(normalized);
-    }
-    const envCandidates = [
-      process.env.ANTHROPIC_DEFAULT_OPUS_MODEL,
-      process.env.ANTHROPIC_DEFAULT_SONNET_MODEL,
-      process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL,
-      process.env.ANTHROPIC_CUSTOM_MODEL_OPTION,
-    ];
-    for (const candidate of envCandidates) {
-      const normalized = (candidate || "").trim();
-      if (normalized) unique.add(normalized);
-    }
-    return Array.from(unique);
+  async listModels(options?: {
+    settingSources?: Array<"user" | "project" | "local">;
+    conversationKey?: string | number;
+    scopeType?: ScopeType;
+    scopeId?: string;
+    scopeLabel?: string;
+    forceRefresh?: boolean;
+  }): Promise<RuntimeModelCatalog> {
+    const originalConversationKey =
+      options?.conversationKey === undefined
+        ? undefined
+        : String(options.conversationKey);
+    const scope = originalConversationKey
+      ? toScopeInfo({
+          scopeType: options?.scopeType,
+          scopeId: options?.scopeId,
+          scopeLabel: options?.scopeLabel,
+        })
+      : undefined;
+    const runtimeCwdRelative = originalConversationKey
+      ? buildRuntimeCwdRelative(scope, originalConversationKey)
+      : undefined;
+    const modelInfos = await this.adapter.listRuntimeModels({
+      settingSources: options?.settingSources,
+      runtimeCwdRelative,
+      forceRefresh: options?.forceRefresh,
+    });
+    return {
+      models: modelInfos.map((model) => model.value),
+      modelInfos,
+    };
   }
 
   async listEfforts(
     options?: {
       model?: string;
       settingSources?: Array<"user" | "project" | "local">;
+      conversationKey?: string | number;
+      scopeType?: ScopeType;
+      scopeId?: string;
+      scopeLabel?: string;
     },
   ): Promise<string[]> {
-    const efforts = await this.adapter.listRuntimeEfforts(options);
+    const originalConversationKey =
+      options?.conversationKey === undefined
+        ? undefined
+        : String(options.conversationKey);
+    const scope = originalConversationKey
+      ? toScopeInfo({
+          scopeType: options?.scopeType,
+          scopeId: options?.scopeId,
+          scopeLabel: options?.scopeLabel,
+        })
+      : undefined;
+    const runtimeCwdRelative = originalConversationKey
+      ? buildRuntimeCwdRelative(scope, originalConversationKey)
+      : undefined;
+    const efforts = await this.adapter.listRuntimeEfforts({
+      model: options?.model,
+      settingSources: options?.settingSources,
+      runtimeCwdRelative,
+    });
     const unique = new Set<string>();
     unique.add("default");
     for (const effort of efforts) {

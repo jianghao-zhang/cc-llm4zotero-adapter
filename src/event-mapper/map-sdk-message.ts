@@ -506,22 +506,6 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
           ];
         }
       }
-      if (delta.type === "signature_delta") {
-        const thinking = typeof delta.text === "string" ? delta.text : "";
-        if (thinking) {
-          return [
-            providerEvent,
-            {
-              type: "reasoning",
-              payload: {
-                round: 1,
-                details: thinking,
-                sessionId,
-              },
-            },
-          ];
-        }
-      }
     }
   }
 

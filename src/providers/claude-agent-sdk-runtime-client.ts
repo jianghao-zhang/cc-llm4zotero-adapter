@@ -891,6 +891,8 @@ export interface ClaudeAgentSdkRuntimeClientOptions {
   blockedMetadataKeys?: string[];
   queryImpl?: QueryFunction;
   resolveSettingsImpl?: ResolveSettingsFunction;
+  /** Upper bound on a single supportedModels() probe. Tests override it. */
+  modelProbeTimeoutMs?: number;
 }
 
 export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
@@ -909,6 +911,10 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
   private readonly modelInfoTtlMs = 60_000;
   private readonly commandInfoTtlMs = 5 * 60_000;
   private readonly effortSuccessTtlMs = 5 * 60_000;
+  // Deliberately below the plugin's 20s request bound so a healthy adapter can
+  // fall back to the settings-derived catalog and answer the HTTP request
+  // before the plugin gives up on it.
+  private readonly modelProbeTimeoutMsDefault = 15_000;
   private readonly hotRuntimePool = new HotRuntimePool({ graceMs: 5 * 60_000 });
   private readonly usageSnapshots = new Map<string, { contextTokens: number; contextWindow?: number }>();
   private readonly runtimeClientInstanceId = `runtime-client-${Math.random().toString(36).slice(2, 10)}`;
@@ -2477,7 +2483,29 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
           permissionMode: this.options.permissionMode,
         },
       }) as Query;
-      const infosRaw = await session.supportedModels();
+      // A wedged CLI can leave supportedModels() pending forever, which pins
+      // the bridge request and every plugin UI waiting on it. Bound it the
+      // same way getLiveContextUsageSnapshot bounds getContextUsage.
+      const probeTimeoutMs =
+        this.options.modelProbeTimeoutMs ?? this.modelProbeTimeoutMsDefault;
+      let probeTimeoutHandle: ReturnType<typeof setTimeout> | undefined;
+      const probeTimeoutPromise = new Promise<"timeout">((resolve) => {
+        probeTimeoutHandle = setTimeout(() => resolve("timeout"), probeTimeoutMs);
+      });
+      let probeResult: unknown | "timeout";
+      try {
+        probeResult = await Promise.race([
+          session.supportedModels(),
+          probeTimeoutPromise,
+        ]);
+      } finally {
+        if (probeTimeoutHandle !== undefined) clearTimeout(probeTimeoutHandle);
+      }
+      // Report the probe as failed rather than caching an empty catalog:
+      // listModels() then falls through to the settings-derived list, which the
+      // plugin already renders.
+      if (probeResult === "timeout") return { infos: [], succeeded: false };
+      const infosRaw = probeResult;
       const infos = Array.isArray(infosRaw) ? infosRaw : [];
       const discovery = { infos, succeeded: Array.isArray(infosRaw) };
       if (

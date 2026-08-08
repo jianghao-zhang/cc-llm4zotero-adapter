@@ -1031,6 +1031,43 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
     expect(closeCalls).toBe(1);
   });
 
+  it("bounds a wedged supportedModels() probe and falls back instead of hanging", async () => {
+    // Blocker: a stale-auth CLI could leave supportedModels() pending forever,
+    // pinning the /models request and every plugin UI waiting on it.
+    const directory = await mkdtemp(join(tmpdir(), "cc-l4z-model-probe-"));
+    let returnCalls = 0;
+    let closeCalls = 0;
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      cwd: directory,
+      // Project scope keyed to this test's own temp dir, so the module-level
+      // model cache cannot leak into neighbouring tests.
+      settingSources: ["project"],
+      modelProbeTimeoutMs: 20,
+      queryImpl() {
+        return {
+          supportedModels() {
+            // Never settles, like a wedged CLI.
+            return new Promise(() => {});
+          },
+          async return() {
+            returnCalls += 1;
+          },
+          close() {
+            closeCalls += 1;
+          },
+        } as any;
+      },
+    });
+
+    const models = await runtime.listModels();
+    // Falls through to the settings-derived catalog rather than hanging.
+    expect(Array.isArray(models)).toBe(true);
+    expect(models.length).toBeGreaterThan(0);
+    // The throwaway session is still torn down on the timeout path.
+    expect(returnCalls).toBe(1);
+    expect(closeCalls).toBe(1);
+  });
+
   it("uses the SDK-merged configured model allowlist when discovery fails", async () => {
     const directory = await mkdtemp(join(tmpdir(), "cc-l4z-model-allowlist-"));
     const homeDirectory = await mkdtemp(join(tmpdir(), "cc-l4z-model-home-"));

@@ -177,6 +177,62 @@ describe("http bridge server", () => {
     }
   });
 
+  it("discovers efforts in the same derived scoped directory as the models", async () => {
+    let seenOptions:
+      | {
+          model?: string;
+          settingSources?: Array<"user" | "project" | "local">;
+          runtimeCwdRelative?: string;
+        }
+      | undefined;
+    const runtimeClient: ClaudeCodeRuntimeClient = {
+      async startTurn() {
+        return {
+          runId: "run-http-scoped-efforts",
+          events: providerEvents([]),
+        };
+      },
+      async listEfforts(options) {
+        seenOptions = options;
+        return ["low", "high"];
+      },
+    };
+    const base = new ClaudeCodeRuntimeAdapter({
+      runtimeClient,
+      sessionMapper: new InMemorySessionMapper(),
+    });
+    const server = await startHttpBridgeServer({
+      adapter: new Llm4ZoteroAgentBackendAdapter({ adapter: base }),
+    });
+
+    try {
+      const params = new URLSearchParams({
+        settingSources: "project,local",
+        conversationKey: "0042",
+        scopeType: "paper",
+        scopeId: "profile-test:1:42",
+        scopeLabel: "Paper 42",
+        model: "ScopedModel",
+      });
+      const response = await fetch(
+        `http://${server.host}:${server.port}/efforts?${params}`,
+      );
+
+      expect(response.ok).toBe(true);
+      expect(await response.json()).toEqual({
+        efforts: ["default", "low", "high"],
+      });
+      expect(seenOptions).toEqual({
+        model: "ScopedModel",
+        settingSources: ["project", "local"],
+        runtimeCwdRelative:
+          "profile-test/scopes/paper/profile-test:1:42/conversations/0042",
+      });
+    } finally {
+      await server.close();
+    }
+  });
+
   it("reports model catalog discovery failures instead of returning an authoritative empty catalog", async () => {
     const runtimeClient: ClaudeCodeRuntimeClient = {
       async startTurn() {

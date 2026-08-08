@@ -372,6 +372,20 @@ export async function startHttpBridgeServer(
         const settingSources = parseSettingSources(
           reqUrl.searchParams.get("settingSources"),
         );
+        const conversationKey = parseConversationKey(
+          reqUrl.searchParams.get("conversationKey"),
+        );
+        const scopeType = parseScopeType(reqUrl.searchParams.get("scopeType"));
+        const scopeIdRaw = reqUrl.searchParams.get("scopeId");
+        const scopeLabelRaw = reqUrl.searchParams.get("scopeLabel");
+        const scopeId =
+          typeof scopeIdRaw === "string" && scopeIdRaw.trim().length > 0
+            ? scopeIdRaw.trim()
+            : undefined;
+        const scopeLabel =
+          typeof scopeLabelRaw === "string" && scopeLabelRaw.trim().length > 0
+            ? scopeLabelRaw.trim()
+            : undefined;
         const model =
           typeof reqUrl.searchParams.get("model") === "string"
             ? (reqUrl.searchParams.get("model") || "").trim()
@@ -379,6 +393,10 @@ export async function startHttpBridgeServer(
         const efforts = await options.adapter.listEfforts({
           settingSources,
           model: model || undefined,
+          conversationKey,
+          scopeType,
+          scopeId,
+          scopeLabel,
         });
         sendJson(res, 200, { efforts });
         return;

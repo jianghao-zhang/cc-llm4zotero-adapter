@@ -264,9 +264,31 @@ export class Llm4ZoteroAgentBackendAdapter {
     options?: {
       model?: string;
       settingSources?: Array<"user" | "project" | "local">;
+      conversationKey?: string | number;
+      scopeType?: ScopeType;
+      scopeId?: string;
+      scopeLabel?: string;
     },
   ): Promise<string[]> {
-    const efforts = await this.adapter.listRuntimeEfforts(options);
+    const originalConversationKey =
+      options?.conversationKey === undefined
+        ? undefined
+        : String(options.conversationKey);
+    const scope = originalConversationKey
+      ? toScopeInfo({
+          scopeType: options?.scopeType,
+          scopeId: options?.scopeId,
+          scopeLabel: options?.scopeLabel,
+        })
+      : undefined;
+    const runtimeCwdRelative = originalConversationKey
+      ? buildRuntimeCwdRelative(scope, originalConversationKey)
+      : undefined;
+    const efforts = await this.adapter.listRuntimeEfforts({
+      model: options?.model,
+      settingSources: options?.settingSources,
+      runtimeCwdRelative,
+    });
     const unique = new Set<string>();
     unique.add("default");
     for (const effort of efforts) {

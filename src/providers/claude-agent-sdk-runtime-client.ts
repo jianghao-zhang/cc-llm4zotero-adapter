@@ -893,6 +893,8 @@ export interface ClaudeAgentSdkRuntimeClientOptions {
   resolveSettingsImpl?: ResolveSettingsFunction;
   /** Upper bound on a single supportedModels() probe. Tests override it. */
   modelProbeTimeoutMs?: number;
+  /** Upper bound on SDK query teardown after a model probe. Tests override it. */
+  modelProbeTeardownTimeoutMs?: number;
 }
 
 export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
@@ -911,10 +913,12 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
   private readonly modelInfoTtlMs = 60_000;
   private readonly commandInfoTtlMs = 5 * 60_000;
   private readonly effortSuccessTtlMs = 5 * 60_000;
+  private readonly modelInfoCacheMaxEntries = 128;
   // Deliberately below the plugin's 20s request bound so a healthy adapter can
   // fall back to the settings-derived catalog and answer the HTTP request
   // before the plugin gives up on it.
   private readonly modelProbeTimeoutMsDefault = 15_000;
+  private readonly modelProbeTeardownTimeoutMsDefault = 1_000;
   private readonly hotRuntimePool = new HotRuntimePool({ graceMs: 5 * 60_000 });
   private readonly usageSnapshots = new Map<string, { contextTokens: number; contextWindow?: number }>();
   private readonly runtimeClientInstanceId = `runtime-client-${Math.random().toString(36).slice(2, 10)}`;
@@ -1920,7 +1924,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       .filter((entry) => entry.name.length > 0);
   }
 
-  async listEfforts(options?: { model?: string; settingSources?: Array<"user" | "project" | "local">; providerKey?: string }): Promise<string[]> {
+  async listEfforts(options?: { model?: string; settingSources?: Array<"user" | "project" | "local">; providerKey?: string; runtimeCwdRelative?: string }): Promise<string[]> {
     return (await this.listEffortCapabilities(options)).efforts;
   }
 
@@ -2408,6 +2412,55 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     );
   }
 
+  private pruneModelInfoCaches(now = Date.now()): void {
+    for (const [cacheKey, cached] of this.modelInfoCache) {
+      if (
+        cached.expiresAt <= now &&
+        !this.modelInfoProbeCache.has(cacheKey)
+      ) {
+        this.modelInfoCache.delete(cacheKey);
+        this.modelInfoProbeGeneration.delete(cacheKey);
+      }
+    }
+
+    while (this.modelInfoCache.size > this.modelInfoCacheMaxEntries) {
+      let evictedKey: string | undefined;
+      for (const cacheKey of this.modelInfoCache.keys()) {
+        if (!this.modelInfoProbeCache.has(cacheKey)) {
+          evictedKey = cacheKey;
+          break;
+        }
+      }
+      if (!evictedKey) break;
+      this.modelInfoCache.delete(evictedKey);
+      this.modelInfoProbeGeneration.delete(evictedKey);
+    }
+
+    // A completed failed probe has no modelInfoCache entry. Drop its
+    // generation token as well so scoped keys cannot accumulate there.
+    for (const cacheKey of this.modelInfoProbeGeneration.keys()) {
+      if (
+        !this.modelInfoCache.has(cacheKey) &&
+        !this.modelInfoProbeCache.has(cacheKey)
+      ) {
+        this.modelInfoProbeGeneration.delete(cacheKey);
+      }
+    }
+  }
+
+  private cacheModelInfo(
+    cacheKey: string,
+    discovery: ClaudeModelDiscovery,
+  ): void {
+    // Map insertion order supplies a small LRU policy for scoped catalogs.
+    this.modelInfoCache.delete(cacheKey);
+    this.modelInfoCache.set(cacheKey, {
+      discovery,
+      expiresAt: Date.now() + this.modelInfoTtlMs,
+    });
+    this.pruneModelInfoCaches();
+  }
+
   private async readSupportedModelsFromSdk(options?: {
     settingSources?: Array<"user" | "project" | "local">;
     providerKey?: string;
@@ -2430,17 +2483,19 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       "default";
     const scopedProviderKey = `${providerKey}::cwd:${cwd}`;
     const cacheKey = `${scopedProviderKey}::${settingSources.join(",")}`;
+    this.pruneModelInfoCaches();
     if (!options?.forceRefresh) {
       const cached = this.modelInfoCache.get(cacheKey);
-      if (cached && Date.now() < cached.expiresAt) return cached.discovery;
+      if (cached && Date.now() < cached.expiresAt) {
+        this.modelInfoCache.delete(cacheKey);
+        this.modelInfoCache.set(cacheKey, cached);
+        return cached.discovery;
+      }
       const sharedCached = getCachedModels(settingSources, scopedProviderKey);
       if (sharedCached && sharedCached.length > 0) {
         const infos = sharedCached as ClaudeModelInfo[];
         const discovery = { infos, succeeded: true };
-        this.modelInfoCache.set(cacheKey, {
-          discovery,
-          expiresAt: Date.now() + this.modelInfoTtlMs,
-        });
+        this.cacheModelInfo(cacheKey, discovery);
         return discovery;
       }
       const inFlight = this.modelInfoProbeCache.get(cacheKey);
@@ -2461,7 +2516,11 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     } finally {
       if (this.modelInfoProbeCache.get(cacheKey) === probe) {
         this.modelInfoProbeCache.delete(cacheKey);
+        if (this.modelInfoProbeGeneration.get(cacheKey) === generation) {
+          this.modelInfoProbeGeneration.delete(cacheKey);
+        }
       }
+      this.pruneModelInfoCaches();
     }
   }
 
@@ -2511,10 +2570,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       if (
         this.modelInfoProbeGeneration.get(input.cacheKey) === input.generation
       ) {
-        this.modelInfoCache.set(input.cacheKey, {
-          discovery,
-          expiresAt: Date.now() + this.modelInfoTtlMs,
-        });
+        this.cacheModelInfo(input.cacheKey, discovery);
         setCachedModels(input.settingSources, infos, input.providerKey);
       }
       return discovery;
@@ -2522,10 +2578,25 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       return { infos: [], succeeded: false };
     } finally {
       try {
-        await session?.return(undefined);
+        session?.close();
       } catch {}
       try {
-        session?.close();
+        if (session) {
+          const teardownTimeoutMs =
+            this.options.modelProbeTeardownTimeoutMs ??
+            this.modelProbeTeardownTimeoutMsDefault;
+          let teardownTimeoutHandle: ReturnType<typeof setTimeout> | undefined;
+          const teardownTimeout = new Promise<void>((resolve) => {
+            teardownTimeoutHandle = setTimeout(resolve, teardownTimeoutMs);
+          });
+          try {
+            await Promise.race([session.return(undefined), teardownTimeout]);
+          } finally {
+            if (teardownTimeoutHandle !== undefined) {
+              clearTimeout(teardownTimeoutHandle);
+            }
+          }
+        }
       } catch {}
     }
   }

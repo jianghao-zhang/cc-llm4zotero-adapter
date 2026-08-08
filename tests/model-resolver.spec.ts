@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  MODEL_CACHE_MAX_ENTRIES,
+  getCachedModels,
   normalizeProviderModelName,
   resolveModelAlias,
   resolveModelWithCache,
+  setCachedModels,
 } from "../src/providers/model-resolver.js";
 
 describe("model resolver", () => {
@@ -50,5 +53,27 @@ describe("model resolver", () => {
       model: "FutureProvider/Model-X[1m]",
       cacheHit: false,
     });
+  });
+
+  it("bounds the shared scoped model cache", () => {
+    const providerPrefix = `bounded-shared-cache-${Date.now()}`;
+    const settingSources = ["local"];
+    for (let index = 0; index <= MODEL_CACHE_MAX_ENTRIES; index += 1) {
+      setCachedModels(
+        settingSources,
+        [{ value: `Model-${index}` }],
+        `${providerPrefix}-${index}`,
+      );
+    }
+
+    expect(
+      getCachedModels(settingSources, `${providerPrefix}-0`),
+    ).toBeUndefined();
+    expect(
+      getCachedModels(
+        settingSources,
+        `${providerPrefix}-${MODEL_CACHE_MAX_ENTRIES}`,
+      ),
+    ).toEqual([{ value: `Model-${MODEL_CACHE_MAX_ENTRIES}` }]);
   });
 });

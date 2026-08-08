@@ -914,6 +914,44 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
     expect(rejectedEscape).toEqual([{ value: "ScopedModel-3" }]);
   });
 
+  it("bounds per-runtime scoped model caches and drops completed generations", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "cc-l4z-model-cache-bound-"));
+    temporaryDirectories.add(directory);
+    let queryCount = 0;
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      cwd: directory,
+      queryImpl() {
+        queryCount += 1;
+        return makeModelProbe([{ value: `BoundedModel-${queryCount}` }]);
+      },
+    });
+    const providerKey = "bounded-scoped-cache-test";
+    const scopeFor = (index: number) =>
+      `profile-test/scopes/paper/profile-test:1:${index}/conversations/${index}`;
+
+    for (let index = 0; index <= 128; index += 1) {
+      await runtime.listModels({
+        providerKey,
+        settingSources: ["project"],
+        runtimeCwdRelative: scopeFor(index),
+      });
+    }
+    const probesBeforeRevisit = queryCount;
+    await runtime.listModels({
+      providerKey,
+      settingSources: ["project"],
+      runtimeCwdRelative: scopeFor(0),
+    });
+
+    const state = runtime as unknown as {
+      modelInfoCache: Map<string, unknown>;
+      modelInfoProbeGeneration: Map<string, unknown>;
+    };
+    expect(queryCount).toBe(probesBeforeRevisit + 1);
+    expect(state.modelInfoCache.size).toBeLessThanOrEqual(128);
+    expect(state.modelInfoProbeGeneration.size).toBe(0);
+  });
+
   it("uses the scoped model catalog for turn-time effort validation", async () => {
     const directory = await mkdtemp(join(tmpdir(), "cc-l4z-effort-scope-"));
     temporaryDirectories.add(directory);
@@ -1043,6 +1081,7 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
       // model cache cannot leak into neighbouring tests.
       settingSources: ["project"],
       modelProbeTimeoutMs: 20,
+      modelProbeTeardownTimeoutMs: 20,
       queryImpl() {
         return {
           supportedModels() {
@@ -1051,6 +1090,9 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
           },
           async return() {
             returnCalls += 1;
+            // A closed SDK query can still expose a wedged async-generator
+            // return path. Teardown must not keep the catalog request open.
+            return new Promise(() => {});
           },
           close() {
             closeCalls += 1;

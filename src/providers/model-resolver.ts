@@ -37,6 +37,23 @@ const modelCache = new Map<
 >();
 
 const CACHE_TTL_MS = 60_000; // 1 minute cache
+export const MODEL_CACHE_MAX_ENTRIES = 128;
+
+function pruneExpiredModelCache(now = Date.now()): void {
+  for (const [key, cached] of modelCache) {
+    if (cached.expiresAt <= now) {
+      modelCache.delete(key);
+    }
+  }
+}
+
+function evictOldestModelCacheEntries(): void {
+  while (modelCache.size > MODEL_CACHE_MAX_ENTRIES) {
+    const oldestKey = modelCache.keys().next().value;
+    if (typeof oldestKey !== "string") return;
+    modelCache.delete(oldestKey);
+  }
+}
 
 function getCacheKey(settingSources: string[], providerKey = "default"): string {
   return `${providerKey}::${settingSources.join(",")}`;
@@ -48,9 +65,14 @@ export function getCachedModels(
 ): ModelInfo[] | undefined {
   const key = getCacheKey(settingSources, providerKey);
   const cached = modelCache.get(key);
-  if (cached && Date.now() < cached.expiresAt) {
+  const now = Date.now();
+  if (cached && now < cached.expiresAt) {
+    // Map insertion order is the LRU order for this small shared cache.
+    modelCache.delete(key);
+    modelCache.set(key, cached);
     return cached.models;
   }
+  if (cached) modelCache.delete(key);
   return undefined;
 }
 
@@ -60,10 +82,14 @@ export function setCachedModels(
   providerKey?: string,
 ): void {
   const key = getCacheKey(settingSources, providerKey);
+  const now = Date.now();
+  pruneExpiredModelCache(now);
+  modelCache.delete(key);
   modelCache.set(key, {
     models,
-    expiresAt: Date.now() + CACHE_TTL_MS,
+    expiresAt: now + CACHE_TTL_MS,
   });
+  evictOldestModelCacheEntries();
 }
 
 /**

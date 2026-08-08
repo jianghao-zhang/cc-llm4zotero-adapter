@@ -100,6 +100,7 @@ export class ClaudeCodeRuntimeAdapter {
     options?: {
       model?: string;
       settingSources?: Array<"user" | "project" | "local">;
+      runtimeCwdRelative?: string;
     },
   ): Promise<string[]> {
     if (typeof this.runtimeClient.listEfforts !== "function") {

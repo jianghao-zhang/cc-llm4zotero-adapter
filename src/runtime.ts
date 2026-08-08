@@ -92,6 +92,7 @@ export interface ClaudeCodeRuntimeClient {
     options?: {
       model?: string;
       settingSources?: Array<"user" | "project" | "local">;
+      runtimeCwdRelative?: string;
     }
   ): Promise<string[]>;
   listMcpServers?(

@@ -228,8 +228,10 @@ export class ClaudeCodeRuntimeAdapter {
       if (this.lifecycleEpoch(conversationKey) !== expectedEpoch) return false;
       await this.sessionMapper.set(sessionMapKey, providerSessionId);
       if (this.lifecycleEpoch(conversationKey) === expectedEpoch) return true;
-      // Invalidation may have raced the mapper write. Remove only the value we
-      // just wrote, so a newer turn's mapping is never clobbered.
+      // Unreachable while the only bump site (invalidateConversationSession)
+      // also holds this lock, so the epoch cannot move under us. Kept as a
+      // backstop for a future bump site outside the lock: remove only the
+      // value we just wrote, so a newer turn's mapping is never clobbered.
       if ((await this.sessionMapper.get(sessionMapKey)) === providerSessionId) {
         await this.sessionMapper.delete(sessionMapKey);
       }
@@ -240,9 +242,11 @@ export class ClaudeCodeRuntimeAdapter {
   private async resolveProviderSessionId(
     requestOrConversationKey: RunTurnRequest | string,
   ): Promise<{ providerSessionId?: string; source: ResumeSource }> {
-    const conversationKey = this.buildSessionMapKey(requestOrConversationKey);
-    const expectedEpoch = this.lifecycleEpoch(conversationKey);
+    // The conversation key and the canonical session-map key are the same
+    // value; keeping two names for it invited reading them as distinct.
     const sessionMapKey = this.buildSessionMapKey(requestOrConversationKey);
+    const conversationKey = sessionMapKey;
+    const expectedEpoch = this.lifecycleEpoch(conversationKey);
     const mapped = await this.sessionMapper.get(sessionMapKey);
     if (mapped) {
       return { providerSessionId: mapped, source: "map" };

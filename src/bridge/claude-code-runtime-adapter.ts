@@ -1,7 +1,12 @@
 import type { ClaudeCodeRuntimeClient, RuntimeModelInfo } from "../runtime.js";
 import type { SessionMapper } from "../session-link/session-mapper.js";
 import type { TraceStore } from "../trace-store/trace-store.js";
-import type { AgentEvent, RunTurnHooks, RunTurnOutcome, RunTurnRequest } from "../types.js";
+import type {
+  AgentEvent,
+  RunTurnHooks,
+  RunTurnOutcome,
+  RunTurnRequest,
+} from "../types.js";
 import { mapProviderEvent } from "../event-mapper/map-provider-event.js";
 import {
   collectLocalPdfs,
@@ -15,12 +20,27 @@ export interface ClaudeCodeRuntimeAdapterOptions {
   traceStore?: TraceStore;
 }
 
-type ResumeSource = "map" | "legacy_provider_map" | "request_hint" | "none" | "force_fresh" | "history_gap" | "local_pdf";
+type ResumeSource =
+  | "map"
+  | "legacy_provider_map"
+  | "request_hint"
+  | "none"
+  | "force_fresh"
+  | "history_gap"
+  | "local_pdf";
 
 export class ClaudeCodeRuntimeAdapter {
   private readonly runtimeClient: ClaudeCodeRuntimeClient;
   private readonly sessionMapper: SessionMapper;
   private readonly traceStore?: TraceStore;
+  /**
+   * Local lifecycle fence for provider work.  The host can invalidate a
+   * conversation while a provider request is still awaiting its first
+   * response; a late response must not repopulate the session mapper, hot
+   * runtime, or trace file that Clear/delete just removed.
+   */
+  private readonly lifecycleEpochByConversation = new Map<string, number>();
+  private readonly lifecycleLocks = new Map<string, Promise<void>>();
 
   constructor(options: ClaudeCodeRuntimeAdapterOptions) {
     this.runtimeClient = options.runtimeClient;
@@ -53,7 +73,9 @@ export class ClaudeCodeRuntimeAdapter {
         eventTs: details.eventTs,
         localTs: now,
         lagMs:
-          typeof details.eventTs === "number" ? Math.max(0, now - details.eventTs) : undefined,
+          typeof details.eventTs === "number"
+            ? Math.max(0, now - details.eventTs)
+            : undefined,
       }),
     );
   }
@@ -81,11 +103,11 @@ export class ClaudeCodeRuntimeAdapter {
     return modelInfos;
   }
 
-  async listRuntimeCommands(
-    options?: {
-      settingSources?: Array<"user" | "project" | "local">;
-    },
-  ): Promise<Array<{ name: string; description: string; argumentHint: string }>> {
+  async listRuntimeCommands(options?: {
+    settingSources?: Array<"user" | "project" | "local">;
+  }): Promise<
+    Array<{ name: string; description: string; argumentHint: string }>
+  > {
     if (typeof this.runtimeClient.listCommands !== "function") {
       return [];
     }
@@ -96,13 +118,11 @@ export class ClaudeCodeRuntimeAdapter {
     }
   }
 
-  async listRuntimeEfforts(
-    options?: {
-      model?: string;
-      settingSources?: Array<"user" | "project" | "local">;
-      runtimeCwdRelative?: string;
-    },
-  ): Promise<string[]> {
+  async listRuntimeEfforts(options?: {
+    model?: string;
+    settingSources?: Array<"user" | "project" | "local">;
+    runtimeCwdRelative?: string;
+  }): Promise<string[]> {
     if (typeof this.runtimeClient.listEfforts !== "function") {
       return ["default", "low", "medium", "high"];
     }
@@ -113,11 +133,9 @@ export class ClaudeCodeRuntimeAdapter {
     }
   }
 
-  async listRuntimeMcpServers(
-    options?: {
-      settingSources?: Array<"user" | "project" | "local">;
-    },
-  ) {
+  async listRuntimeMcpServers(options?: {
+    settingSources?: Array<"user" | "project" | "local">;
+  }) {
     if (typeof this.runtimeClient.listMcpServers !== "function") {
       return [];
     }
@@ -128,7 +146,9 @@ export class ClaudeCodeRuntimeAdapter {
     }
   }
 
-  private buildSessionMapKey(requestOrConversationKey: RunTurnRequest | string): string {
+  private buildSessionMapKey(
+    requestOrConversationKey: RunTurnRequest | string,
+  ): string {
     if (typeof requestOrConversationKey === "string") {
       return requestOrConversationKey;
     }
@@ -148,50 +168,150 @@ export class ClaudeCodeRuntimeAdapter {
         },
   ): string | undefined {
     const metadata =
-      requestOrConversationKey.metadata && typeof requestOrConversationKey.metadata === "object"
+      requestOrConversationKey.metadata &&
+      typeof requestOrConversationKey.metadata === "object"
         ? (requestOrConversationKey.metadata as Record<string, unknown>)
         : {};
     const providerIdentity =
-      typeof metadata.providerIdentity === "string" && metadata.providerIdentity.trim()
+      typeof metadata.providerIdentity === "string" &&
+      metadata.providerIdentity.trim()
         ? metadata.providerIdentity.trim()
         : "";
-    return providerIdentity ? `${requestOrConversationKey.conversationKey}::provider:${providerIdentity}` : undefined;
+    return providerIdentity
+      ? `${requestOrConversationKey.conversationKey}::provider:${providerIdentity}`
+      : undefined;
   }
 
   private normalizeProviderSessionId(value: unknown): string | undefined {
     return typeof value === "string" && value.trim() ? value.trim() : undefined;
   }
 
+  private lifecycleEpoch(conversationKey: string): number {
+    return this.lifecycleEpochByConversation.get(conversationKey) || 0;
+  }
+
+  private bumpLifecycleEpoch(conversationKey: string): number {
+    const next = this.lifecycleEpoch(conversationKey) + 1;
+    this.lifecycleEpochByConversation.set(conversationKey, next);
+    return next;
+  }
+
+  private async withLifecycleLock<T>(
+    conversationKey: string,
+    task: () => Promise<T>,
+  ): Promise<T> {
+    const previous =
+      this.lifecycleLocks.get(conversationKey) || Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.lifecycleLocks.set(conversationKey, current);
+    await previous;
+    try {
+      return await task();
+    } finally {
+      release();
+      if (this.lifecycleLocks.get(conversationKey) === current) {
+        this.lifecycleLocks.delete(conversationKey);
+      }
+    }
+  }
+
+  private async setSessionMappingIfCurrent(
+    conversationKey: string,
+    sessionMapKey: string,
+    providerSessionId: string,
+    expectedEpoch: number,
+  ): Promise<boolean> {
+    return this.withLifecycleLock(conversationKey, async () => {
+      if (this.lifecycleEpoch(conversationKey) !== expectedEpoch) return false;
+      await this.sessionMapper.set(sessionMapKey, providerSessionId);
+      if (this.lifecycleEpoch(conversationKey) === expectedEpoch) return true;
+      // Unreachable while the only bump site (invalidateConversationSession)
+      // also holds this lock, so the epoch cannot move under us. Kept as a
+      // backstop for a future bump site outside the lock: remove only the
+      // value we just wrote, so a newer turn's mapping is never clobbered.
+      if ((await this.sessionMapper.get(sessionMapKey)) === providerSessionId) {
+        await this.sessionMapper.delete(sessionMapKey);
+      }
+      return false;
+    });
+  }
+
   private async resolveProviderSessionId(
     requestOrConversationKey: RunTurnRequest | string,
   ): Promise<{ providerSessionId?: string; source: ResumeSource }> {
+    // The conversation key and the canonical session-map key are the same
+    // value; keeping two names for it invited reading them as distinct.
     const sessionMapKey = this.buildSessionMapKey(requestOrConversationKey);
+    const conversationKey = sessionMapKey;
+    const expectedEpoch = this.lifecycleEpoch(conversationKey);
     const mapped = await this.sessionMapper.get(sessionMapKey);
     if (mapped) {
       return { providerSessionId: mapped, source: "map" };
     }
 
     if (typeof requestOrConversationKey !== "string") {
-      const legacyMapKey = this.buildLegacyProviderSessionMapKey(requestOrConversationKey);
+      const legacyMapKey = this.buildLegacyProviderSessionMapKey(
+        requestOrConversationKey,
+      );
       if (legacyMapKey) {
         const legacyMapped = await this.sessionMapper.get(legacyMapKey);
         if (legacyMapped) {
-          await this.sessionMapper.set(sessionMapKey, legacyMapped);
-          return { providerSessionId: legacyMapped, source: "legacy_provider_map" };
+          if (
+            !(await this.setSessionMappingIfCurrent(
+              conversationKey,
+              sessionMapKey,
+              legacyMapped,
+              expectedEpoch,
+            ))
+          ) {
+            return { source: "none" };
+          }
+          return {
+            providerSessionId: legacyMapped,
+            source: "legacy_provider_map",
+          };
         }
       }
     }
 
-    const legacyByPrefix = await this.sessionMapper.getByPrefix(`${sessionMapKey}::provider:`);
+    const legacyByPrefix = await this.sessionMapper.getByPrefix(
+      `${sessionMapKey}::provider:`,
+    );
     if (legacyByPrefix) {
-      await this.sessionMapper.set(sessionMapKey, legacyByPrefix);
-      return { providerSessionId: legacyByPrefix, source: "legacy_provider_map" };
+      if (
+        !(await this.setSessionMappingIfCurrent(
+          conversationKey,
+          sessionMapKey,
+          legacyByPrefix,
+          expectedEpoch,
+        ))
+      ) {
+        return { source: "none" };
+      }
+      return {
+        providerSessionId: legacyByPrefix,
+        source: "legacy_provider_map",
+      };
     }
 
     if (typeof requestOrConversationKey !== "string") {
-      const hinted = this.normalizeProviderSessionId(requestOrConversationKey.providerSessionId);
+      const hinted = this.normalizeProviderSessionId(
+        requestOrConversationKey.providerSessionId,
+      );
       if (hinted) {
-        await this.sessionMapper.set(sessionMapKey, hinted);
+        if (
+          !(await this.setSessionMappingIfCurrent(
+            conversationKey,
+            sessionMapKey,
+            hinted,
+            expectedEpoch,
+          ))
+        ) {
+          return { source: "none" };
+        }
         return { providerSessionId: hinted, source: "request_hint" };
       }
     }
@@ -199,8 +319,11 @@ export class ClaudeCodeRuntimeAdapter {
     return { source: "none" };
   }
 
-  async getMappedProviderSessionId(conversationKey: string): Promise<string | undefined> {
-    const { providerSessionId } = await this.resolveProviderSessionId(conversationKey);
+  async getMappedProviderSessionId(
+    conversationKey: string,
+  ): Promise<string | undefined> {
+    const { providerSessionId } =
+      await this.resolveProviderSessionId(conversationKey);
     return providerSessionId;
   }
 
@@ -217,19 +340,60 @@ export class ClaudeCodeRuntimeAdapter {
       typeof requestOrConversationKey === "string"
         ? requestOrConversationKey
         : requestOrConversationKey.conversationKey;
-    await this.sessionMapper.delete(baseConversationKey);
-    await this.sessionMapper.deleteByPrefix(`${baseConversationKey}::provider:`);
-    await this.sessionMapper.delete(this.buildLocalPdfHistoryGapKey(baseConversationKey));
-    await this.runtimeClient.invalidateHotRuntime?.(baseConversationKey);
+    const metadata =
+      typeof requestOrConversationKey === "string"
+        ? undefined
+        : requestOrConversationKey.metadata;
+    const expectedProviderSessionId =
+      metadata && typeof metadata.providerSessionId === "string"
+        ? metadata.providerSessionId.trim()
+        : "";
+    await this.withLifecycleLock(baseConversationKey, async () => {
+      if (expectedProviderSessionId) {
+        const currentProviderSessionId =
+          (await this.sessionMapper.get(baseConversationKey)) ||
+          (await this.sessionMapper.getByPrefix(
+            `${baseConversationKey}::provider:`,
+          ));
+        // A recycled conversation key may already belong to a new provider
+        // session. An old cleanup job must never remove that newer mapping.
+        if (
+          currentProviderSessionId &&
+          currentProviderSessionId !== expectedProviderSessionId
+        ) {
+          return;
+        }
+      }
+      this.bumpLifecycleEpoch(baseConversationKey);
+      await this.sessionMapper.delete(baseConversationKey);
+      await this.sessionMapper.deleteByPrefix(
+        `${baseConversationKey}::provider:`,
+      );
+      await this.sessionMapper.delete(
+        this.buildLocalPdfHistoryGapKey(baseConversationKey),
+      );
+      await this.runtimeClient.invalidateHotRuntime?.(baseConversationKey);
+      await this.traceStore?.clear(baseConversationKey);
+    });
   }
 
-  async retainHotRuntime(request: RunTurnRequest, mountId: string): Promise<{ conversationKey: string; mountId: string; retained: boolean; probeId?: string } | void> {
+  async retainHotRuntime(
+    request: RunTurnRequest,
+    mountId: string,
+  ): Promise<{
+    conversationKey: string;
+    mountId: string;
+    retained: boolean;
+    probeId?: string;
+  } | void> {
     await this.runtimeClient.retainHotRuntime?.(request, mountId);
-    const metadata = request.metadata && typeof request.metadata === "object"
-      ? (request.metadata as Record<string, unknown>)
-      : {};
+    const metadata =
+      request.metadata && typeof request.metadata === "object"
+        ? (request.metadata as Record<string, unknown>)
+        : {};
     if (collectLocalPdfs(request.runtimeRequest).length === 0) {
-      const { providerSessionId } = await this.resolveProviderSessionId(request);
+      const { providerSessionId } =
+        await this.resolveProviderSessionId(request);
       await this.runtimeClient.warmHotRuntime?.({
         conversationKey: request.conversationKey,
         userMessage: "",
@@ -244,11 +408,17 @@ export class ClaudeCodeRuntimeAdapter {
       conversationKey: request.conversationKey,
       mountId,
       retained: true,
-      probeId: typeof metadata.retentionProbeId === "string" ? metadata.retentionProbeId : undefined,
+      probeId:
+        typeof metadata.retentionProbeId === "string"
+          ? metadata.retentionProbeId
+          : undefined,
     };
   }
 
-  async releaseHotRuntime(conversationKey: string, mountId: string): Promise<void> {
+  async releaseHotRuntime(
+    conversationKey: string,
+    mountId: string,
+  ): Promise<void> {
     await this.runtimeClient.releaseHotRuntime?.(conversationKey, mountId);
   }
 
@@ -256,7 +426,10 @@ export class ClaudeCodeRuntimeAdapter {
     await this.runtimeClient.invalidateAllHotRuntimes?.();
   }
 
-  async runTurn(request: RunTurnRequest, hooks: RunTurnHooks = {}): Promise<RunTurnOutcome> {
+  async runTurn(
+    request: RunTurnRequest,
+    hooks: RunTurnHooks = {},
+  ): Promise<RunTurnOutcome> {
     const signal = hooks.signal ?? request.signal;
     const localPdfs = collectLocalPdfs(request.runtimeRequest);
     const isLocalPdfTurn = localPdfs.length > 0;
@@ -272,23 +445,31 @@ export class ClaudeCodeRuntimeAdapter {
     }
     const forceFreshSession = Boolean(
       request.metadata &&
-        typeof request.metadata === "object" &&
-        (request.metadata as Record<string, unknown>).forceFreshSession === true,
+      typeof request.metadata === "object" &&
+      (request.metadata as Record<string, unknown>).forceFreshSession === true,
     );
     const sessionMapKey = this.buildSessionMapKey(request);
-    const historyGapKey = this.buildLocalPdfHistoryGapKey(request.conversationKey);
+    const historyGapKey = this.buildLocalPdfHistoryGapKey(
+      request.conversationKey,
+    );
+    let lifecycleEpoch = this.lifecycleEpoch(request.conversationKey);
     if (forceFreshSession) {
       await this.invalidateConversationSession(request);
+      lifecycleEpoch = this.lifecycleEpoch(request.conversationKey);
     }
-    const hasHistoryGap = !forceFreshSession && !isLocalPdfTurn && Boolean(
-      await this.sessionMapper.get(historyGapKey),
-    );
+    const hasHistoryGap =
+      !forceFreshSession &&
+      !isLocalPdfTurn &&
+      Boolean(await this.sessionMapper.get(historyGapKey));
     const resolvedResume = forceFreshSession
       ? { providerSessionId: undefined, source: "force_fresh" as ResumeSource }
       : isLocalPdfTurn
         ? { providerSessionId: undefined, source: "local_pdf" as ResumeSource }
         : hasHistoryGap
-          ? { providerSessionId: undefined, source: "history_gap" as ResumeSource }
+          ? {
+              providerSessionId: undefined,
+              source: "history_gap" as ResumeSource,
+            }
           : await this.resolveProviderSessionId(request);
     const initialSessionId = resolvedResume.providerSessionId;
     if (hooks.onEvent) {
@@ -305,18 +486,39 @@ export class ClaudeCodeRuntimeAdapter {
       });
     }
     const providerSessionId = initialSessionId;
-    const effectiveRequest = isLocalPdfTurn || hasHistoryGap
-      ? this.withResumeFallbackHistory(request)
-      : request;
+    if (this.lifecycleEpoch(request.conversationKey) !== lifecycleEpoch) {
+      throw new Error("Conversation lifecycle changed before provider start");
+    }
+    const effectiveRequest =
+      isLocalPdfTurn || hasHistoryGap
+        ? this.withResumeFallbackHistory(request)
+        : request;
 
     let firstOutcome: RunTurnOutcome;
     try {
-      firstOutcome = await this.runTurnOnce(effectiveRequest, hooks, signal, providerSessionId);
+      firstOutcome = await this.runTurnOnce(
+        effectiveRequest,
+        hooks,
+        signal,
+        providerSessionId,
+        lifecycleEpoch,
+      );
     } catch (error) {
-      const originalMessage = error instanceof Error ? error.message : String(error);
+      const originalMessage =
+        error instanceof Error ? error.message : String(error);
       const err = new Error(sanitizeLocalPdfOutput(originalMessage, localPdfs));
-      if (providerSessionId && this.isInvalidThinkingSignatureError(err.message)) {
-        await this.sessionMapper.delete(sessionMapKey);
+      if (
+        providerSessionId &&
+        this.isInvalidThinkingSignatureError(err.message)
+      ) {
+        if (this.lifecycleEpoch(request.conversationKey) !== lifecycleEpoch) {
+          throw new Error(
+            "Conversation lifecycle changed during provider retry",
+          );
+        }
+        await this.withLifecycleLock(request.conversationKey, () =>
+          this.sessionMapper.delete(sessionMapKey),
+        );
         hooks.onEvent?.({
           type: "status",
           ts: Date.now(),
@@ -324,12 +526,26 @@ export class ClaudeCodeRuntimeAdapter {
             text: "Claude session resume failed. Retrying with a fresh Claude session and local Zotero history.",
           },
         });
-        return this.runTurnOnce(this.withResumeFallbackHistory(request), hooks, signal, undefined);
+        return this.runTurnOnce(
+          this.withResumeFallbackHistory(request),
+          hooks,
+          signal,
+          undefined,
+          lifecycleEpoch,
+        );
       }
       throw err;
     }
+    if (this.lifecycleEpoch(request.conversationKey) !== lifecycleEpoch) {
+      return { ...firstOutcome, providerSessionId: undefined };
+    }
     if (this.shouldRetryForThinkingSignature(providerSessionId, firstOutcome)) {
-      await this.sessionMapper.delete(sessionMapKey);
+      if (this.lifecycleEpoch(request.conversationKey) !== lifecycleEpoch) {
+        return { ...firstOutcome, providerSessionId: undefined };
+      }
+      await this.withLifecycleLock(request.conversationKey, () =>
+        this.sessionMapper.delete(sessionMapKey),
+      );
       hooks.onEvent?.({
         type: "status",
         ts: Date.now(),
@@ -337,16 +553,41 @@ export class ClaudeCodeRuntimeAdapter {
           text: "Claude session resume failed. Retrying with a fresh Claude session and local Zotero history.",
         },
       });
-      firstOutcome = await this.runTurnOnce(this.withResumeFallbackHistory(request), hooks, signal, undefined);
+      firstOutcome = await this.runTurnOnce(
+        this.withResumeFallbackHistory(request),
+        hooks,
+        signal,
+        undefined,
+        lifecycleEpoch,
+      );
     }
     if (isLocalPdfTurn && firstOutcome.status === "completed") {
-      await this.sessionMapper.delete(sessionMapKey);
-      await this.sessionMapper.deleteByPrefix(`${sessionMapKey}::provider:`);
-      await this.sessionMapper.set(historyGapKey, "1");
+      if (this.lifecycleEpoch(request.conversationKey) !== lifecycleEpoch) {
+        return { ...firstOutcome, providerSessionId: undefined };
+      }
+      await this.withLifecycleLock(request.conversationKey, async () => {
+        if (this.lifecycleEpoch(request.conversationKey) !== lifecycleEpoch) {
+          return;
+        }
+        await this.sessionMapper.delete(sessionMapKey);
+        await this.sessionMapper.deleteByPrefix(`${sessionMapKey}::provider:`);
+        await this.sessionMapper.set(historyGapKey, "1");
+      });
       return { ...firstOutcome, providerSessionId: undefined };
     }
-    if (hasHistoryGap && firstOutcome.status === "completed" && firstOutcome.providerSessionId) {
-      await this.sessionMapper.delete(historyGapKey);
+    if (
+      hasHistoryGap &&
+      firstOutcome.status === "completed" &&
+      firstOutcome.providerSessionId
+    ) {
+      if (this.lifecycleEpoch(request.conversationKey) !== lifecycleEpoch) {
+        return { ...firstOutcome, providerSessionId: undefined };
+      }
+      await this.withLifecycleLock(request.conversationKey, async () => {
+        if (this.lifecycleEpoch(request.conversationKey) === lifecycleEpoch) {
+          await this.sessionMapper.delete(historyGapKey);
+        }
+      });
     }
     return firstOutcome;
   }
@@ -367,6 +608,7 @@ export class ClaudeCodeRuntimeAdapter {
     hooks: RunTurnHooks,
     signal: AbortSignal | undefined,
     providerSessionId: string | undefined,
+    lifecycleEpoch: number,
   ): Promise<RunTurnOutcome> {
     const sessionMapKey = this.buildSessionMapKey(request);
     const localPdfs = collectLocalPdfs(request.runtimeRequest);
@@ -386,16 +628,28 @@ export class ClaudeCodeRuntimeAdapter {
     let resolvedSessionId = providerSessionId;
     if (persistProviderSession && stream.providerSessionId) {
       resolvedSessionId = stream.providerSessionId;
-      await this.sessionMapper.set(sessionMapKey, stream.providerSessionId);
+      const mappingWritten = await this.setSessionMappingIfCurrent(
+        request.conversationKey,
+        sessionMapKey,
+        stream.providerSessionId,
+        lifecycleEpoch,
+      );
+      if (!mappingWritten) resolvedSessionId = undefined;
     }
 
-    hooks.onStart?.({
-      runId: stream.runId,
-      conversationKey: request.conversationKey,
-      providerSessionId: persistProviderSession
-        ? stream.providerSessionId ?? providerSessionId
-        : undefined,
-    });
+    // The provider response may arrive after Clear/delete invalidated this
+    // lifecycle epoch.  Session writes above are fenced, but the host's
+    // onStart callback also mutates run/UI state and must not repopulate the
+    // cleared generation.
+    if (this.lifecycleEpoch(request.conversationKey) === lifecycleEpoch) {
+      hooks.onStart?.({
+        runId: stream.runId,
+        conversationKey: request.conversationKey,
+        providerSessionId: persistProviderSession
+          ? (stream.providerSessionId ?? providerSessionId)
+          : undefined,
+      });
+    }
 
     let finalText = "";
     let pendingTextDelta = "";
@@ -406,12 +660,14 @@ export class ClaudeCodeRuntimeAdapter {
     const sanitizeReasoningEvent = (event: AgentEvent): AgentEvent => {
       const sanitized = sanitizeLocalPdfOutput(event, localPdfs);
       if (event.type !== "reasoning") return sanitized;
-      const payload = event.payload && typeof event.payload === "object"
-        ? (event.payload as Record<string, unknown>)
-        : {};
-      const sanitizedPayload = sanitized.payload && typeof sanitized.payload === "object"
-        ? (sanitized.payload as Record<string, unknown>)
-        : {};
+      const payload =
+        event.payload && typeof event.payload === "object"
+          ? (event.payload as Record<string, unknown>)
+          : {};
+      const sanitizedPayload =
+        sanitized.payload && typeof sanitized.payload === "object"
+          ? (sanitized.payload as Record<string, unknown>)
+          : {};
       if (typeof payload.details !== "string") return sanitized;
       if (typeof payload.round === "number" && Number.isFinite(payload.round)) {
         lastReasoningRound = payload.round;
@@ -444,7 +700,13 @@ export class ClaudeCodeRuntimeAdapter {
         textLength: redactedDelta.length,
         eventTs,
       });
-      await this.emitEvent(stream.runId, request.conversationKey, mergedEvent, hooks);
+      await this.emitEvent(
+        stream.runId,
+        request.conversationKey,
+        mergedEvent,
+        hooks,
+        lifecycleEpoch,
+      );
     };
 
     const flushPendingTextDelta = async (): Promise<void> => {
@@ -469,14 +731,20 @@ export class ClaudeCodeRuntimeAdapter {
     const flushHeldReasoning = async (): Promise<void> => {
       const details = outputStreamSanitizer.flushText("reasoning");
       if (!details) return;
-      await this.emitEvent(stream.runId, request.conversationKey, {
-        type: "reasoning",
-        ts: lastReasoningTs ?? Date.now(),
-        payload: {
-          round: lastReasoningRound,
-          details,
+      await this.emitEvent(
+        stream.runId,
+        request.conversationKey,
+        {
+          type: "reasoning",
+          ts: lastReasoningTs ?? Date.now(),
+          payload: {
+            round: lastReasoningRound,
+            details,
+          },
         },
-      }, hooks);
+        hooks,
+        lifecycleEpoch,
+      );
     };
 
     try {
@@ -488,19 +756,22 @@ export class ClaudeCodeRuntimeAdapter {
           typeof mappedEvent.payload === "object"
             ? (mappedEvent.payload as Record<string, unknown>).providerType
             : undefined;
-        const event = mappedEvent.type === "message_delta"
-          ? mappedEvent
-          : mappedEvent.type === "reasoning"
-            ? sanitizeReasoningEvent(mappedEvent)
-          : mappedProviderType === "stream_event"
-            ? outputStreamSanitizer.sanitizeChunk(
-                "provider_event:stream_event",
-                mappedEvent,
-              )
-          : sanitizeLocalPdfOutput(mappedEvent, localPdfs);
+        const event =
+          mappedEvent.type === "message_delta"
+            ? mappedEvent
+            : mappedEvent.type === "reasoning"
+              ? sanitizeReasoningEvent(mappedEvent)
+              : mappedProviderType === "stream_event"
+                ? outputStreamSanitizer.sanitizeChunk(
+                    "provider_event:stream_event",
+                    mappedEvent,
+                  )
+                : sanitizeLocalPdfOutput(mappedEvent, localPdfs);
         const eventSessionId = this.extractSessionId(event.payload);
         const providerType =
-          event.type === "provider_event" && event.payload && typeof event.payload === "object"
+          event.type === "provider_event" &&
+          event.payload &&
+          typeof event.payload === "object"
             ? (event.payload as Record<string, unknown>).providerType
             : undefined;
         const canAdoptSessionId =
@@ -518,7 +789,13 @@ export class ClaudeCodeRuntimeAdapter {
           eventSessionId !== resolvedSessionId
         ) {
           resolvedSessionId = eventSessionId;
-          await this.sessionMapper.set(sessionMapKey, eventSessionId);
+          const mappingWritten = await this.setSessionMappingIfCurrent(
+            request.conversationKey,
+            sessionMapKey,
+            eventSessionId,
+            lifecycleEpoch,
+          );
+          if (!mappingWritten) resolvedSessionId = undefined;
         }
         if (event.type === "message_delta") {
           const delta = event.payload.delta;
@@ -540,11 +817,18 @@ export class ClaudeCodeRuntimeAdapter {
           this.logStreamingTiming("emit_final", {
             conversationKey: request.conversationKey,
             runId: stream.runId,
-            textLength: typeof output === "string" ? output.length : finalText.length,
+            textLength:
+              typeof output === "string" ? output.length : finalText.length,
             eventTs: event.ts,
           });
         }
-        await this.emitEvent(stream.runId, request.conversationKey, event, hooks);
+        await this.emitEvent(
+          stream.runId,
+          request.conversationKey,
+          event,
+          hooks,
+          lifecycleEpoch,
+        );
 
         if (event.type === "final") {
           const output = event.payload.output;
@@ -567,13 +851,16 @@ export class ClaudeCodeRuntimeAdapter {
       return {
         runId: stream.runId,
         conversationKey: request.conversationKey,
-        providerSessionId: persistProviderSession ? resolvedSessionId : undefined,
+        providerSessionId: persistProviderSession
+          ? resolvedSessionId
+          : undefined,
         status: signal?.aborted ? "cancelled" : "completed",
         finalText: sanitizeLocalPdfOutput(finalText, localPdfs),
       };
     } catch (error) {
       outputStreamSanitizer.discardAll();
-      const originalMessage = error instanceof Error ? error.message : String(error);
+      const originalMessage =
+        error instanceof Error ? error.message : String(error);
       const err = new Error(sanitizeLocalPdfOutput(originalMessage, localPdfs));
       const fallbackEvent: AgentEvent = {
         type: "fallback",
@@ -583,12 +870,20 @@ export class ClaudeCodeRuntimeAdapter {
           message: err.message,
         },
       };
-      await this.emitEvent(stream.runId, request.conversationKey, fallbackEvent, hooks);
+      await this.emitEvent(
+        stream.runId,
+        request.conversationKey,
+        fallbackEvent,
+        hooks,
+        lifecycleEpoch,
+      );
 
       return {
         runId: stream.runId,
         conversationKey: request.conversationKey,
-        providerSessionId: persistProviderSession ? resolvedSessionId : undefined,
+        providerSessionId: persistProviderSession
+          ? resolvedSessionId
+          : undefined,
         status: signal?.aborted ? "cancelled" : "failed",
         finalText: sanitizeLocalPdfOutput(finalText, localPdfs),
         error: err.message,
@@ -601,10 +896,12 @@ export class ClaudeCodeRuntimeAdapter {
     conversationKey: string,
     event: AgentEvent,
     hooks: RunTurnHooks,
+    lifecycleEpoch: number,
   ): Promise<void> {
+    if (this.lifecycleEpoch(conversationKey) !== lifecycleEpoch) return;
     hooks.onEvent?.(event);
     if (this.traceStore) {
-      void this.traceStore.append({ runId, conversationKey, event });
+      await this.traceStore.append({ runId, conversationKey, event });
     }
   }
 
@@ -621,12 +918,15 @@ export class ClaudeCodeRuntimeAdapter {
     return undefined;
   }
 
-  private isInvalidThinkingSignatureError(message: string | undefined): boolean {
+  private isInvalidThinkingSignatureError(
+    message: string | undefined,
+  ): boolean {
     if (!message) return false;
     const normalized = message.toLowerCase();
     return (
       normalized.includes("invalid signature in thinking block") ||
-      (normalized.includes("thinking block") && normalized.includes("invalid signature"))
+      (normalized.includes("thinking block") &&
+        normalized.includes("invalid signature"))
     );
   }
 
@@ -635,10 +935,16 @@ export class ClaudeCodeRuntimeAdapter {
     outcome: RunTurnOutcome,
   ): boolean {
     if (!initialSessionId) return false;
-    if (outcome.status === "failed" && this.isInvalidThinkingSignatureError(outcome.error)) {
+    if (
+      outcome.status === "failed" &&
+      this.isInvalidThinkingSignatureError(outcome.error)
+    ) {
       return true;
     }
-    if (outcome.status === "completed" && this.isInvalidThinkingSignatureError(outcome.finalText)) {
+    if (
+      outcome.status === "completed" &&
+      this.isInvalidThinkingSignatureError(outcome.finalText)
+    ) {
       return true;
     }
     return false;

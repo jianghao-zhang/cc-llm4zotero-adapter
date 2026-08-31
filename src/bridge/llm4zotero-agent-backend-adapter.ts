@@ -11,7 +11,7 @@ import type {
 import { mapToLlm4ZoteroEvent } from "../event-mapper/map-to-llm4zotero-event.js";
 import { findToolByName, getToolCatalog } from "./tool-catalog.js";
 import { globalPermissionStore } from "../permissions/permission-store.js";
-import type { RuntimeModelCatalog } from "../runtime.js";
+import type { RuntimeModelCatalog, RuntimePermissionModeCatalog } from "../runtime.js";
 
 const CATASTROPHIC_ARG_PATTERNS: RegExp[] = [
   /\brm\s+-rf\s+\/(?!\S)/i,
@@ -258,6 +258,14 @@ export class Llm4ZoteroAgentBackendAdapter {
       models: modelInfos.map((model) => model.value),
       modelInfos,
     };
+  }
+
+  async listPermissionModes(options?: {
+    settingSources?: Array<"user" | "project" | "local">;
+  }): Promise<RuntimePermissionModeCatalog> {
+    return this.adapter.listRuntimePermissionModes({
+      settingSources: options?.settingSources,
+    });
   }
 
   async listEfforts(

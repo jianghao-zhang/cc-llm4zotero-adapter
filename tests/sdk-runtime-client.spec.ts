@@ -617,8 +617,90 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
     }
 
     expect(seenOptions.permissionMode).toBe("bypassPermissions");
+    expect(seenOptions.allowDangerouslySkipPermissions).toBe(true);
     expect(seenOptions.canUseTool).toBeUndefined();
     expect(globalPermissionStore.pendingCount()).toBe(0);
+  });
+
+  it("accepts all six canonical Claude Code permission modes", async () => {
+    const seenModes: unknown[] = [];
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      queryImpl(args) {
+        seenModes.push(args.options.permissionMode);
+        return makeStream([
+          { type: "result", session_id: "session-mode", result: "ok", is_error: false }
+        ]);
+      },
+    });
+
+    for (const permissionMode of [
+      "default",
+      "acceptEdits",
+      "plan",
+      "auto",
+      "dontAsk",
+      "bypassPermissions",
+    ]) {
+      const stream = await runtime.startTurn({
+        conversationKey: `conv-mode-${permissionMode}`,
+        userMessage: "test permissions",
+        metadata: { permissionMode },
+      });
+      for await (const _event of stream.events) {
+        void _event;
+      }
+    }
+
+    expect(seenModes).toEqual([
+      "default",
+      "acceptEdits",
+      "plan",
+      "auto",
+      "dontAsk",
+      "bypassPermissions",
+    ]);
+  });
+
+  it("reports administrative availability from effective Claude settings", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "cc-l4z-permissions-"));
+    temporaryDirectories.add(cwd);
+    const runtime = new ClaudeAgentSdkRuntimeClient({
+      cwd,
+      queryImpl() {
+        return makeStream([]);
+      },
+      async resolveSettingsImpl() {
+        return {
+          effective: {
+            disableAutoMode: "disable",
+            permissions: {
+              defaultMode: "plan",
+              disableBypassPermissionsMode: "disable",
+            },
+          },
+        };
+      },
+    });
+
+    const catalog = await runtime.listPermissionModes({
+      settingSources: ["user", "project", "local"],
+    });
+
+    expect(catalog.configuredDefaultMode).toBe("plan");
+    expect(catalog.modes.map((mode) => mode.id)).toEqual([
+      "plan",
+      "dontAsk",
+      "default",
+      "acceptEdits",
+      "auto",
+      "bypassPermissions",
+    ]);
+    expect(catalog.modes.find((mode) => mode.id === "auto")).toMatchObject({
+      available: false,
+    });
+    expect(
+      catalog.modes.find((mode) => mode.id === "bypassPermissions"),
+    ).toMatchObject({ available: false });
   });
 
   it("ignores frontend model metadata by default", async () => {
@@ -1703,9 +1785,10 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
     expect(seenResumes).toEqual([undefined]);
   });
 
-  it("rebuilds retained hot runtime on option changes while resuming the same session", async () => {
+  it("rebuilds retained hot runtime on model and permission changes while resuming the same session", async () => {
     let queryCount = 0;
     const seenResumes: Array<unknown> = [];
+    const seenPermissionModes: Array<unknown> = [];
     let turnIndex = 0;
 
     const runtime = new ClaudeAgentSdkRuntimeClient({
@@ -1716,6 +1799,7 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
         if (typeof prompt !== "string") {
           queryCount += 1;
           seenResumes.push(options.resume);
+          seenPermissionModes.push(options.permissionMode);
         }
         return {
           async *[Symbol.asyncIterator]() {
@@ -1734,7 +1818,7 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
     const first = await runtime.startTurn({
       conversationKey: "conv-hot-rebuild",
       userMessage: "hello",
-      metadata: { model: "sonnet" }
+      metadata: { model: "sonnet", permissionMode: "default" }
     });
     for await (const _event of first.events) {
       void _event;
@@ -1743,14 +1827,28 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
     const second = await runtime.startTurn({
       conversationKey: "conv-hot-rebuild",
       userMessage: "again",
-      metadata: { model: "opus" }
+      metadata: { model: "opus", permissionMode: "default" }
     });
     for await (const _event of second.events) {
       void _event;
     }
 
-    expect(queryCount).toBe(2);
-    expect(seenResumes).toEqual([undefined, "sess-hot-rebuild"]);
+    const third = await runtime.startTurn({
+      conversationKey: "conv-hot-rebuild",
+      userMessage: "one more time",
+      metadata: { model: "opus", permissionMode: "plan" }
+    });
+    for await (const _event of third.events) {
+      void _event;
+    }
+
+    expect(queryCount).toBe(3);
+    expect(seenResumes).toEqual([
+      undefined,
+      "sess-hot-rebuild",
+      "sess-hot-rebuild",
+    ]);
+    expect(seenPermissionModes).toEqual(["default", "default", "plan"]);
   });
 
   it("uses a fresh ephemeral query for every PDF turn", async () => {

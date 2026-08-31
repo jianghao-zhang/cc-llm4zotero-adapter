@@ -1,4 +1,4 @@
-import type { ClaudeCodeRuntimeClient, RuntimeModelInfo } from "../runtime.js";
+import type { ClaudeCodeRuntimeClient, RuntimeModelInfo, RuntimePermissionModeCatalog } from "../runtime.js";
 import type { SessionMapper } from "../session-link/session-mapper.js";
 import type { TraceStore } from "../trace-store/trace-store.js";
 import type {
@@ -131,6 +131,16 @@ export class ClaudeCodeRuntimeAdapter {
     } catch {
       return ["default", "low", "medium", "high"];
     }
+  }
+
+  async listRuntimePermissionModes(options?: {
+    settingSources?: Array<"user" | "project" | "local">;
+    runtimeCwdRelative?: string;
+  }): Promise<RuntimePermissionModeCatalog> {
+    if (typeof this.runtimeClient.listPermissionModes !== "function") {
+      throw new Error("Claude Code runtime permission mode catalog is unavailable");
+    }
+    return this.runtimeClient.listPermissionModes(options);
   }
 
   async listRuntimeMcpServers(options?: {

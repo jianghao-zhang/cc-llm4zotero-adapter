@@ -302,7 +302,7 @@ export async function startHttpBridgeServer(
         sendJson(res, 200, {
           ok: true,
           protocolVersion: 2,
-          capabilities: ["local_pdf_paths", "model_catalog_v1"],
+          capabilities: ["local_pdf_paths", "model_catalog_v1", "permission_modes_v1"],
           ts: Date.now(),
         });
         return;
@@ -332,6 +332,17 @@ export async function startHttpBridgeServer(
         );
         const commands = await options.adapter.listCommands({ settingSources });
         sendJson(res, 200, { commands });
+        return;
+      }
+
+      if (req.method === "GET" && reqUrl.pathname === "/permission-modes") {
+        const settingSources = parseSettingSources(
+          reqUrl.searchParams.get("settingSources"),
+        );
+        const catalog = await options.adapter.listPermissionModes({
+          settingSources,
+        });
+        sendJson(res, 200, catalog);
         return;
       }
 

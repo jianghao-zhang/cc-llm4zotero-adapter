@@ -9,7 +9,7 @@ import { readFile } from "node:fs/promises";
 import { mkdirSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import type { ClaudeCodeRuntimeClient, McpServerStatus, ProviderEvent, RuntimeModelInfo, RuntimeTurnRequest, RuntimeTurnStream } from "../runtime.js";
+import type { ClaudeCodeRuntimeClient, McpServerStatus, ProviderEvent, RuntimeModelInfo, RuntimePermissionModeCatalog, RuntimeTurnRequest, RuntimeTurnStream } from "../runtime.js";
 import { mapSdkMessageToProviderEvents } from "../event-mapper/map-sdk-message.js";
 import { globalPermissionStore } from "../permissions/permission-store.js";
 import type { PermissionResult } from "../permissions/permission-store.js";
@@ -192,6 +192,8 @@ type ClaudeSettingsShape = {
   availableModels?: unknown;
   modelOverrides?: unknown;
   env?: unknown;
+  disableAutoMode?: unknown;
+  permissions?: unknown;
 };
 
 type RuntimeAttachment = {
@@ -692,7 +694,7 @@ function parsePermissionModeOverride(metadata: Record<string, unknown>): Permiss
   if (!normalized) return undefined;
   if (normalized === "yolo") return "bypassPermissions";
   if (normalized === "safe") return "default";
-  if (normalized === "default" || normalized === "acceptedits" || normalized === "bypasspermissions" || normalized === "plan" || normalized === "dontask") {
+  if (normalized === "default" || normalized === "acceptedits" || normalized === "bypasspermissions" || normalized === "plan" || normalized === "auto" || normalized === "dontask") {
     if (normalized === "acceptedits") return "acceptEdits";
     if (normalized === "bypasspermissions") return "bypassPermissions";
     if (normalized === "dontask") return "dontAsk";
@@ -2248,6 +2250,8 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
         mcpServers,
         settingSources: effectiveSettingSources,
         permissionMode: effectivePermissionMode,
+        allowDangerouslySkipPermissions:
+          effectivePermissionMode === "bypassPermissions" ? true : undefined,
         includePartialMessages: this.options.includePartialMessages,
         maxTurns: this.options.maxTurns,
         continue: localPdfs.length ? false : this.options.continue,
@@ -2300,6 +2304,72 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       return resolve(baseCwd, ".claude/settings.json");
     }
     return resolve(effectiveCwd, ".claude/settings.local.json");
+  }
+
+  async listPermissionModes(options?: {
+    settingSources?: Array<"user" | "project" | "local">;
+    runtimeCwdRelative?: string;
+  }): Promise<RuntimePermissionModeCatalog> {
+    const requestedSources = options?.settingSources;
+    const settingSources =
+      Array.isArray(requestedSources) && requestedSources.length > 0
+        ? requestedSources
+        : (this.options.settingSources ?? ["user", "project", "local"]);
+    const cwd = this.resolveScopedCwd({
+      runtimeCwdRelative: options?.runtimeCwdRelative,
+    });
+    const effectiveSettings = cwd
+      ? await this.readEffectiveSettingsFromSdk(cwd, settingSources)
+      : undefined;
+    const permissions = asRecord(effectiveSettings?.permissions);
+    const autoDisabled = effectiveSettings?.disableAutoMode === "disable";
+    const bypassDisabled =
+      permissions?.disableBypassPermissionsMode === "disable";
+    const modes: RuntimePermissionModeCatalog["modes"] = [
+      {
+        id: "plan",
+        description: "Plan without executing tools or making changes.",
+        available: true,
+      },
+      {
+        id: "dontAsk",
+        description: "Deny actions that require an interactive permission prompt.",
+        available: true,
+      },
+      {
+        id: "default",
+        description: "Use Claude Code's standard permission prompting.",
+        available: true,
+      },
+      {
+        id: "acceptEdits",
+        description: "Automatically accept file edits while retaining other prompts.",
+        available: true,
+      },
+      {
+        id: "auto",
+        description: "Use Claude Code's automatic permission approval mode.",
+        available: !autoDisabled,
+        disabledReason: autoDisabled
+          ? "Auto approval is disabled by the effective Claude Code settings."
+          : undefined,
+      },
+      {
+        id: "bypassPermissions",
+        description: "Bypass Claude Code permission checks.",
+        available: !bypassDisabled,
+        disabledReason: bypassDisabled
+          ? "Permission bypass is disabled by the effective Claude Code settings."
+          : undefined,
+      },
+    ];
+    return {
+      modes,
+      configuredDefaultMode:
+        typeof permissions?.defaultMode === "string"
+          ? permissions.defaultMode
+          : undefined,
+    };
   }
 
   private async readEffectiveSettingsFromSdk(

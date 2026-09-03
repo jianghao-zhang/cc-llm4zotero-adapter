@@ -260,6 +260,49 @@ npm run daemon:status
 npm run daemon:restart
 ```
 
+#### macOS LaunchAgent cannot find Node/npm installed by NVM
+
+If `npm run daemon:status` reports that the service is loaded but health is
+down, inspect the daemon error log:
+
+```bash
+tail -n 50 "$HOME/Library/Logs/cc-llm4zotero-adapter/bridge.stderr.log"
+```
+
+When it contains `zsh: command not found: npm`, the interactive shell can see
+NVM's Node installation but the macOS LaunchAgent cannot. An existing
+`node_modules` directory can also retain an older Claude Agent SDK after the
+repository is updated, which may leave older model names in the model menu.
+
+The following repair synchronizes dependencies, exposes the active NVM
+Node/npm executables through `$HOME/.local/bin` (already included in the
+LaunchAgent's `PATH`), and restarts the service:
+
+```bash
+cd /path/to/cc-llm4zotero-adapter
+
+npm ci
+
+mkdir -p "$HOME/.local/bin"
+ln -s "$(command -v node)" "$HOME/.local/bin/node"
+ln -s "$(command -v npm)" "$HOME/.local/bin/npm"
+
+npm run daemon:restart
+npm run daemon:status
+curl -fsS http://127.0.0.1:19787/healthz
+```
+
+If either symlink destination already exists, inspect it with `ls -l` before
+replacing it. After the health check succeeds, force-refresh the Claude model
+catalog and inspect the resolved model names:
+
+```bash
+curl -fsS 'http://127.0.0.1:19787/models?settingSources=user%2Cproject%2Clocal&refresh=1' \
+  | jq '.modelInfos[] | {value, resolvedModel, displayName}'
+```
+
+Then select **Retry loading Claude models** in llm-for-zotero.
+
 ### 2) Bridge URL or port mismatch
 
 - Make sure llm-for-zotero Bridge URL matches adapter bind address.

@@ -187,4 +187,41 @@ describe("mapSdkMessageToProviderEvents", () => {
       }),
     });
   });
+
+  it("normalizes Claude plan and task tools as host-owned transition requests", () => {
+    const events = mapSdkMessageToProviderEvents({
+      type: "assistant",
+      session_id: "session-plan",
+      message: {
+        content: [
+          {
+            type: "tool_use",
+            id: "exit-plan-1",
+            name: "ExitPlanMode",
+            input: { plan: "1. Inspect targets\n2. Apply and verify" },
+          },
+          {
+            type: "tool_use",
+            id: "todo-1",
+            name: "TodoWrite",
+            input: { todos: [{ content: "Inspect targets", status: "completed" }] },
+          },
+        ],
+      },
+    });
+
+    expect(events).toContainEqual({
+      type: "provider_event",
+      payload: expect.objectContaining({
+        providerType: "claude_plan",
+        payload: expect.objectContaining({ ready: true }),
+      }),
+    });
+    expect(events).toContainEqual({
+      type: "provider_event",
+      payload: expect.objectContaining({
+        providerType: "claude_task_progress",
+      }),
+    });
+  });
 });

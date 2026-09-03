@@ -331,6 +331,30 @@ export function mapSdkMessageToProviderEvents(raw: unknown): ProviderEvent[] {
           },
         });
       }
+      if (
+        block.type === "tool_use" &&
+        (block.name === "ExitPlanMode" ||
+          block.name === "TodoWrite" ||
+          block.name === "TaskCreate" ||
+          block.name === "TaskUpdate")
+      ) {
+        events.push({
+          type: "provider_event",
+          payload: {
+            providerType:
+              block.name === "ExitPlanMode"
+                ? "claude_plan"
+                : "claude_task_progress",
+            sessionId,
+            payload: {
+              toolUseId: block.id,
+              toolName: block.name,
+              input: block.input,
+              ready: block.name === "ExitPlanMode",
+            },
+          },
+        });
+      }
     }
 
     if (events.length === 0) {

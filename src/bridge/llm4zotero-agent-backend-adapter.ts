@@ -128,6 +128,12 @@ export class Llm4ZoteroAgentBackendAdapter {
     this.runtimeCwd = options.runtimeCwd;
   }
 
+  get supportsStructuredCompletion(): boolean { return this.adapter.supportsStructuredCompletion; }
+
+  completeStructured(request: import("../runtime.js").StructuredCompletionRequest): Promise<import("../runtime.js").StructuredCompletionResult> {
+    return this.adapter.completeStructured(request);
+  }
+
   resolveExternalConfirmation(
     requestId: string,
     resolution: { approved: boolean; actionId?: string; data?: unknown },

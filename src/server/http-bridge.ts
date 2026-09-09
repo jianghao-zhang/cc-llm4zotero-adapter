@@ -302,9 +302,28 @@ export async function startHttpBridgeServer(
         sendJson(res, 200, {
           ok: true,
           protocolVersion: 2,
-          capabilities: ["local_pdf_paths", "model_catalog_v1", "permission_modes_v1"],
+          capabilities: ["local_pdf_paths", "model_catalog_v1", "permission_modes_v1", ...(options.adapter.supportsStructuredCompletion ? ["structured_completion_v1"] : [])],
           ts: Date.now(),
         });
+        return;
+      }
+
+      if (req.method === "POST" && reqUrl.pathname === "/structured-completion") {
+        if (!options.adapter.supportsStructuredCompletion) { sendJson(res, 503, {error: "structured_completion_v1 is unavailable"}); return; }
+        const body = await readJson(req) as Record<string, unknown>;
+        if (!body || typeof body.prompt !== "string" || !body.prompt.trim() || (body.model !== undefined && typeof body.model !== "string")) {
+          sendJson(res, 400, { error: "A prompt and optional model are required" });
+          return;
+        }
+        const controller = new AbortController();
+        const cancel = () => controller.abort();
+        res.once("close", cancel);
+        try {
+          const result = await options.adapter.completeStructured({ prompt: body.prompt,
+            model: body.model as string | undefined,
+            timeoutMs: Math.min(300000, Math.max(1000, Number(body.timeoutMs) || 20000)), signal: controller.signal });
+          sendJson(res, 200, result);
+        } finally { res.off("close", cancel); }
         return;
       }
 

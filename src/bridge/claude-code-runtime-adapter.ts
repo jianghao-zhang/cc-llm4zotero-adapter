@@ -30,6 +30,13 @@ type ResumeSource =
   | "local_pdf";
 
 export class ClaudeCodeRuntimeAdapter {
+  get supportsStructuredCompletion(): boolean { return typeof this.runtimeClient.completeStructured === "function"; }
+
+  async completeStructured(request: import("../runtime.js").StructuredCompletionRequest): Promise<import("../runtime.js").StructuredCompletionResult> {
+    if (!this.runtimeClient.completeStructured) throw new Error("structured_completion_v1 is unavailable");
+    return this.runtimeClient.completeStructured(request);
+  }
+
   private readonly runtimeClient: ClaudeCodeRuntimeClient;
   private readonly sessionMapper: SessionMapper;
   private readonly traceStore?: TraceStore;

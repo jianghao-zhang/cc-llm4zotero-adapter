@@ -44,6 +44,25 @@ function isHostAbsolutePath(value: string): boolean {
   return /^[A-Za-z]:\\/.test(windowsPath) || /^\\\\[^\\]+\\[^\\]+(?:\\|$)/.test(windowsPath);
 }
 
+const WINDOWS_DRIVE_PATH = /^([A-Za-z]):[\\/](.*)$/;
+
+/**
+ * Zotero on Windows sends drive-letter paths such as
+ * C:\Users\...\paper.pdf. When this bridge runs inside WSL,
+ * isHostAbsolutePath sees a string that is not POSIX-absolute, so
+ * collectLocalPdfs throws "Invalid local PDF resource batch." for a
+ * file that is readable under the automount root. Translate only on
+ * POSIX, where a drive-letter path can never be a valid absolute path,
+ * so a bridge running on Windows is unaffected.
+ */
+function translateWindowsPathForPosix(value: string): string {
+  if (process.platform === "win32") return value;
+  const match = value.match(WINDOWS_DRIVE_PATH);
+  if (!match) return value;
+  const mountRoot = (process.env.ADAPTER_WINDOWS_DRIVE_MOUNT_ROOT || "/mnt").replace(/\/+$/, "");
+  return `${mountRoot}/${match[1].toLowerCase()}/${match[2].replace(/\\/g, "/")}`;
+}
+
 function stringifyJson(value: unknown): string {
   return JSON.stringify(value)
     .replace(/\u2028/g, "\\u2028")
@@ -91,7 +110,9 @@ export function collectLocalPdfs(runtimeRequest: unknown): readonly LocalPdfReso
     const itemId = asPositiveInteger(record?.itemId);
     const contextItemId = asPositiveInteger(record?.contextItemId);
     const sourceKey = typeof record?.sourceKey === "string" ? record.sourceKey : "";
-    const absolutePath = typeof record?.absolutePath === "string" ? record.absolutePath : "";
+    const absolutePath = translateWindowsPathForPosix(
+      typeof record?.absolutePath === "string" ? record.absolutePath : "",
+    );
     const title = cleanLabel(record?.title, "");
     const name = cleanLabel(record?.name, "");
     if (

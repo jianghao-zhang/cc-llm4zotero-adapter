@@ -230,6 +230,7 @@ npm run serve:bridge
 | `--state-dir` | `ADAPTER_STATE_DIR` | Session/trace persistence directory. Defaults to the legacy Zotero state path when available. |
 | `--zotero-root` | `ZOTERO_ROOT` | Override the legacy Zotero root used to derive default runtime/state paths. Useful when Zotero data is not under the home directory. |
 | `--additional-directories` | `ADAPTER_ADDITIONAL_DIRECTORIES` | Extra readable directories (comma-separated, `~` supported). |
+| (env only) | `ADAPTER_WINDOWS_DRIVE_MOUNT_ROOT` | Where Windows drives are mounted when the bridge runs under WSL while Zotero runs on Windows (default `/mnt`). Raw PDF paths such as `C:\Users\...` are mapped to `<root>/c/Users/...`. |
 | `--default-allowed-tools` | `ADAPTER_DEFAULT_ALLOWED_TOOLS` | Tools always auto-allowed (comma-separated). Default: `WebFetch,WebSearch`. |
 | `--setting-sources` | `ADAPTER_SETTING_SOURCES` | Claude settings sources: `user`, `project`, `local` (comma-separated). Default: `user,project,local`. |
 | `--append-system-prompt` | `ADAPTER_APPEND_SYSTEM_PROMPT` | Inline overlay prompt text. |

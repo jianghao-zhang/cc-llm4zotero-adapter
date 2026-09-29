@@ -672,4 +672,56 @@ describe("http bridge server", () => {
       await server.close();
     }
   });
+
+  describe("request hardening", () => {
+    async function startServer() {
+      const runtimeClient: ClaudeCodeRuntimeClient = {
+        async startTurn() { return { runId: "fixture", events: providerEvents([]) }; },
+      };
+      const base = new ClaudeCodeRuntimeAdapter({ runtimeClient, sessionMapper: new InMemorySessionMapper() });
+      return startHttpBridgeServer({ adapter: new Llm4ZoteroAgentBackendAdapter({ adapter: base }) });
+    }
+
+    it("rejects a non-loopback Host header (DNS rebinding)", async () => {
+      const server = await startServer();
+      try {
+        const { request } = await import("node:http");
+        const status = await new Promise<number>((resolve, reject) => {
+          const req = request(
+            { host: server.host, port: server.port, path: "/healthz", headers: { Host: "attacker.example:19787" } },
+            (res) => { res.resume(); resolve(res.statusCode ?? 0); },
+          );
+          req.on("error", reject);
+          req.end();
+        });
+        expect(status).toBe(403);
+      } finally {
+        await server.close();
+      }
+    });
+
+    it("rejects POST requests that are not application/json (cross-site form/text posts)", async () => {
+      const server = await startServer();
+      try {
+        const response = await fetch(`http://${server.host}:${server.port}/run-turn`, {
+          method: "POST",
+          headers: { "Content-Type": "text/plain" },
+          body: JSON.stringify({ conversationKey: "k", userText: "hi", metadata: { permissionMode: "yolo" } }),
+        });
+        expect(response.status).toBe(415);
+      } finally {
+        await server.close();
+      }
+    });
+
+    it("still serves loopback GET requests", async () => {
+      const server = await startServer();
+      try {
+        const response = await fetch(`http://${server.host}:${server.port}/healthz`);
+        expect(response.status).toBe(200);
+      } finally {
+        await server.close();
+      }
+    });
+  });
 });

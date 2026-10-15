@@ -115,6 +115,29 @@ function redactSecrets(value: unknown): unknown {
   );
 }
 
+const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "localhost", "[::1]"]);
+
+/**
+ * Guards against DNS rebinding: the Host header must name a loopback address
+ * (or the explicitly configured bind host). A rebound attacker domain resolves
+ * to 127.0.0.1 but still sends its own hostname in Host.
+ */
+function isAllowedHostHeader(hostHeader: string | undefined, bindHost: string): boolean {
+  if (!hostHeader) return false;
+  const hostname = hostHeader.replace(/:\d+$/, "").toLowerCase();
+  return LOOPBACK_HOSTNAMES.has(hostname) || hostname === bindHost.toLowerCase();
+}
+
+/**
+ * Guards against cross-site request forgery: a browser can only send
+ * application/json cross-origin after a CORS preflight, which this server
+ * never approves. Requiring it blocks "simple" text/plain POSTs from web pages.
+ */
+function hasJsonContentType(req: IncomingMessage): boolean {
+  const contentType = String(req.headers["content-type"] ?? "");
+  return /^application\/json\s*(;|$)/i.test(contentType.trim());
+}
+
 async function readJson(req: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
   for await (const chunk of req) {
@@ -297,6 +320,14 @@ export async function startHttpBridgeServer(
 
   const server = createServer(async (req, res) => {
     try {
+      if (!isAllowedHostHeader(req.headers.host, host)) {
+        sendJson(res, 403, { error: "Forbidden host" });
+        return;
+      }
+      if (req.method === "POST" && !hasJsonContentType(req)) {
+        sendJson(res, 415, { error: "Content-Type must be application/json" });
+        return;
+      }
       const reqUrl = new URL(req.url || "/", `http://${host}:${port}`);
       if (req.method === "GET" && req.url === "/healthz") {
         sendJson(res, 200, {

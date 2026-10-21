@@ -6,8 +6,8 @@ import type {
   SettingSource,
 } from "@anthropic-ai/claude-agent-sdk";
 import { readFile } from "node:fs/promises";
-import { existsSync, lstatSync, mkdirSync, symlinkSync } from "node:fs";
-import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { mkdirSync } from "node:fs";
+import { isAbsolute, relative, resolve } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import type { ClaudeCodeRuntimeClient, McpServerStatus, ProviderEvent, RuntimeAccountQuota, RuntimeAccountQuotaOptions, RuntimeModelInfo, RuntimePermissionModeCatalog, RuntimeTurnRequest, RuntimeTurnStream } from "../runtime.js";
 import { mapSdkMessageToProviderEvents } from "../event-mapper/map-sdk-message.js";
@@ -834,6 +834,47 @@ function resolveProfileProjectRoot(baseCwd: string, scopedCwd: string): string {
   const firstSegment = rel.split(/[\\/]/)[0];
   return PROFILE_SEGMENT_PATTERN.test(firstSegment) ? resolve(baseCwd, firstSegment) : baseCwd;
 }
+function isPlainSettingsObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+async function readSettingsObject(path: string): Promise<Record<string, unknown> | undefined> {
+  let raw: string;
+  try {
+    raw = await readFile(path, "utf8");
+  } catch {
+    return undefined;
+  }
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (isPlainSettingsObject(parsed)) return parsed;
+    console.warn(`[cc-llm4zotero-adapter] ignoring settings file that is not a JSON object: ${path}`);
+  } catch (error) {
+    console.warn(
+      `[cc-llm4zotero-adapter] ignoring unparseable settings file ${path}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  return undefined;
+}
+// Mirrors Claude Code's scope merge: objects merge per key, arrays are
+// concatenated without duplicates, and other values from the override win.
+function mergeSettingsLayers(
+  base: Record<string, unknown>,
+  override: Record<string, unknown>,
+): Record<string, unknown> {
+  const merged: Record<string, unknown> = { ...base };
+  for (const [key, value] of Object.entries(override)) {
+    const existing = merged[key];
+    if (isPlainSettingsObject(existing) && isPlainSettingsObject(value)) {
+      merged[key] = mergeSettingsLayers(existing, value);
+    } else if (Array.isArray(existing) && Array.isArray(value)) {
+      const seen = new Set(existing.map((entry) => JSON.stringify(entry)));
+      merged[key] = [...existing, ...value.filter((entry) => !seen.has(JSON.stringify(entry)))];
+    } else {
+      merged[key] = value;
+    }
+  }
+  return merged;
+}
 async function buildSettingsStackIdentity(
   settingSources: SettingSource[],
   resolveSettingsPathBySource: (source: "user" | "project" | "local", cwdOverride?: string) => string | undefined,
@@ -883,6 +924,7 @@ function buildHotRuntimeSignature(
         : null,
     mcpServers: normalizeMcpServers(queryOptions.mcpServers) ?? null,
     allowedTools: toStableStringList(queryOptions.allowedTools, true),
+    settings: isPlainSettingsObject(queryOptions.settings) ? queryOptions.settings : null,
     configSourceMode:
       typeof metadata.claudeConfigSource === "string" && metadata.claudeConfigSource.trim()
         ? metadata.claudeConfigSource.trim()
@@ -2229,6 +2271,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       ),
     );
     const effectiveSettingSources = settingSourcesOverride ?? this.options.settingSources ?? ["user", "project", "local"];
+    const profileFlagSettings = await this.loadProfileFlagSettings(effectiveSettingSources, effectiveCwd);
     const mcpServers = normalizeMcpServers(request.mcpServers ?? rawRequestMetadata.mcpServers);
     const providerKey =
       (await buildSettingsStackIdentity(
@@ -2323,6 +2366,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
         hooks: localPdfReadHooks ?? metadata.hooks,
         mcpServers,
         settingSources: effectiveSettingSources,
+        settings: profileFlagSettings,
         permissionMode: effectivePermissionMode,
         allowDangerouslySkipPermissions:
           effectivePermissionMode === "bypassPermissions" ? true : undefined,
@@ -2362,38 +2406,35 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       return baseCwd;
     }
     mkdirSync(candidate, { recursive: true });
-    this.linkProfileProjectSettings(baseCwd, candidate);
     return candidate;
   }
 
   // Claude Code reads project settings only from <cwd>/.claude/settings.json and
-  // never walks up, so a scoped conversation cwd would otherwise ignore the
-  // profile-level settings file that llm-for-zotero presents as the project
-  // layer. Symlinking keeps one editable source of truth and preserves the
-  // documented precedence (conversation settings.local.json still wins).
-  private linkProfileProjectSettings(baseCwd: string, scopedCwd: string): void {
-    const projectRoot = resolveProfileProjectRoot(baseCwd, scopedCwd);
-    if (projectRoot === scopedCwd) return;
-    const target = resolve(projectRoot, ".claude/settings.json");
-    const link = resolve(scopedCwd, ".claude/settings.json");
-    if (!existsSync(target)) return;
-    try {
-      lstatSync(link);
-      // Never replace an existing per-conversation file or link.
-      return;
-    } catch {
-      // Missing; create it below.
+  // never walks up, so a scoped conversation cwd ignores the profile-level
+  // settings file that llm-for-zotero presents as the project layer. SDK
+  // sessions also never accept workspace trust, so project-level allow rules
+  // would be dropped even if the file were found there. Instead, merge the
+  // profile file with the conversation's settings.local.json (local wins) and
+  // pass the result as flag settings, which keeps local > project > user.
+  private async loadProfileFlagSettings(
+    effectiveSettingSources: SettingSource[],
+    effectiveCwd: string | undefined,
+  ): Promise<Record<string, unknown> | undefined> {
+    if (!effectiveSettingSources.includes("project")) return undefined;
+    const projectPath = this.resolveSettingsPathBySource("project", effectiveCwd);
+    const localPath = effectiveSettingSources.includes("local")
+      ? this.resolveSettingsPathBySource("local", effectiveCwd)
+      : undefined;
+    const layers: Record<string, unknown>[] = [];
+    for (const path of [projectPath, localPath]) {
+      if (!path) continue;
+      const layer = await readSettingsObject(path);
+      if (layer) layers.push(layer);
     }
-    try {
-      mkdirSync(dirname(link), { recursive: true });
-      symlinkSync(relative(dirname(link), target), link, "file");
-    } catch (error) {
-      // Windows without symlink privilege, read-only trees, races: fall back to
-      // Claude Code's default behavior rather than failing the turn.
-      console.warn(
-        `[cc-llm4zotero-adapter] could not link project settings into ${scopedCwd}: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
+    if (!layers.length) return undefined;
+    const merged = layers.reduce(mergeSettingsLayers, {});
+    delete merged.$schema;
+    return Object.keys(merged).length ? merged : undefined;
   }
 
   private resolveSettingsPathBySource(source: "user" | "project" | "local", cwdOverride?: string): string | undefined {

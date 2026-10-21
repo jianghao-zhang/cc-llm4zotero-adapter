@@ -824,6 +824,57 @@ function shouldAutoCompact(
   const percentage = Math.round((contextTokens / contextWindow) * 100);
   return percentage >= threshold;
 }
+const PROFILE_SEGMENT_PATTERN = /^profile-[A-Za-z0-9_-]+$/;
+
+// The project layer for a scoped cwd is its Zotero profile runtime root
+// (<base>/profile-xxx) when present, otherwise the shared runtime root.
+function resolveProfileProjectRoot(baseCwd: string, scopedCwd: string): string {
+  const rel = relative(baseCwd, scopedCwd);
+  if (!rel || rel.startsWith("..") || isAbsolute(rel)) return baseCwd;
+  const firstSegment = rel.split(/[\\/]/)[0];
+  return PROFILE_SEGMENT_PATTERN.test(firstSegment) ? resolve(baseCwd, firstSegment) : baseCwd;
+}
+function isPlainSettingsObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+async function readSettingsObject(path: string): Promise<Record<string, unknown> | undefined> {
+  let raw: string;
+  try {
+    raw = await readFile(path, "utf8");
+  } catch {
+    return undefined;
+  }
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (isPlainSettingsObject(parsed)) return parsed;
+    console.warn(`[cc-llm4zotero-adapter] ignoring settings file that is not a JSON object: ${path}`);
+  } catch (error) {
+    console.warn(
+      `[cc-llm4zotero-adapter] ignoring unparseable settings file ${path}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  return undefined;
+}
+// Mirrors Claude Code's scope merge: objects merge per key, arrays are
+// concatenated without duplicates, and other values from the override win.
+function mergeSettingsLayers(
+  base: Record<string, unknown>,
+  override: Record<string, unknown>,
+): Record<string, unknown> {
+  const merged: Record<string, unknown> = { ...base };
+  for (const [key, value] of Object.entries(override)) {
+    const existing = merged[key];
+    if (isPlainSettingsObject(existing) && isPlainSettingsObject(value)) {
+      merged[key] = mergeSettingsLayers(existing, value);
+    } else if (Array.isArray(existing) && Array.isArray(value)) {
+      const seen = new Set(existing.map((entry) => JSON.stringify(entry)));
+      merged[key] = [...existing, ...value.filter((entry) => !seen.has(JSON.stringify(entry)))];
+    } else {
+      merged[key] = value;
+    }
+  }
+  return merged;
+}
 async function buildSettingsStackIdentity(
   settingSources: SettingSource[],
   resolveSettingsPathBySource: (source: "user" | "project" | "local", cwdOverride?: string) => string | undefined,
@@ -873,6 +924,7 @@ function buildHotRuntimeSignature(
         : null,
     mcpServers: normalizeMcpServers(queryOptions.mcpServers) ?? null,
     allowedTools: toStableStringList(queryOptions.allowedTools, true),
+    settings: isPlainSettingsObject(queryOptions.settings) ? queryOptions.settings : null,
     configSourceMode:
       typeof metadata.claudeConfigSource === "string" && metadata.claudeConfigSource.trim()
         ? metadata.claudeConfigSource.trim()
@@ -2219,6 +2271,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       ),
     );
     const effectiveSettingSources = settingSourcesOverride ?? this.options.settingSources ?? ["user", "project", "local"];
+    const profileFlagSettings = await this.loadProfileFlagSettings(effectiveSettingSources, effectiveCwd);
     const mcpServers = normalizeMcpServers(request.mcpServers ?? rawRequestMetadata.mcpServers);
     const providerKey =
       (await buildSettingsStackIdentity(
@@ -2313,6 +2366,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
         hooks: localPdfReadHooks ?? metadata.hooks,
         mcpServers,
         settingSources: effectiveSettingSources,
+        settings: profileFlagSettings,
         permissionMode: effectivePermissionMode,
         allowDangerouslySkipPermissions:
           effectivePermissionMode === "bypassPermissions" ? true : undefined,
@@ -2355,6 +2409,45 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
     return candidate;
   }
 
+  // Claude Code reads project settings only from <cwd>/.claude/settings.json and
+  // never walks up, so a scoped conversation cwd ignores the profile-level
+  // settings file that llm-for-zotero presents as the project layer. SDK
+  // sessions also never accept workspace trust, so project-level allow rules
+  // would be dropped even if the file were found there. Instead, merge the
+  // profile and conversation settings files and pass the result as flag
+  // settings. Lowest to highest priority:
+  //   <profile>/.claude/settings.json
+  //   <profile>/.claude/settings.local.json
+  //   <conversation>/.claude/settings.json
+  //   <conversation>/.claude/settings.local.json
+  // settings.json files follow the `project` source; settings.local.json files
+  // follow the `local` source.
+  private async loadProfileFlagSettings(
+    effectiveSettingSources: SettingSource[],
+    effectiveCwd: string | undefined,
+  ): Promise<Record<string, unknown> | undefined> {
+    const baseCwd = this.options.cwd ? resolve(this.options.cwd) : process.cwd();
+    const conversationDir = effectiveCwd ? resolve(effectiveCwd) : baseCwd;
+    const profileDir = resolveProfileProjectRoot(baseCwd, conversationDir);
+    const includeProject = effectiveSettingSources.includes("project");
+    const includeLocal = effectiveSettingSources.includes("local");
+    const paths: string[] = [];
+    for (const dir of [profileDir, conversationDir]) {
+      if (includeProject) paths.push(resolve(dir, ".claude/settings.json"));
+      if (includeLocal) paths.push(resolve(dir, ".claude/settings.local.json"));
+    }
+    const layers: Record<string, unknown>[] = [];
+    // Scopes at the runtime or profile root resolve both dirs to one folder.
+    for (const path of new Set(paths)) {
+      const layer = await readSettingsObject(path);
+      if (layer) layers.push(layer);
+    }
+    if (!layers.length) return undefined;
+    const merged = layers.reduce(mergeSettingsLayers, {});
+    delete merged.$schema;
+    return Object.keys(merged).length ? merged : undefined;
+  }
+
   private resolveSettingsPathBySource(source: "user" | "project" | "local", cwdOverride?: string): string | undefined {
     const homeDirRaw = (process.env.HOME || process.env.USERPROFILE || "").trim();
     const homeDir = homeDirRaw ? resolve(homeDirRaw) : undefined;
@@ -2365,7 +2458,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       return resolve(homeDir, ".claude/settings.json");
     }
     if (source === "project") {
-      return resolve(baseCwd, ".claude/settings.json");
+      return resolve(resolveProfileProjectRoot(baseCwd, effectiveCwd), ".claude/settings.json");
     }
     return resolve(effectiveCwd, ".claude/settings.local.json");
   }

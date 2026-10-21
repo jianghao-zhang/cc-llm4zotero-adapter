@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { ClaudeCodeRuntimeAdapter } from "../src/bridge/claude-code-runtime-adapter.js";
@@ -1086,6 +1086,211 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
     expect(probeCwds).toEqual([scopedCwd]);
     expect(turnOptions.cwd).toBe(scopedCwd);
     expect(turnOptions.effort).toBe("high");
+  });
+
+  describe("profile project settings", () => {
+    const conversationScope =
+      "profile-test/scopes/paper/profile-test:1:42/conversations/0042";
+
+    function makeTurnRuntime(directory: string, settingSources?: Array<"user" | "project" | "local">) {
+      const seen: Array<Record<string, unknown>> = [];
+      const runtime = new ClaudeAgentSdkRuntimeClient({
+        cwd: directory,
+        settingSources: settingSources ?? ["project", "local"],
+        queryImpl(args) {
+          seen.push(args.options);
+          return makeStream([
+            { type: "result", session_id: "session-profile-settings", result: "ok", is_error: false },
+          ]);
+        },
+      });
+      return { runtime, seen };
+    }
+
+    async function runScopedTurn(
+      runtime: ClaudeAgentSdkRuntimeClient,
+      runtimeCwdRelative: string,
+      metadata: Record<string, unknown> = {},
+    ) {
+      const turn = await runtime.startTurn({
+        conversationKey: "conv-profile-settings",
+        userMessage: "hello",
+        metadata: { runtimeCwdRelative, ...metadata },
+      });
+      for await (const _event of turn.events) {
+        // Drain the turn so the query completes.
+      }
+    }
+
+    async function makeRuntimeRoot(prefix: string): Promise<string> {
+      const directory = await mkdtemp(join(tmpdir(), prefix));
+      temporaryDirectories.add(directory);
+      return directory;
+    }
+
+    async function writeJson(path: string, value: unknown) {
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(path, `${JSON.stringify(value)}\n`);
+    }
+
+    it("passes the profile settings.json as flag settings for scoped conversations", async () => {
+      const directory = await makeRuntimeRoot("cc-l4z-profile-flag-");
+      const profileSettings = join(directory, "profile-test", ".claude", "settings.json");
+      await writeJson(profileSettings, {
+        $schema: "https://json.schemastore.org/claude-code-settings.json",
+        permissions: { allow: ["Edit(~/tmp/**)"] },
+        sandbox: { enabled: true },
+      });
+      const { runtime, seen } = makeTurnRuntime(directory);
+
+      await runScopedTurn(runtime, conversationScope);
+
+      expect(seen[0].cwd).toBe(resolve(directory, conversationScope));
+      expect(seen[0].settings).toEqual({
+        permissions: { allow: ["Edit(~/tmp/**)"] },
+        sandbox: { enabled: true },
+      });
+      expect(String(seen[0].appendSystemPrompt)).toContain(`project: ${profileSettings}`);
+      await expect(lstat(join(directory, conversationScope, ".claude", "settings.json"))).rejects.toThrow();
+    });
+
+    it("lets the conversation settings.local.json override the profile file", async () => {
+      const directory = await makeRuntimeRoot("cc-l4z-profile-local-");
+      await writeJson(join(directory, "profile-test", ".claude", "settings.json"), {
+        model: "opus",
+        permissions: { allow: ["Read(~/Zotero/**)"], defaultMode: "default" },
+        sandbox: { enabled: true, filesystem: { allowWrite: ["~/tmp"] } },
+      });
+      await writeJson(join(directory, conversationScope, ".claude", "settings.local.json"), {
+        model: "sonnet",
+        permissions: { allow: ["Read(~/Zotero/**)", "Edit(./notes/**)"] },
+        sandbox: { filesystem: { allowWrite: ["~/scratch"] } },
+      });
+      const { runtime, seen } = makeTurnRuntime(directory);
+
+      await runScopedTurn(runtime, conversationScope);
+
+      expect(seen[0].settings).toEqual({
+        model: "sonnet",
+        permissions: { allow: ["Read(~/Zotero/**)", "Edit(./notes/**)"], defaultMode: "default" },
+        sandbox: { enabled: true, filesystem: { allowWrite: ["~/tmp", "~/scratch"] } },
+      });
+    });
+
+    it("merges profile and conversation settings files in priority order", async () => {
+      const directory = await makeRuntimeRoot("cc-l4z-profile-order-");
+      const profileDir = join(directory, "profile-test", ".claude");
+      const conversationDir = join(directory, conversationScope, ".claude");
+      await writeJson(join(profileDir, "settings.json"), {
+        model: "profile",
+        effortLevel: "profile",
+        env: { FROM: "profile", PROFILE_ONLY: "1" },
+        permissions: { allow: ["Read(~/a/**)"] },
+      });
+      await writeJson(join(profileDir, "settings.local.json"), {
+        model: "profile-local",
+        effortLevel: "profile-local",
+        env: { FROM: "profile-local" },
+        permissions: { allow: ["Read(~/b/**)"] },
+      });
+      await writeJson(join(conversationDir, "settings.json"), {
+        model: "conversation",
+        env: { FROM: "conversation" },
+        permissions: { allow: ["Read(~/c/**)"] },
+      });
+      await writeJson(join(conversationDir, "settings.local.json"), {
+        model: "conversation-local",
+        permissions: { allow: ["Read(~/d/**)"] },
+      });
+      const { runtime, seen } = makeTurnRuntime(directory);
+
+      await runScopedTurn(runtime, conversationScope);
+
+      expect(seen[0].settings).toEqual({
+        model: "conversation-local",
+        effortLevel: "profile-local",
+        env: { FROM: "conversation", PROFILE_ONLY: "1" },
+        permissions: { allow: ["Read(~/a/**)", "Read(~/b/**)", "Read(~/c/**)", "Read(~/d/**)"] },
+      });
+    });
+
+    it("gates settings.json files on project and settings.local.json files on local", async () => {
+      const directory = await makeRuntimeRoot("cc-l4z-profile-gates-");
+      const profileDir = join(directory, "profile-test", ".claude");
+      const conversationDir = join(directory, conversationScope, ".claude");
+      await writeJson(join(profileDir, "settings.json"), { env: { P: "1" } });
+      await writeJson(join(profileDir, "settings.local.json"), { env: { PL: "1" } });
+      await writeJson(join(conversationDir, "settings.json"), { env: { C: "1" } });
+      await writeJson(join(conversationDir, "settings.local.json"), { env: { CL: "1" } });
+      const { runtime, seen } = makeTurnRuntime(directory);
+
+      await runScopedTurn(runtime, conversationScope, { claudeSettingSources: ["user", "project"] });
+      await runScopedTurn(runtime, conversationScope, { claudeSettingSources: ["local"] });
+
+      expect(seen.map((options) => options.settings)).toEqual([
+        { env: { P: "1", C: "1" } },
+        { env: { PL: "1", CL: "1" } },
+      ]);
+    });
+
+    it("omits the local layer when local settings are not an active source", async () => {
+      const directory = await makeRuntimeRoot("cc-l4z-profile-nolocal-");
+      await writeJson(join(directory, "profile-test", ".claude", "settings.json"), { model: "opus" });
+      await writeJson(join(directory, conversationScope, ".claude", "settings.local.json"), { model: "sonnet" });
+      const { runtime, seen } = makeTurnRuntime(directory, ["user", "project"]);
+
+      await runScopedTurn(runtime, conversationScope);
+
+      expect(seen[0].settings).toEqual({ model: "opus" });
+    });
+
+    it("passes no flag settings when project settings are not an active source", async () => {
+      const directory = await makeRuntimeRoot("cc-l4z-profile-useronly-");
+      await writeJson(join(directory, "profile-test", ".claude", "settings.json"), { model: "opus" });
+      const { runtime, seen } = makeTurnRuntime(directory);
+
+      await runScopedTurn(runtime, conversationScope, { claudeSettingSources: ["user"] });
+
+      expect(seen[0].settings).toBeUndefined();
+    });
+
+    it("skips missing or unparseable settings files without failing the turn", async () => {
+      const directory = await makeRuntimeRoot("cc-l4z-profile-bad-");
+      const profileSettings = join(directory, "profile-test", ".claude", "settings.json");
+      await mkdir(dirname(profileSettings), { recursive: true });
+      await writeFile(profileSettings, "{ not json");
+      const { runtime, seen } = makeTurnRuntime(directory);
+
+      await runScopedTurn(runtime, conversationScope);
+
+      expect(seen[0].settings).toBeUndefined();
+    });
+
+    it("uses the shared runtime root settings for scopes without a profile segment", async () => {
+      const directory = await makeRuntimeRoot("cc-l4z-profile-shared-");
+      await writeJson(join(directory, ".claude", "settings.json"), { env: { SHARED: "1" } });
+      const { runtime, seen } = makeTurnRuntime(directory);
+
+      await runScopedTurn(runtime, "scopes/open/open-1/conversations/7");
+
+      expect(seen[0].settings).toEqual({ env: { SHARED: "1" } });
+    });
+
+    it("reads profile edits on the next turn", async () => {
+      const directory = await makeRuntimeRoot("cc-l4z-profile-edit-");
+      const profileSettings = join(directory, "profile-test", ".claude", "settings.json");
+      await writeJson(profileSettings, { permissions: { allow: ["Read(~/a/**)"] } });
+      const { runtime, seen } = makeTurnRuntime(directory);
+
+      await runScopedTurn(runtime, conversationScope);
+      await writeJson(profileSettings, { permissions: { allow: ["Read(~/b/**)"] } });
+      await runScopedTurn(runtime, conversationScope);
+
+      expect(seen.map((options) => options.settings)).toEqual([
+        { permissions: { allow: ["Read(~/a/**)"] } },
+        { permissions: { allow: ["Read(~/b/**)"] } },
+      ]);
+    });
   });
 
   it("keeps a successful empty SDK catalog empty despite configured fallbacks", async () => {

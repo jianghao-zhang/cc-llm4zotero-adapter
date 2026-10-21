@@ -116,6 +116,8 @@ In this Zotero integration, those layers are used like this:
 - `project` → the shared Zotero Claude runtime root
 - `local` → the current conversation-specific runtime folder
 
+Claude Code only reads project settings from `<cwd>/.claude/settings.json` and does not look in parent directories. Because each conversation runs in its own folder under `scopes/`, the adapter symlinks the conversation's `.claude/settings.json` to the profile runtime root's `.claude/settings.json` (or the shared runtime root's, for scopes without a profile). Editing the profile file therefore applies to every conversation on its next turn, and a conversation's `.claude/settings.local.json` still overrides it. An existing conversation `settings.json` is never replaced; if the symlink cannot be created (for example on Windows without symlink privileges), the adapter logs a warning and the conversation runs without project settings.
+
 That is why this adapter works well for both kinds of users:
 
 - users who want Zotero to reuse their normal Claude setup

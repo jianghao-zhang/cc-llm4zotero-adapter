@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { ClaudeCodeRuntimeAdapter } from "../src/bridge/claude-code-runtime-adapter.js";
@@ -1086,6 +1086,104 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
     expect(probeCwds).toEqual([scopedCwd]);
     expect(turnOptions.cwd).toBe(scopedCwd);
     expect(turnOptions.effort).toBe("high");
+  });
+
+  describe("profile project settings", () => {
+    const conversationScope =
+      "profile-test/scopes/paper/profile-test:1:42/conversations/0042";
+
+    async function runScopedTurn(directory: string, runtimeCwdRelative: string) {
+      let turnOptions: Record<string, unknown> = {};
+      const runtime = new ClaudeAgentSdkRuntimeClient({
+        cwd: directory,
+        settingSources: ["project", "local"],
+        queryImpl(args) {
+          turnOptions = args.options;
+          return makeStream([
+            { type: "result", session_id: "session-profile-settings", result: "ok", is_error: false },
+          ]);
+        },
+      });
+      const turn = await runtime.startTurn({
+        conversationKey: "conv-profile-settings",
+        userMessage: "hello",
+        metadata: { runtimeCwdRelative },
+      });
+      for await (const _event of turn.events) {
+        // Drain the turn so the query completes.
+      }
+      return turnOptions;
+    }
+
+    async function makeRuntimeRoot(prefix: string): Promise<string> {
+      const directory = await mkdtemp(join(tmpdir(), prefix));
+      temporaryDirectories.add(directory);
+      return directory;
+    }
+
+    it("links the profile settings.json into the scoped conversation cwd", async () => {
+      const directory = await makeRuntimeRoot("cc-l4z-profile-link-");
+      const profileSettings = join(directory, "profile-test", ".claude", "settings.json");
+      await mkdir(dirname(profileSettings), { recursive: true });
+      await writeFile(profileSettings, '{"permissions":{"defaultMode":"plan"}}\n');
+
+      const turnOptions = await runScopedTurn(directory, conversationScope);
+
+      const link = join(directory, conversationScope, ".claude", "settings.json");
+      expect((await lstat(link)).isSymbolicLink()).toBe(true);
+      expect(await readFile(link, "utf8")).toBe('{"permissions":{"defaultMode":"plan"}}\n');
+      expect(String(turnOptions.appendSystemPrompt)).toContain(`project: ${profileSettings}`);
+
+      // Edits to the profile file are visible without relinking.
+      await writeFile(profileSettings, '{"permissions":{"defaultMode":"dontAsk"}}\n');
+      expect(await readFile(link, "utf8")).toBe('{"permissions":{"defaultMode":"dontAsk"}}\n');
+    });
+
+    it("never replaces an existing conversation settings.json", async () => {
+      const directory = await makeRuntimeRoot("cc-l4z-profile-keep-");
+      await mkdir(join(directory, "profile-test", ".claude"), { recursive: true });
+      await writeFile(join(directory, "profile-test", ".claude", "settings.json"), "{}\n");
+      const conversationSettings = join(directory, conversationScope, ".claude", "settings.json");
+      await mkdir(dirname(conversationSettings), { recursive: true });
+      await writeFile(conversationSettings, '{"model":"sonnet"}\n');
+
+      await runScopedTurn(directory, conversationScope);
+
+      expect((await lstat(conversationSettings)).isSymbolicLink()).toBe(false);
+      expect(await readFile(conversationSettings, "utf8")).toBe('{"model":"sonnet"}\n');
+    });
+
+    it("does not create a dangling link when the profile has no settings.json", async () => {
+      const directory = await makeRuntimeRoot("cc-l4z-profile-missing-");
+
+      await runScopedTurn(directory, conversationScope);
+
+      await expect(lstat(join(directory, conversationScope, ".claude", "settings.json"))).rejects.toThrow();
+    });
+
+    it("falls back to the shared runtime root settings for scopes without a profile segment", async () => {
+      const directory = await makeRuntimeRoot("cc-l4z-profile-shared-");
+      await mkdir(join(directory, ".claude"), { recursive: true });
+      await writeFile(join(directory, ".claude", "settings.json"), '{"env":{"SHARED":"1"}}\n');
+      const scope = "scopes/open/open-1/conversations/7";
+
+      await runScopedTurn(directory, scope);
+
+      const link = join(directory, scope, ".claude", "settings.json");
+      expect((await lstat(link)).isSymbolicLink()).toBe(true);
+      expect(await readFile(link, "utf8")).toBe('{"env":{"SHARED":"1"}}\n');
+    });
+
+    it("leaves the runtime root itself untouched", async () => {
+      const directory = await makeRuntimeRoot("cc-l4z-profile-root-");
+      await mkdir(join(directory, ".claude"), { recursive: true });
+      await writeFile(join(directory, ".claude", "settings.json"), "{}\n");
+
+      const turnOptions = await runScopedTurn(directory, "");
+
+      expect(turnOptions.cwd).toBe(resolve(directory));
+      expect((await lstat(join(directory, ".claude", "settings.json"))).isSymbolicLink()).toBe(false);
+    });
   });
 
   it("keeps a successful empty SDK catalog empty despite configured fallbacks", async () => {

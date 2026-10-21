@@ -6,8 +6,8 @@ import type {
   SettingSource,
 } from "@anthropic-ai/claude-agent-sdk";
 import { readFile } from "node:fs/promises";
-import { mkdirSync } from "node:fs";
-import { isAbsolute, relative, resolve } from "node:path";
+import { existsSync, lstatSync, mkdirSync, symlinkSync } from "node:fs";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import type { ClaudeCodeRuntimeClient, McpServerStatus, ProviderEvent, RuntimeAccountQuota, RuntimeAccountQuotaOptions, RuntimeModelInfo, RuntimePermissionModeCatalog, RuntimeTurnRequest, RuntimeTurnStream } from "../runtime.js";
 import { mapSdkMessageToProviderEvents } from "../event-mapper/map-sdk-message.js";
@@ -823,6 +823,16 @@ function shouldAutoCompact(
   if (contextTokens <= 0 || contextWindow <= 0) return false;
   const percentage = Math.round((contextTokens / contextWindow) * 100);
   return percentage >= threshold;
+}
+const PROFILE_SEGMENT_PATTERN = /^profile-[A-Za-z0-9_-]+$/;
+
+// The project layer for a scoped cwd is its Zotero profile runtime root
+// (<base>/profile-xxx) when present, otherwise the shared runtime root.
+function resolveProfileProjectRoot(baseCwd: string, scopedCwd: string): string {
+  const rel = relative(baseCwd, scopedCwd);
+  if (!rel || rel.startsWith("..") || isAbsolute(rel)) return baseCwd;
+  const firstSegment = rel.split(/[\\/]/)[0];
+  return PROFILE_SEGMENT_PATTERN.test(firstSegment) ? resolve(baseCwd, firstSegment) : baseCwd;
 }
 async function buildSettingsStackIdentity(
   settingSources: SettingSource[],
@@ -2352,7 +2362,38 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       return baseCwd;
     }
     mkdirSync(candidate, { recursive: true });
+    this.linkProfileProjectSettings(baseCwd, candidate);
     return candidate;
+  }
+
+  // Claude Code reads project settings only from <cwd>/.claude/settings.json and
+  // never walks up, so a scoped conversation cwd would otherwise ignore the
+  // profile-level settings file that llm-for-zotero presents as the project
+  // layer. Symlinking keeps one editable source of truth and preserves the
+  // documented precedence (conversation settings.local.json still wins).
+  private linkProfileProjectSettings(baseCwd: string, scopedCwd: string): void {
+    const projectRoot = resolveProfileProjectRoot(baseCwd, scopedCwd);
+    if (projectRoot === scopedCwd) return;
+    const target = resolve(projectRoot, ".claude/settings.json");
+    const link = resolve(scopedCwd, ".claude/settings.json");
+    if (!existsSync(target)) return;
+    try {
+      lstatSync(link);
+      // Never replace an existing per-conversation file or link.
+      return;
+    } catch {
+      // Missing; create it below.
+    }
+    try {
+      mkdirSync(dirname(link), { recursive: true });
+      symlinkSync(relative(dirname(link), target), link, "file");
+    } catch (error) {
+      // Windows without symlink privilege, read-only trees, races: fall back to
+      // Claude Code's default behavior rather than failing the turn.
+      console.warn(
+        `[cc-llm4zotero-adapter] could not link project settings into ${scopedCwd}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
 
   private resolveSettingsPathBySource(source: "user" | "project" | "local", cwdOverride?: string): string | undefined {
@@ -2365,7 +2406,7 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
       return resolve(homeDir, ".claude/settings.json");
     }
     if (source === "project") {
-      return resolve(baseCwd, ".claude/settings.json");
+      return resolve(resolveProfileProjectRoot(baseCwd, effectiveCwd), ".claude/settings.json");
     }
     return resolve(effectiveCwd, ".claude/settings.local.json");
   }

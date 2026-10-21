@@ -116,7 +116,14 @@ In this Zotero integration, those layers are used like this:
 - `project` → the shared Zotero Claude runtime root
 - `local` → the current conversation-specific runtime folder
 
-Claude Code only reads project settings from `<cwd>/.claude/settings.json` and does not look in parent directories, and SDK sessions never accept workspace trust, so project-level allow rules would be dropped even if it did. Because each conversation runs in its own folder under `scopes/`, the adapter instead reads the profile runtime root's `.claude/settings.json` (or the shared runtime root's, for scopes without a profile), merges the conversation's `.claude/settings.local.json` over it, and passes the result to the SDK as flag settings (the `--settings` layer). The effective order is local > project > user, edits apply on the next turn, and nothing is written into conversation folders. This applies only when `project` is an active setting source; `local` is merged only when it is active too. Because flag settings are passed on the Claude process command line, do not keep secrets in the profile file's `env` block.
+Claude Code only reads project settings from `<cwd>/.claude/settings.json` and does not look in parent directories, and SDK sessions never accept workspace trust, so project-level allow rules would be dropped even if it did. Because each conversation runs in its own folder under `scopes/`, the adapter instead merges these files and passes the result to the SDK as flag settings (the `--settings` layer), highest priority first:
+
+1. `<conversation>/.claude/settings.local.json`
+2. `<conversation>/.claude/settings.json`
+3. `<profile>/.claude/settings.local.json`
+4. `<profile>/.claude/settings.json`
+
+`<profile>` is the profile runtime root (or the shared runtime root, for scopes without a profile). Objects merge per key, arrays are combined, and other values from the higher-priority file win. The `settings.json` files are read only when `project` is an active setting source, and the `settings.local.json` files only when `local` is. The merged result sits above user settings, edits apply on the next turn, and nothing is written into conversation folders. Because flag settings are passed on the Claude process command line, do not keep secrets in the profile file's `env` block.
 
 That is why this adapter works well for both kinds of users:
 

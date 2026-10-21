@@ -1177,6 +1177,62 @@ describe("ClaudeAgentSdkRuntimeClient", () => {
       });
     });
 
+    it("merges profile and conversation settings files in priority order", async () => {
+      const directory = await makeRuntimeRoot("cc-l4z-profile-order-");
+      const profileDir = join(directory, "profile-test", ".claude");
+      const conversationDir = join(directory, conversationScope, ".claude");
+      await writeJson(join(profileDir, "settings.json"), {
+        model: "profile",
+        effortLevel: "profile",
+        env: { FROM: "profile", PROFILE_ONLY: "1" },
+        permissions: { allow: ["Read(~/a/**)"] },
+      });
+      await writeJson(join(profileDir, "settings.local.json"), {
+        model: "profile-local",
+        effortLevel: "profile-local",
+        env: { FROM: "profile-local" },
+        permissions: { allow: ["Read(~/b/**)"] },
+      });
+      await writeJson(join(conversationDir, "settings.json"), {
+        model: "conversation",
+        env: { FROM: "conversation" },
+        permissions: { allow: ["Read(~/c/**)"] },
+      });
+      await writeJson(join(conversationDir, "settings.local.json"), {
+        model: "conversation-local",
+        permissions: { allow: ["Read(~/d/**)"] },
+      });
+      const { runtime, seen } = makeTurnRuntime(directory);
+
+      await runScopedTurn(runtime, conversationScope);
+
+      expect(seen[0].settings).toEqual({
+        model: "conversation-local",
+        effortLevel: "profile-local",
+        env: { FROM: "conversation", PROFILE_ONLY: "1" },
+        permissions: { allow: ["Read(~/a/**)", "Read(~/b/**)", "Read(~/c/**)", "Read(~/d/**)"] },
+      });
+    });
+
+    it("gates settings.json files on project and settings.local.json files on local", async () => {
+      const directory = await makeRuntimeRoot("cc-l4z-profile-gates-");
+      const profileDir = join(directory, "profile-test", ".claude");
+      const conversationDir = join(directory, conversationScope, ".claude");
+      await writeJson(join(profileDir, "settings.json"), { env: { P: "1" } });
+      await writeJson(join(profileDir, "settings.local.json"), { env: { PL: "1" } });
+      await writeJson(join(conversationDir, "settings.json"), { env: { C: "1" } });
+      await writeJson(join(conversationDir, "settings.local.json"), { env: { CL: "1" } });
+      const { runtime, seen } = makeTurnRuntime(directory);
+
+      await runScopedTurn(runtime, conversationScope, { claudeSettingSources: ["user", "project"] });
+      await runScopedTurn(runtime, conversationScope, { claudeSettingSources: ["local"] });
+
+      expect(seen.map((options) => options.settings)).toEqual([
+        { env: { P: "1", C: "1" } },
+        { env: { PL: "1", CL: "1" } },
+      ]);
+    });
+
     it("omits the local layer when local settings are not an active source", async () => {
       const directory = await makeRuntimeRoot("cc-l4z-profile-nolocal-");
       await writeJson(join(directory, "profile-test", ".claude", "settings.json"), { model: "opus" });

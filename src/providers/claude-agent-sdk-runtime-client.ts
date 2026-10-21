@@ -2414,20 +2414,31 @@ export class ClaudeAgentSdkRuntimeClient implements ClaudeCodeRuntimeClient {
   // settings file that llm-for-zotero presents as the project layer. SDK
   // sessions also never accept workspace trust, so project-level allow rules
   // would be dropped even if the file were found there. Instead, merge the
-  // profile file with the conversation's settings.local.json (local wins) and
-  // pass the result as flag settings, which keeps local > project > user.
+  // profile and conversation settings files and pass the result as flag
+  // settings. Lowest to highest priority:
+  //   <profile>/.claude/settings.json
+  //   <profile>/.claude/settings.local.json
+  //   <conversation>/.claude/settings.json
+  //   <conversation>/.claude/settings.local.json
+  // settings.json files follow the `project` source; settings.local.json files
+  // follow the `local` source.
   private async loadProfileFlagSettings(
     effectiveSettingSources: SettingSource[],
     effectiveCwd: string | undefined,
   ): Promise<Record<string, unknown> | undefined> {
-    if (!effectiveSettingSources.includes("project")) return undefined;
-    const projectPath = this.resolveSettingsPathBySource("project", effectiveCwd);
-    const localPath = effectiveSettingSources.includes("local")
-      ? this.resolveSettingsPathBySource("local", effectiveCwd)
-      : undefined;
+    const baseCwd = this.options.cwd ? resolve(this.options.cwd) : process.cwd();
+    const conversationDir = effectiveCwd ? resolve(effectiveCwd) : baseCwd;
+    const profileDir = resolveProfileProjectRoot(baseCwd, conversationDir);
+    const includeProject = effectiveSettingSources.includes("project");
+    const includeLocal = effectiveSettingSources.includes("local");
+    const paths: string[] = [];
+    for (const dir of [profileDir, conversationDir]) {
+      if (includeProject) paths.push(resolve(dir, ".claude/settings.json"));
+      if (includeLocal) paths.push(resolve(dir, ".claude/settings.local.json"));
+    }
     const layers: Record<string, unknown>[] = [];
-    for (const path of [projectPath, localPath]) {
-      if (!path) continue;
+    // Scopes at the runtime or profile root resolve both dirs to one folder.
+    for (const path of new Set(paths)) {
       const layer = await readSettingsObject(path);
       if (layer) layers.push(layer);
     }
